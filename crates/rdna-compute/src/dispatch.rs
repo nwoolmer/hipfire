@@ -11681,6 +11681,12 @@ impl Gpu {
     /// GPU-side GQA attention.
     /// pos_buf: GPU buffer with single i32 position. Kernel computes seq_len = pos_buf[0] + 1.
     /// seq_len_hint: host-side seq_len for shared memory sizing (= pos + 1).
+    /// FP32-KV attention with optional GQA-4 specialization. When the head
+    /// ratio is 4:1 (Bonsai-8B's 32:8) and shared-mem fits, dispatches the
+    /// gqa4 kernel that loads K/V once per KV head and dots against 4 Q
+    /// heads in parallel — saves 4× DRAM KV traffic in long-context decode.
+    /// Falls back to per-Q-head attention_f32 otherwise (or when shared-
+    /// mem would exceed the 96 KB LDS cap on RDNA 3.5+).
     pub fn attention_f32(
         &mut self,
         q: &GpuTensor,
@@ -11695,6 +11701,68 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
+        // GQA-4 fast path: 4:1 head ratio + long enough seq for the
+        // 4× KV-bandwidth savings to outpace the lost parallelism (8
+        // blocks vs 32). Empirically at short seq (<1024 tok), the
+        // n_kv_heads=8 dispatch underutilizes a 40-CU gfx1151 — fewer
+        // waves in flight than weight matmul → overall slower decode
+        // even though attention compute is faster.
+        let kv_group = if n_kv_heads > 0 { n_heads / n_kv_heads } else { 0 };
+        let effective_seq_pre = if self.active_stream.is_some() { max_seq } else { seq_len_hint };
+        let block_size_pre = (effective_seq_pre.max(head_dim) as u32).next_power_of_two().min(256);
+        // GQA-4 shared mem = R × seq + workspace; cap at 80 KB to stay
+        // under gfx1151's 96 KB LDS with margin for compiler stack.
+        let gqa4_shmem = (4 * effective_seq_pre + block_size_pre as usize) * 4;
+        let gqa4_seq_threshold = 1024;
+        if kv_group == 4 && n_heads % n_kv_heads == 0
+            && seq_len_hint >= gqa4_seq_threshold
+            && gqa4_shmem <= 80 * 1024
+        {
+            self.ensure_kernel(
+                "attention_f32_gqa4",
+                kernels::ATTENTION_F32_GQA4_SRC,
+                "attention_f32_gqa4",
+            )?;
+            let func = &self.functions["attention_f32_gqa4"];
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut out_ptr = out.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut ms = max_seq as i32;
+            let mut sc = scale;
+
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut out_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+            ];
+
+            return unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_kv_heads as u32, 1, 1],
+                    [block_size_pre, 1, 1],
+                    gqa4_shmem as u32,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
         self.ensure_kernel("attention", kernels::ATTENTION_SRC, "attention_f32")?;
         let func = &self.functions["attention_f32"];
 

@@ -45,6 +45,7 @@ pub const GEMM_HFQ1G128_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels
 pub const GEMV_HFQ1G128_DP4A_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_dp4a.hip");
 pub const GEMM_QKV_HFQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq1g128_wmma.hip");
 pub const GEMM_GATE_UP_HFQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq1g128_wmma.hip");
+pub const ATTENTION_F32_GQA4_SRC: &str = include_str!("../../../kernels/src/attention_f32_gqa4.hip");
 pub const EMBEDDING_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq1g128.hip");
 pub const DEQUANT_HFQ1G128_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq1g128_to_f16.hip");
 
