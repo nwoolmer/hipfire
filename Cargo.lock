@@ -358,6 +358,7 @@ name = "rdna-compute"
 version = "0.1.20"
 dependencies = [
  "hip-bridge",
+ "hipfire-quantize",
 ]
 
 [[package]]

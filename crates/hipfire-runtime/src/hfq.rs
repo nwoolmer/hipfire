@@ -496,6 +496,10 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
         }
+        21 => { // HFQ1-G128 — PrismML 1-bit, FP16 scale, 18 bytes per 128 elements
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ1G128, m, k, row_stride: 0 })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -529,6 +533,9 @@ pub fn load_weights_hfq(
     } else if embd_info.0.quant_type == 7 {
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
         (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+    } else if embd_info.0.quant_type == 21 {
+        eprintln!("    (HFQ1-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ1G128)
     } else if embd_info.0.quant_type == 3 {
         // Q8F16: upload raw, use Q8 embedding lookup at inference
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);

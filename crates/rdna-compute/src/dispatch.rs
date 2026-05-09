@@ -321,6 +321,7 @@ pub enum DType {
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    HFQ1G128,  // 18 bytes per 128 elements (PrismML Q1_0: 1-bit sign-only, FP16 scale, no zero)
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -329,7 +330,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::HFQ1G128 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -1989,6 +1990,259 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq4g128", kernels::GEMV_HFQ4G128_SRC, "gemv_hfq4g128")?;
         let func = &self.functions["gemv_hfq4g128"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 single-token embedding lookup: dequant one row on GPU, output F32.
+    pub fn embedding_lookup_hfq1g128(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("embedding_hfq1g128", kernels::EMBEDDING_HFQ1G128_SRC, "embedding_hfq1g128")?;
+        let func = &self.functions["embedding_hfq1g128"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// HFQ1-G128 whole-tensor dequant to FP16. Used for prefill paths that
+    /// need an FP16 weight matrix in registers/LDS (e.g. WMMA tiles).
+    pub fn dequant_hfq1g128_to_f16(
+        &mut self,
+        a_packed: &GpuTensor,
+        w_f16: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dequant_hfq1g128_to_f16", kernels::DEQUANT_HFQ1G128_TO_F16_SRC, "dequant_hfq1g128_to_f16")?;
+        let func = &self.functions["dequant_hfq1g128_to_f16"];
+
+        let mut ap = a_packed.buf.as_ptr();
+        let mut wp = w_f16.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let groups = (k / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 quad-group multirow GEMV. Per K-step: 4 groups (= 512 weights)
+    /// per row, R∈{2,4,8} rows per block. ~4× the inner-step ILP of single-group.
+    pub fn gemv_hfq1g128_multirow_quad(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows_per_block: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kname, ename) = match rows_per_block {
+            2 => ("gemv_hfq1g128_multirow_quad_r2", "gemv_hfq1g128_multirow_quad_r2"),
+            4 => ("gemv_hfq1g128_multirow_quad_r4", "gemv_hfq1g128_multirow_quad_r4"),
+            8 => ("gemv_hfq1g128_multirow_quad_r8", "gemv_hfq1g128_multirow_quad_r8"),
+            _ => return self.gemv_hfq1g128_multirow(a_raw, x, y, m, k, rows_per_block),
+        };
+        self.ensure_kernel(kname, kernels::GEMV_HFQ1G128_MULTIROW_QUAD_SRC, ename)?;
+        let func = &self.functions[kname];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let grid = ((m as u32) + rows_per_block - 1) / rows_per_block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 packed-2-groups GEMV. Each lane handles 8 weights (1 byte)
+    /// of one group; 2 groups packed per K-step → halves outer-loop count.
+    /// Combine with R∈{1,2,4} multirow for additional row-tile amortization.
+    pub fn gemv_hfq1g128_packed(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows_per_block: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kname, ename) = match rows_per_block {
+            1 => ("gemv_hfq1g128_packed_r1", "gemv_hfq1g128_packed_r1"),
+            2 => ("gemv_hfq1g128_packed_r2", "gemv_hfq1g128_packed_r2"),
+            4 => ("gemv_hfq1g128_packed_r4", "gemv_hfq1g128_packed_r4"),
+            _ => return self.gemv_hfq1g128(a_raw, x, y, m, k),
+        };
+        self.ensure_kernel(kname, kernels::GEMV_HFQ1G128_PACKED_SRC, ename)?;
+        let func = &self.functions[kname];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let grid = ((m as u32) + rows_per_block - 1) / rows_per_block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 multi-row GEMV. R ∈ {2, 4, 8} chosen by env or arch default.
+    /// Each wave32 produces R output rows; x-load is hoisted across rows.
+    pub fn gemv_hfq1g128_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows_per_block: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kname, ename) = match rows_per_block {
+            2 => ("gemv_hfq1g128_multirow_r2", "gemv_hfq1g128_multirow_r2"),
+            4 => ("gemv_hfq1g128_multirow_r4", "gemv_hfq1g128_multirow_r4"),
+            8 => ("gemv_hfq1g128_multirow_r8", "gemv_hfq1g128_multirow_r8"),
+            _ => return self.gemv_hfq1g128(a_raw, x, y, m, k),
+        };
+        self.ensure_kernel(kname, kernels::GEMV_HFQ1G128_MULTIROW_SRC, ename)?;
+        let func = &self.functions[kname];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let grid = ((m as u32) + rows_per_block - 1) / rows_per_block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 GEMV (PrismML Q1_0): wave32, FP-direct.
+    /// `a_raw` is HFQ1G128-packed weights ([M, K], 18 B per 128-elt group);
+    /// `x` is FP32 activations [K]; `y` is FP32 output [M]. K must be multiple of 128.
+    pub fn gemv_hfq1g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_hfq1g128", kernels::GEMV_HFQ1G128_SRC, "gemv_hfq1g128")?;
+        let func = &self.functions["gemv_hfq1g128"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();

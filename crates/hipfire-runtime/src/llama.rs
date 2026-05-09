@@ -498,6 +498,7 @@ pub enum EmbeddingFormat {
     Q4K,       // raw Q4K blocks, use GPU dequant kernel
     HFQ4G256,  // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128,  // raw HFQ4-G128 blocks, use GPU dequant kernel
+    HFQ1G128,  // raw HFQ1-G128 blocks (PrismML Q1_0), use GPU dequant kernel
     Q8_0,  // raw Q8_0 blocks, use GPU dequant kernel
 }
 
@@ -562,6 +563,14 @@ pub fn weight_gemv(
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
+        DType::HFQ1G128 => {
+            // Multirow-quad R=2: 4 groups packed per K-step + 2 rows per
+            // block. Wins ~+50% bandwidth over single-row (95 → 142 GB/s
+            // on FFN-up shape) and ~+22% over plain multirow R=4 thanks to
+            // ~16 independent FMAs / K-step for ILP + amortized x-load
+            // across 2 rows. See plans/hfq1g128-bonsai.md §6 Tier E.
+            gpu.gemv_hfq1g128_multirow_quad(&w.buf, x, y, w.m, w.k, 2)
+        }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -1002,6 +1011,7 @@ pub fn prefill_forward(
         match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?,
             EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &x_single, token, dim)?,
             EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?,
             EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?,
             EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?,
@@ -1475,6 +1485,7 @@ fn forward_prefill_chunk(
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &s.x, tok, dim)?,
                 EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?,
                 EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
                 EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
@@ -1973,6 +1984,7 @@ pub fn forward_scratch_embed(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
     }
     Ok(())
@@ -2381,6 +2393,7 @@ pub fn forward(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
     }
 
@@ -2550,6 +2563,7 @@ fn forward_logits_gpu(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
     }
 

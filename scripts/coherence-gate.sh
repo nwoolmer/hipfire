@@ -111,6 +111,14 @@ SHORT_TESTS=(
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
     # absent (download via `hipfire pull qwen3.5-9b.mq6`).
     "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # HFQ1G128 coverage — PrismML Bonsai-8B (1.125 bpw QAT'd Qwen3-8B).
+    # Verifies 1-bit weight matmul kernel (gemv_hfq1g128_multirow R=4) +
+    # embedding lookup. Convert with `hipfire-quantize --format hfq1`. The
+    # underlying GGUF (`prism-ml/Bonsai-8B-gguf`) is QAT'd so output
+    # quality is meaningfully lower than HFQ4 — the gate just checks for
+    # fluency + on-topic, not byte-equivalence to HFQ4.
+    "bonsai/bonsai-8b.hfq|cap-hfq1-bonsai|What is the capital of France? Answer in one short sentence.|80"
+    "bonsai/bonsai-8b.hfq|reason-hfq1-bonsai|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"

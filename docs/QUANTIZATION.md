@@ -6,19 +6,31 @@ side. For the user-facing "how do I quantize my model" page, see
 
 ## Weight formats
 
-All weight formats group elements into 256-wide blocks (G256). Each
+Most weight formats group elements into 256-wide blocks (G256). Each
 block has independent scale + zero-point metadata. The bitwidth and
 whether a Walsh-Hadamard rotation runs before quantization defines the
 four production formats.
 
-| Format | Bits | Rotation | Bytes / 256 elements | Use case |
+| Format | Bits | Rotation | Bytes / group | Use case |
 |---|---|---|---|---|
-| HFQ4-G256 | 4 | none | 136 (8 hdr + 128 data) | Llama / Qwen3 / dense |
-| HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
-| MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |
-| MQ6-G256 | 6 | FWHT | 200 | Qwen 3.5+ higher quality |
-| MQ3-G256 | 3 | FWHT | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth play (≥9B models only) |
-| MQ2-G256 | 2 | FWHT | 72 (8 hdr + 64 data) | Reserved — uniform-grid collapses; pending Lloyd-Max codebook |
+| HFQ4-G256 | 4 | none | 136 / 256 (8 hdr + 128 data) | Llama / Qwen3 / dense |
+| HFQ6-G256 | 6 | none | 200 / 256 | Dense, higher quality |
+| MQ4-G256 | 4 | FWHT | 136 / 256 | Qwen 3.5+ hybrid |
+| MQ6-G256 | 6 | FWHT | 200 / 256 | Qwen 3.5+ higher quality |
+| MQ3-G256 | 3 | FWHT | 104 / 256 (8 hdr + 96 data) | Sub-4-bit bandwidth play (≥9B models only) |
+| MQ2-G256 | 2 | FWHT | 72 / 256 (8 hdr + 64 data) | Reserved — uniform-grid collapses; pending Lloyd-Max codebook |
+| HFQ1-G128 | 1 | none | **18 / 128** (2 hdr + 16 data) | PrismML Bonsai (QAT'd 1-bit Qwen3) |
+
+**HFQ1-G128 caveat**: 1-bit weights are only viable when the model is
+*trained* to tolerate 1-bit (QAT). The format ingests
+[`prism-ml/Bonsai-8B-gguf`](https://huggingface.co/prism-ml/Bonsai-8B-gguf)
+byte-verbatim (matches PrismML's `block_q1_0`: 2 B FP16 d + 16 B packed
+bits, LSB-first within byte, codebook `{−d, +d}`, no zero-point).
+Producing new HFQ1G128 weights from an arbitrary FP16 source via
+`hipfire-quantize --format hfq1` is supported but will collapse on
+non-QAT'd models. See `plans/hfq1g128-bonsai.md` for full design notes
+and the gfx1151 perf trajectory (Phase 2 lock-in: ~75 tok/s decode on
+Bonsai-8B with the multirow-quad GEMV).
 
 **Sub-4-bit caveat**: MQ3 and MQ2 reuse the production HFQ3/HFQ2
 decode kernels with a pre-rotated `x` (no separate kernel). Local

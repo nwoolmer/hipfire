@@ -31,6 +31,16 @@ pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
 
+/// HFQ1-G128: PrismML 1-bit sign-only quant (FP16 scale, 18 B per 128-weight group).
+/// Phase 1 GEMV: wave32, FP-direct (FP32 activations, no Q8_1 pre-pass).
+/// dp4a + WMMA variants land in Phase 2. See plans/hfq1g128-bonsai.md.
+pub const GEMV_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128.hip");
+pub const GEMV_HFQ1G128_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow.hip");
+pub const GEMV_HFQ1G128_PACKED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_packed.hip");
+pub const GEMV_HFQ1G128_MULTIROW_QUAD_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow_quad.hip");
+pub const EMBEDDING_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq1g128.hip");
+pub const DEQUANT_HFQ1G128_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq1g128_to_f16.hip");
+
 
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).

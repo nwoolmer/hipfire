@@ -29,6 +29,9 @@ pub enum GgmlType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    /// PrismML 1-bit sign-only quant (group=128, FP16 scale, 18 B/group).
+    /// Type ID 41 in PrismML's `llama.cpp` fork; not in upstream.
+    Q1_0 = 41,
 }
 
 impl GgmlType {
@@ -49,6 +52,7 @@ impl GgmlType {
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
             30 => Some(Self::BF16),
+            41 => Some(Self::Q1_0),
             _ => None,
         }
     }
@@ -57,6 +61,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q1_0 => 128,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
         }
     }
@@ -65,6 +70,7 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
+            Self::Q1_0 => 18,
             Self::Q4_0 => 18,
             Self::Q4_1 => 20,
             Self::Q5_0 => 22,
@@ -342,6 +348,33 @@ fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// PrismML Q1_0 dequant: 128 weights/group, 2 B FP16 scale + 16 B packed
+/// bits, bit=1 → +d, bit=0 → -d, LSB-first within byte. Mirrors
+/// upstream `dequantize_row_q1_0` (`PrismML-Eng/llama.cpp` ggml-quants.c:415).
+fn dequant_q1_0(data: &[u8], n: usize) -> Vec<f32> {
+    let block_size = 128usize;
+    let nblocks = (n + block_size - 1) / block_size;
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * 18;
+        if off + 18 > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let neg_d = -d;
+        for j in 0..block_size {
+            let idx = b * block_size + j;
+            if idx >= n {
+                break;
+            }
+            let byte = data[off + 2 + (j >> 3)];
+            let bit = (byte >> (j & 7)) & 1;
+            out[idx] = if bit == 1 { d } else { neg_d };
+        }
+    }
+    out
+}
+
 fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 32;
     let nblocks = (n + block_size - 1) / block_size;
@@ -539,6 +572,7 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
+        GgmlType::Q1_0 => dequant_q1_0(data, n),
         other => panic!(
             "GGUF tensor type {:?} not implemented (tensor: {})",
             other, info.name

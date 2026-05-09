@@ -6,7 +6,8 @@
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
 //! RDNA-native quantized weights.
 
-mod gguf_input;
+use hipfire_quantize::gguf_input;
+use hipfire_quantize::q1_0;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -1310,6 +1311,7 @@ enum QuantType {
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
     MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    HFQ1G128 = 21, // PrismML Q1_0 1-bit sign-only (FP16 scale, no zero, 18 B/group)
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -1915,6 +1917,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 /// calibrated for Qwen3.5+ training.** Default is HFQ4 for dense GGUFs;
 /// pass `--format mq4` only when the source is a Qwen3.5+ family model.
 #[derive(Clone, Copy, Debug)]
+#[derive(PartialEq, Eq)]
 enum GgufFormat {
     Hfq4,
     Hfq6,
@@ -1924,6 +1927,7 @@ enum GgufFormat {
     Mq2,
     Mq2Lloyd,
     Mq3Lloyd,
+    Hfq1,
 }
 
 impl GgufFormat {
@@ -1937,6 +1941,7 @@ impl GgufFormat {
             "mq2" | "mq2g256" => Some(Self::Mq2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
+            "hfq1" | "hfq1g128" | "bonsai" => Some(Self::Hfq1),
             _ => None,
         }
     }
@@ -1951,6 +1956,7 @@ impl GgufFormat {
             Self::Mq2 => "MQ2G256",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
+            Self::Hfq1 => "HFQ1G128",
         }
     }
 }
@@ -2086,12 +2092,61 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if format == GgufFormat::Hfq1
+            && info.dtype == gguf_input::GgmlType::Q1_0
+            && k_dim % 128 == 0
+        {
+            // HFQ1G128 byte-verbatim passthrough wins over the kmap/Q8 rules
+            // when the source is already Q1_0 — PrismML's per-tensor format
+            // choice (incl. embedding/lm_head) is authoritative. Preserves
+            // the 1-bit calibration that QAT'd into the model.
+            let nblocks = n_elements / 128;
+            let expected = nblocks * 18;
+            assert_eq!(
+                raw.len(),
+                expected,
+                "Q1_0 size mismatch for {}: got {} bytes, expected {}",
+                info.name,
+                raw.len(),
+                expected
+            );
+            quant_params += n_elements as u64;
+            (raw.to_vec(), QuantType::HFQ1G128, 128u32, "HFQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if format == GgufFormat::Hfq1 {
+            // HFQ1G128: byte-verbatim passthrough when source is GGUF
+            // Q1_0 (the Bonsai workflow); otherwise re-quantize from F32
+            // via PrismML's `d = mean(|w|)` rule. Bypasses kmap because
+            // PrismML already chose per-tensor precision in their GGUF.
+            if k_dim % 128 != 0 {
+                let f32_data = gguf_input::tensor_to_f32(info, raw);
+                let q = quantize_hfq4g128(&f32_data);
+                quant_params += n_elements as u64;
+                (q, QuantType::HFQ4G128, 128u32, "HFQ4G128 (HFQ1 fallback, k_dim not 128-aligned)")
+            } else if info.dtype == gguf_input::GgmlType::Q1_0 {
+                let nblocks = n_elements / 128;
+                let expected = nblocks * 18;
+                assert_eq!(
+                    raw.len(),
+                    expected,
+                    "Q1_0 size mismatch for {}: got {} bytes, expected {}",
+                    info.name,
+                    raw.len(),
+                    expected
+                );
+                quant_params += n_elements as u64;
+                (raw.to_vec(), QuantType::HFQ1G128, 128u32, "HFQ1G128 (passthrough)")
+            } else {
+                let f32_data = gguf_input::tensor_to_f32(info, raw);
+                let q = q1_0::quantize_row(&f32_data);
+                quant_params += n_elements as u64;
+                (q, QuantType::HFQ1G128, 128u32, "HFQ1G128 (requant)")
+            }
         } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
             // K-map promote to 6-bit
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -2106,6 +2161,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
+                GgufFormat::Hfq1 => unreachable!("HFQ1 handled in dedicated branch"),
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -2144,6 +2200,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                 }
+                GgufFormat::Hfq1 => unreachable!("HFQ1 handled in dedicated branch"),
             }
         } else {
             // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
