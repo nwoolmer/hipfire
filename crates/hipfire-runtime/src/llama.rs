@@ -1972,6 +1972,13 @@ impl ForwardScratch {
 
 /// Forward pass with persistent scratch buffers. Zero allocations.
 /// Returns (token_id, new_rng_state) via GPU-side sampling.
+///
+/// `HIPFIRE_GRAPH=1` enables HIP-graph capture+replay for the layer loop:
+/// the first call after warmup captures the layer graph; subsequent calls
+/// replay it, collapsing 250+ kernel launches per token into one
+/// `hipGraphLaunch`. Embedding and sampling stay direct (token / RNG vary
+/// per call, sampling has GPU→host readback). Mirrors the qwen35.rs
+/// pattern (qwen35.rs:2942-2989) so the two arches stay in lockstep.
 pub fn forward_scratch(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
@@ -1986,8 +1993,59 @@ pub fn forward_scratch(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    forward_scratch_embed(gpu, weights, config, token, pos, scratch)?;
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state, repeat_window, repeat_penalty)
+    let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1");
+
+    // Embedding lookup (always direct — token changes per call).
+    let dim = config.dim;
+    match weights.embd_format {
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
+    }
+
+    if use_graph && gpu.graph_exec.is_some() {
+        // ── Replay path ── update pos via stream_write_value32 (in-graph
+        // semantics), then launch the captured graph.
+        let stream = gpu.active_stream.as_ref().unwrap();
+        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+        gpu.graph_launch()?;
+    } else if use_graph && gpu.graph_exec.is_none() {
+        let pos_i32 = pos as i32;
+        if !gpu.ar_forward_warmed_up {
+            // ── Warmup ── run direct so kernel JIT, FP16-shadow allocation,
+            // and any other lazy work happens outside the captured region
+            // (would otherwise hit "hipMalloc not permitted under capture").
+            gpu.ar_forward_warmed_up = true;
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            forward_scratch_layers_compute(gpu, weights, config, pos, kv_cache, scratch)?;
+        } else {
+            // ── First post-warmup call ── capture the layer graph.
+            if gpu.active_stream.is_none() {
+                gpu.active_stream = Some(gpu.hip.stream_create()?);
+            }
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.begin_graph_capture()?;
+            forward_scratch_layers_compute(gpu, weights, config, pos, kv_cache, scratch)?;
+            gpu.end_graph_capture()?;
+            gpu.graph_launch()?;
+            eprintln!("[hipGraph llama] captured {} blobs", gpu.capture_blobs.len());
+        }
+    } else {
+        // ── Direct path ──
+        let pos_i32 = pos as i32;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_compute(gpu, weights, config, pos, kv_cache, scratch)?;
+    }
+
+    // Sample (always direct — has GPU→host readback).
+    gpu.sample_top_p(
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+        config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
+    )
 }
 
 /// Upload pos and compute embedding. Must be called before forward_scratch_layers.
@@ -2015,7 +2073,10 @@ pub fn forward_scratch_embed(
     Ok(())
 }
 
-/// Layer loop + final norm + logits + sampling. Graph-capturable.
+/// Layer loop + final norm + logits + sampling. Graph-capturable except
+/// for the trailing `sample_top_p` (which has GPU→host readback). The
+/// graph-capture path in `forward_scratch` uses `forward_scratch_compute`
+/// for the capturable body and calls `sample_top_p` separately.
 pub fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
@@ -2029,6 +2090,24 @@ pub fn forward_scratch_layers(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
+    forward_scratch_layers_compute(gpu, weights, config, pos, kv_cache, scratch)?;
+    gpu.sample_top_p(
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+        config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
+    )
+}
+
+/// Layer loop + final norm + logits. Graph-capturable (no sync readback).
+/// Produces `scratch.logits`. Caller samples separately.
+pub fn forward_scratch_layers_compute(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+) -> HipResult<()> {
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;
@@ -2152,13 +2231,7 @@ pub fn forward_scratch_layers(
 
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-
-    // GPU-side sampling (includes sync readback — can't be in graph capture)
-    gpu.sample_top_p(
-        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-        config.vocab_size, temperature, top_p, rng_state,
-        repeat_window, repeat_penalty,
-    )
+    Ok(())
 }
 
 /// Early-exit forward pass: check confidence at checkpoint layers, skip rest if confident.
