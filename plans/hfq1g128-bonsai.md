@@ -360,6 +360,33 @@ so individual runs vary; best-of-3 is the honest steady-state number.
 - No WMMA prefill — short prefill perf is acceptable (79 tok/s for
   13-token prompt) but would benefit at longer contexts.
 
+**Phase 3 actuals (2026-05-09):** 5 commits on `feat/hfq1g128-bonsai`.
+Final E2E decode best-of-N: **93.8 tok/s** (+101% over Phase 1 single-row
+46.7 baseline). Negative results documented:
+
+- **3.3 dp4a — measured & lost.** 82 GB/s vs FP-direct 142 GB/s
+  microbench. Q8_1 pre-pass forces DRAM ping-pong on activations that
+  the FP-direct path keeps L2-cached. Kernel kept in tree as documented
+  negative result (see commit 69ceb6f).
+- **3.5 HIP graph capture — wired & neutral.** 4 alternating runs each
+  way show no measurable speedup on gfx1151. AMD's `hipGraphLaunch`
+  apparently doesn't elide per-launch overhead the way NVIDIA's does.
+  Kept in tree for correctness invariant + future stream-pipelining
+  prerequisite (see commit a757522).
+- **3.6 GQA-4 attention — gated to seq≥1024.** Bandwidth math: at
+  seq=299, KV reads are 4% of weight reads → GQA-4's 4× saving lifts
+  step time by <1%. Below seq=1024, the n_kv_heads=8 dispatch
+  underutilizes a 40-CU APU (worse parallelism than the 32-block
+  per-Q-head dispatch). Real win lives at seq=8000+ (see commit
+  900a6e7).
+- **3.7 stream pipelining — analyzed, skipped.** AR decode within one
+  token has a strict serial dep chain: rmsnorm → QKV → rope → kv_write
+  → attention → wo → residual → ffn → next_layer. The only
+  parallelizable pairs are tiny (q_norm‖k_norm, kv_write_k‖kv_write_v
+  — single-digit microseconds each). Cross-token pipelining requires
+  speculative decoding (out of scope per user direction). Not viable
+  on this workload without changing the fundamental decode loop.
+
 **Phase 3 perf path** (in priority order, after Phase 2 perf shortfall):
 
 1. **Fused projections**: `fused_qkv_hfq1g128` (3 outputs from same input)
