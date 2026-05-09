@@ -2084,6 +2084,160 @@ impl Gpu {
         }
     }
 
+    /// Fused 3-way HFQ1-G128 GEMV (Q + K + V from shared activation x).
+    /// One launch instead of three per layer; activation x stays cached
+    /// across the projections. R=2 multirow + 4 groups packed per K-step
+    /// (mirrors gemv_hfq1g128_multirow_quad math, just with row→matrix routing).
+    pub fn fused_qkv_hfq1g128(
+        &mut self,
+        wq: &GpuTensor, wk: &GpuTensor, wv: &GpuTensor,
+        x: &GpuTensor,
+        yq: &GpuTensor, yk: &GpuTensor, yv: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_qkv_hfq1g128_r2",
+            kernels::FUSED_QKV_HFQ1G128_SRC,
+            "fused_qkv_hfq1g128_r2",
+        )?;
+        let func = &self.functions["fused_qkv_hfq1g128_r2"];
+
+        let mut aq = wq.buf.as_ptr();
+        let mut ak = wk.buf.as_ptr();
+        let mut av = wv.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yqp = yq.buf.as_ptr();
+        let mut ykp = yk.buf.as_ptr();
+        let mut yvp = yv.buf.as_ptr();
+        let mut qm = q_m as i32;
+        let mut km = k_m as i32;
+        let mut vm = v_m as i32;
+        let mut kk = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yqp as *mut _ as *mut c_void,
+            &mut ykp as *mut _ as *mut c_void,
+            &mut yvp as *mut _ as *mut c_void,
+            &mut qm as *mut _ as *mut c_void,
+            &mut km as *mut _ as *mut c_void,
+            &mut vm as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+
+        // R=2 → grid = ceil((q_m + k_m + v_m) / 2).
+        let total_m = (q_m + k_m + v_m) as u32;
+        let grid = (total_m + 1) / 2;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ1-G128 batched GEMM (FP-direct). Replaces the GEMV-per-token
+    /// fallback in `weight_gemm` with a single batched launch.
+    pub fn gemm_hfq1g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_hfq1g128", kernels::GEMM_HFQ1G128_SRC, "gemm_hfq1g128")?;
+        let func = &self.functions["gemm_hfq1g128"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+
+        let n_tiles = ((batch_size as u32) + 7) / 8;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, n_tiles, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Fused 2-way HFQ1-G128 GEMV (gate + up from shared activation).
+    pub fn fused_gate_up_hfq1g128(
+        &mut self,
+        wg: &GpuTensor, wu: &GpuTensor,
+        x: &GpuTensor,
+        yg: &GpuTensor, yu: &GpuTensor,
+        g_m: usize, u_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_gate_up_hfq1g128_r2",
+            kernels::FUSED_GATE_UP_HFQ1G128_SRC,
+            "fused_gate_up_hfq1g128_r2",
+        )?;
+        let func = &self.functions["fused_gate_up_hfq1g128_r2"];
+
+        let mut ag = wg.buf.as_ptr();
+        let mut au = wu.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut ygp = yg.buf.as_ptr();
+        let mut yup = yu.buf.as_ptr();
+        let mut gm = g_m as i32;
+        let mut um = u_m as i32;
+        let mut kk = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut ygp as *mut _ as *mut c_void,
+            &mut yup as *mut _ as *mut c_void,
+            &mut gm as *mut _ as *mut c_void,
+            &mut um as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+
+        let total_m = (g_m + u_m) as u32;
+        let grid = (total_m + 1) / 2;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ1-G128 quad-group multirow GEMV. Per K-step: 4 groups (= 512 weights)
     /// per row, R∈{2,4,8} rows per block. ~4× the inner-step ILP of single-group.
     pub fn gemv_hfq1g128_multirow_quad(

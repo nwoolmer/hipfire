@@ -958,6 +958,7 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::HFQ1G128 => gpu.gemm_hfq1g128(&w.buf, x, y, w.m, w.k, batch_size),
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
@@ -2020,6 +2021,15 @@ pub fn forward_scratch_layers(
                 &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
+        } else if layer.wq.gpu_dtype == DType::HFQ1G128
+            && layer.wk.gpu_dtype == DType::HFQ1G128
+            && layer.wv.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_qkv_hfq1g128(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
@@ -2096,6 +2106,14 @@ pub fn forward_scratch_layers(
                 &scratch.tmp, &scratch.gate, &scratch.up,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
+        } else if layer.w_gate.gpu_dtype == DType::HFQ1G128
+            && layer.w_up.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_gate_up_hfq1g128(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
         } else {
             // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
@@ -2160,6 +2178,15 @@ pub fn forward_early_exit(
                 &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
+        } else if layer.wq.gpu_dtype == DType::HFQ1G128
+            && layer.wk.gpu_dtype == DType::HFQ1G128
+            && layer.wv.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_qkv_hfq1g128(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
@@ -2202,6 +2229,14 @@ pub fn forward_early_exit(
         gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else if layer.w_gate.gpu_dtype == DType::HFQ1G128
+            && layer.w_up.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_gate_up_hfq1g128(
                 &layer.w_gate.buf, &layer.w_up.buf,
                 &scratch.tmp, &scratch.gate, &scratch.up,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
@@ -2277,6 +2312,15 @@ pub fn forward_scratch_compute(
                 &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
+        } else if layer.wq.gpu_dtype == DType::HFQ1G128
+            && layer.wk.gpu_dtype == DType::HFQ1G128
+            && layer.wv.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_qkv_hfq1g128(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
         } else {
             // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
             let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
@@ -2349,6 +2393,14 @@ pub fn forward_scratch_compute(
         gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else if layer.w_gate.gpu_dtype == DType::HFQ1G128
+            && layer.w_up.gpu_dtype == DType::HFQ1G128
+        {
+            gpu.fused_gate_up_hfq1g128(
                 &layer.w_gate.buf, &layer.w_up.buf,
                 &scratch.tmp, &scratch.gate, &scratch.up,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,

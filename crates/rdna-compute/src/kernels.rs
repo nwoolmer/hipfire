@@ -38,6 +38,10 @@ pub const GEMV_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1
 pub const GEMV_HFQ1G128_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow.hip");
 pub const GEMV_HFQ1G128_PACKED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_packed.hip");
 pub const GEMV_HFQ1G128_MULTIROW_QUAD_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow_quad.hip");
+pub const FUSED_QKV_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq1g128.hip");
+pub const FUSED_GATE_UP_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq1g128.hip");
+pub const GEMM_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq1g128.hip");
+pub const GEMM_HFQ1G128_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_hfq1g128_residual_wmma.hip");
 pub const EMBEDDING_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq1g128.hip");
 pub const DEQUANT_HFQ1G128_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq1g128_to_f16.hip");
 
