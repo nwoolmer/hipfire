@@ -139,6 +139,13 @@ fn main() -> Result<(), String> {
         gpu.gemv_hfq1g128_multirow_quad(&d_a, &d_x, &d_y, M, K, 8)
     })?;
 
+    // dp4a path (Q8_1 activations). Includes a per-launch quantize_q8_1
+    // overhead that the bench loop pays each iteration; the steady-state
+    // E2E cost is amortized differently when integrated into a forward pass.
+    bench_one(&mut gpu, "dp4a (Q8_1 acts, single-row)", &d_a, &d_x, &d_y, &mut |gpu| {
+        gpu.gemv_hfq1g128_dp4a(&d_a, &d_x, &d_y, M, K)
+    })?;
+
     gpu.free_tensor(d_a).ok();
     gpu.free_tensor(d_x).ok();
     gpu.free_tensor(d_y).ok();
