@@ -38,6 +38,11 @@ pub const GEMV_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1
 pub const GEMV_HFQ1G128_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow.hip");
 pub const GEMV_HFQ1G128_PACKED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_packed.hip");
 pub const GEMV_HFQ1G128_MULTIROW_QUAD_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_multirow_quad.hip");
+
+/// Fused HFQ1G128 GEMV with residual add. Drop-in for `weight_gemv_residual`'s
+/// HFQ1 path, eliminating the alloc + plain-gemv + add_inplace + free fallback
+/// (saves 1 launch per residual site → 72 per token at Bonsai's 36 layers).
+pub const GEMV_HFQ1G128_RESIDUAL_MULTIROW_QUAD_SRC: &str = include_str!("../../../kernels/src/gemv_hfq1g128_residual_multirow_quad.hip");
 pub const FUSED_QKV_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq1g128.hip");
 pub const FUSED_GATE_UP_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq1g128.hip");
 pub const GEMM_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq1g128.hip");
@@ -47,6 +52,10 @@ pub const GEMM_QKV_HFQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMM_GATE_UP_HFQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq1g128_wmma.hip");
 pub const ATTENTION_F32_GQA4_SRC: &str = include_str!("../../../kernels/src/attention_f32_gqa4.hip");
 pub const EMBEDDING_HFQ1G128_SRC: &str = include_str!("../../../kernels/src/embedding_hfq1g128.hip");
+
+/// Batched HFQ1G128 embedding lookup. One launch for N tokens; replaces
+/// the per-token sequential loop in prefill_forward/forward_prefill_chunk.
+pub const EMBEDDING_HFQ1G128_BATCHED_SRC: &str = include_str!("../../../kernels/src/embedding_hfq1g128_batched.hip");
 pub const DEQUANT_HFQ1G128_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq1g128_to_f16.hip");
 
 
@@ -920,6 +929,15 @@ pub const ATTENTION_Q8_0_KV_TIMED_SRC: &str = include_str!("../../../kernels/src
 /// Grid: [n_heads, n_tiles]. Each block fuses QK-dot + softmax + V-accumulate
 /// for its tile of positions, writing partials to global memory.
 pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip");
+
+/// Batched flash attention tile for Q8_0 KV. Mirrors single-q tile with
+/// outer batch dim via blockIdx.z + tree-mask bias parity. 4 dims/thread
+/// looped over n_halves so head_dim=128 and 256 share one kernel.
+pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
+
+/// Batched flash attention reduce for Q8_0 V (V in normal/un-rotated space).
+/// 2-pass online softmax over the tile partials. Same n_halves pattern.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_reduce_batched.hip");
 
 /// Flash attention reduce kernel — combines tile partials via online softmax
 /// correction. Grid: [n_heads]. Reads per-tile {max, sum, out[head_dim]},

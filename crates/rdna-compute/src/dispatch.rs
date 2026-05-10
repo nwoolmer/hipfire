@@ -2018,6 +2018,44 @@ impl Gpu {
     }
 
     /// HFQ1-G128 single-token embedding lookup: dequant one row on GPU, output F32.
+    /// Batched HFQ1G128 embedding lookup — one launch instead of n_tokens
+    /// sequential calls. Saves ~255 launches per prefill chunk on Bonsai.
+    pub fn embedding_lookup_hfq1g128_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,    // [n_tokens × dim]
+        tokens: &GpuTensor,    // [n_tokens] i32
+        n_tokens: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_lookup_hfq1g128_batched",
+            kernels::EMBEDDING_HFQ1G128_BATCHED_SRC,
+            "embedding_lookup_hfq1g128_batched",
+        )?;
+        let func = &self.functions["embedding_lookup_hfq1g128_batched"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tk = tokens.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut d = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tk as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_tokens as u32, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     pub fn embedding_lookup_hfq1g128(
         &mut self,
         table: &GpuTensor,
@@ -2498,6 +2536,48 @@ impl Gpu {
                 0,
                 self.stream_ref(),
                 &mut params,
+            )
+        }
+    }
+
+    /// Fused HFQ1-G128 residual GEMV: `y[row] += W[row, :] · x[:]`.
+    /// Drop-in for `weight_gemv_residual`'s HFQ1 path — eliminates the
+    /// alloc + plain-gemv + add_inplace + free fallback (saves 1 launch per
+    /// residual site → 72 per token at Bonsai's 36 layers).
+    /// Block: [32]. Grid: ceil(m / 2). Same multirow-quad inner loop as
+    /// gemv_hfq1g128_multirow_quad with `+=` write-back.
+    pub fn gemv_hfq1g128_residual_multirow_quad(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const ROWS_PER_BLOCK: u32 = 2;
+        self.ensure_kernel(
+            "gemv_hfq1g128_residual_multirow_quad_r2",
+            kernels::GEMV_HFQ1G128_RESIDUAL_MULTIROW_QUAD_SRC,
+            "gemv_hfq1g128_residual_multirow_quad_r2",
+        )?;
+        let func = &self.functions["gemv_hfq1g128_residual_multirow_quad_r2"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        let grid = ((m as u32) + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params,
             )
         }
     }
@@ -13071,6 +13151,152 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
         )
+    }
+
+    /// Batched flash attention for Q8_0 KV. Tile + reduce pair, supports
+    /// head_dim=128 and head_dim=256 (kernels loop over n_halves).
+    ///
+    /// Used by `forward_prefill_chunk` when `max_ctx_len > LDS_CTX_LIMIT`
+    /// (currently 22000) so the score-array LDS allocation in
+    /// `attention_q8_0_kv_batched_masked` doesn't exceed gfx1151's 96 KB
+    /// per-WG cap. Single launch per chunk replaces the per-position
+    /// `attention_flash_q8_0` loop in the previous fallback.
+    pub fn attention_flash_q8_0_batched_masked(
+        &mut self,
+        q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
+        let stride = 2 + head_dim;
+        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        let partials_capacity = partials.numel() * 4;
+        let sub_batch = if per_pos_bytes > 0 {
+            (partials_capacity / per_pos_bytes).max(1).min(batch_size)
+        } else {
+            batch_size
+        };
+
+        self.ensure_kernel(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+        )?;
+        self.ensure_kernel(
+            "attention_flash_q8_0_reduce_batched",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_BATCHED_SRC,
+            "attention_flash_q8_0_reduce_batched",
+        )?;
+
+        let q_dim = n_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+
+            // ── Tile kernel ──
+            {
+                let q_ptr = unsafe {
+                    (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void
+                };
+                let k_ptr = k_cache.buf.as_ptr();
+                let v_ptr = v_cache.buf.as_ptr();
+                let p_ptr = partials.buf.as_ptr();
+                let pos_ptr = positions.buf.as_ptr();
+                let bias_ptr: *mut std::ffi::c_void = match tree_bias {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
+                let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+                let hd = head_dim as i32; let ms = max_seq as i32;
+                let sc = scale; let ts = TILE_SIZE as i32;
+                let mt = max_tiles as i32; let bo = offset as i32;
+                let bs = block_start as i32; let bc = block_cols as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &q_ptr as *const _ as *mut c_void,
+                    &k_ptr as *const _ as *mut c_void,
+                    &v_ptr as *const _ as *mut c_void,
+                    &p_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &bias_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &nkv as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &ms as *const _ as *mut c_void,
+                    &sc as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                    &bc as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_flash_q8_0_tile_batched",
+                    [n_heads as u32, max_tiles as u32, chunk as u32],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr);
+                        b.push_ptr(p_ptr); b.push_ptr(pos_ptr); b.push_ptr(bias_ptr);
+                        b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
+                        b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
+                        b.push_i32(bs); b.push_i32(bc);
+                        b
+                    },
+                )?;
+            }
+
+            // ── Reduce kernel ──
+            {
+                let p_ptr = partials.buf.as_ptr();
+                let o_ptr = unsafe {
+                    (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void
+                };
+                let pos_ptr = positions.buf.as_ptr();
+                let nh = n_heads as i32; let hd = head_dim as i32;
+                let ts = TILE_SIZE as i32; let mt = max_tiles as i32;
+                let bo = offset as i32;
+                let bs = block_start as i32; let bc = block_cols as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &p_ptr as *const _ as *mut c_void,
+                    &o_ptr as *const _ as *mut c_void,
+                    &pos_ptr as *const _ as *mut c_void,
+                    &nh as *const _ as *mut c_void,
+                    &hd as *const _ as *mut c_void,
+                    &ts as *const _ as *mut c_void,
+                    &mt as *const _ as *mut c_void,
+                    &bo as *const _ as *mut c_void,
+                    &bs as *const _ as *mut c_void,
+                    &bc as *const _ as *mut c_void,
+                ];
+                self.launch_maybe_blob(
+                    "attention_flash_q8_0_reduce_batched",
+                    [n_heads as u32, chunk as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(p_ptr); b.push_ptr(o_ptr); b.push_ptr(pos_ptr);
+                        b.push_i32(nh); b.push_i32(hd); b.push_i32(ts); b.push_i32(mt);
+                        b.push_i32(bo); b.push_i32(bs); b.push_i32(bc);
+                        b
+                    },
+                )?;
+            }
+
+            offset += chunk;
+        }
+        Ok(())
     }
 
     /// Flash attention for asym3 KV (K at 3-bit rotated, V at Q8_0).
