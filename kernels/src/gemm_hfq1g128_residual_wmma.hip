@@ -12,6 +12,12 @@
 // Grid: [ceil(M/16), ceil(N/16)]. Block: [32]. LDS: 0.
 //
 // Per K-tile: 16 weight bits packed in 1 uint16 → unpacked to ±d FP16.
+//
+// RDNA3 wave32 WMMA C layout: lane k holds D[col=k%16, row=2*j+(k>>4)]
+// for j=0..7. Output indexing must follow this layout — earlier kernel
+// versions (gemm_hfq4g256_residual_wmma) used a transposed layout that
+// produced gibberish in production (caught when wiring HFQ1 into
+// forward_prefill_chunk).
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -67,15 +73,14 @@ extern "C" __global__ void gemm_hfq1g128_residual_wmma(
         }
     }
 
-    const int out_row = row_start + (tid & 15);
-    const int out_batch_base = batch_start + (tid >> 4) * 8;
-
-    if (out_row < M) {
+    // RDNA3 wave32 WMMA C layout: acc[j] = D[row = 2*j + (tid>>4), col = tid & 15].
+    const int out_col = batch_start + (tid & 15);
+    if (out_col < batch_size) {
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            int bidx = out_batch_base + j;
-            if (bidx < batch_size)
-                Y[(long long)bidx * M + out_row] += acc[j];
+            int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < M)
+                Y[(long long)out_col * M + out_row] += acc[j];
         }
     }
 }

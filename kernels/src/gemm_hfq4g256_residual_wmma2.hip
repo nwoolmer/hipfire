@@ -77,15 +77,19 @@ extern "C" __global__ void gemm_hfq4g256_residual_wmma2(
         }
     }
 
-    // Output: each wave writes its own 16×16 tile
-    const int out_row = row_start + (lane & 15);
-    const int out_batch_base = batch_start + (lane >> 4) * 8;
-    if (out_row < M) {
+    // Output: each wave writes its own 16×16 tile.
+    // RDNA3 wave32 WMMA output: acc[j] = D[row = 2*j + (lane>>4), col = lane & 15].
+    // (Pre-fix mapping was `out_row = row_start + (lane & 15)` + col_base from
+    // (lane>>4)*8 — that writes a transposed permutation. Inert here since
+    // no Rust dispatch site calls this kernel; matched the same bug fixed in
+    // gemm_hfq1g128_residual_wmma after it surfaced via forward_prefill_chunk.)
+    const int out_col = batch_start + (lane & 15);
+    if (out_col < batch_size) {
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            int bidx = out_batch_base + j;
-            if (bidx < batch_size)
-                Y[(long long)bidx * M + out_row] += acc[j];
+            int out_row = row_start + 2 * j + (lane >> 4);
+            if (out_row < M)
+                Y[(long long)out_col * M + out_row] += acc[j];
         }
     }
 }
