@@ -789,6 +789,17 @@ pub fn weight_gemv_prerotated(
 ///
 /// For any other dtype, falls back to plain `weight_gemv` followed by an
 /// explicit `add_inplace_f32` — same observable behavior as before.
+/// True when `weight_gemv_residual` will hit a fused gemv-with-residual
+/// kernel for `dt`. False when it falls through to the alloc+gemv+add+free
+/// path — callers that have a pre-allocated scratch should prefer the
+/// explicit gemv + add_inplace_f32 sequence in that case.
+pub fn has_fused_residual_gemv(dt: DType) -> bool {
+    matches!(dt,
+        DType::HFQ4G256 | DType::HFQ3G256 | DType::HFQ6G256 | DType::HFQ1G128
+        | DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ3G256Lloyd
+    )
+}
+
 pub fn weight_gemv_residual(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -799,6 +810,7 @@ pub fn weight_gemv_residual(
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ6G256 => gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k),
+        DType::HFQ1G128 => gpu.gemv_hfq1g128_residual_multirow_quad(&w.buf, x, y, w.m, w.k),
         DType::MQ6G256 => {
             // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
             // hfq6g256_residual against the rotated activations. Saves one
@@ -1006,20 +1018,38 @@ pub fn prefill_forward(
     let ffn_hidden_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
     let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
-    // Embedding: lookup each token individually into the batch buffer
-    let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
-    for (i, &token) in tokens.iter().enumerate() {
+    // Embedding: HFQ4G256, Q8_0, and HFQ1G128 have batched variants (one
+    // launch for all N tokens). Other formats fall back to a per-token
+    // loop with a temp scratch + memcpy.
+    let has_batched_embed = matches!(weights.embd_format,
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ1G128);
+    if has_batched_embed {
+        let tokens_buf = gpu.alloc_tensor(&[batch], DType::F32)?;
+        let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let tokens_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, batch * 4)
+        };
+        gpu.hip.memcpy_htod(&tokens_buf.buf, tokens_bytes)?;
         match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?,
-            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?,
-            EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &x_single, token, dim)?,
-            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?,
-            EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?,
-            EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &x_batch, &tokens_buf, batch, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(&weights.token_embd, &x_batch, &tokens_buf, batch, dim)?,
+            EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128_batched(&weights.token_embd, &x_batch, &tokens_buf, batch, dim)?,
+            _ => unreachable!(),
         }
-        gpu.hip.memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
+        gpu.free_tensor(tokens_buf)?;
+    } else {
+        let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
+        for (i, &token) in tokens.iter().enumerate() {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?,
+                EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?,
+                EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?,
+                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ1G128 => unreachable!(),
+            }
+            gpu.hip.memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
+        }
+        gpu.free_tensor(x_single)?;
     }
-    gpu.free_tensor(x_single)?;
 
     // Position array for batched RoPE: [0, 1, 2, ..., batch-1]
     let pos_data: Vec<i32> = (0..batch as i32).collect();
@@ -1116,13 +1146,11 @@ pub fn prefill_forward(
     gpu.free_tensor(attn_slice)?;
     gpu.hip.free(pos_buf)?;
 
-    // Final norm + output projection for LAST position only
-    let last_off = (batch - 1) * dim * 4;
-    let x_last = gpu.alloc_tensor(&[dim], DType::F32)?;
-    gpu.hip.memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
-
+    // Final norm + output projection for LAST position only.
+    // Take a view into x_batch's last row instead of alloc+memcpy.
+    let last_row_view = x_batch.sub_offset((batch - 1) * dim, dim);
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
-    gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
+    gpu.rmsnorm_f32(&last_row_view, &weights.output_norm, &tmp, config.norm_eps)?;
 
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
@@ -1141,7 +1169,6 @@ pub fn prefill_forward(
     gpu.free_tensor(up_batch)?;
     gpu.free_tensor(ffn_hidden_batch)?;
     gpu.free_tensor(ffn_out_batch)?;
-    gpu.free_tensor(x_last)?;
     gpu.free_tensor(tmp)?;
     gpu.free_tensor(logits)?;
 
@@ -1371,11 +1398,12 @@ pub fn forward_prefill_batch(
     }
 
     // Final norm + output projection on the LAST row of x_batch (chunk-local).
+    // Take a view into x_batch's last row instead of memcpy'ing it into
+    // scratch.x — saves one D2D copy per prefill (small but free win).
     let dim = config.dim;
     let last_n = ((n - 1) % max_chunk) + 1;
-    let last_off_bytes = (last_n - 1) * dim * 4;
-    gpu.hip.memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, last_off_bytes, dim * 4)?;
-    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    let last_row_view = pbs.x_batch.sub_offset((last_n - 1) * dim, dim);
+    gpu.rmsnorm_f32(&last_row_view, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     if let Some(p) = own_pbs {
@@ -1436,7 +1464,13 @@ pub fn forward_prefill_batch_chunk_captured(
     // baked from `physical_cap` in capture mode, not the live seq_len, so
     // we have to gate on the cap regardless of how many tokens this chunk
     // carries. Asym KV paths run pure-batched kernels and stay safe.
-    const LDS_CTX_LIMIT: usize = 15000;
+    // gfx1151 has a 96 KB per-WG LDS cap. attention_q8_0_kv_batched_masked
+    // allocates `(max_ctx_len + 256 + head_dim) * 4` bytes for scores +
+    // workspace + q_shared. At max_ctx_len=22000 with head_dim=128 that's
+    // 87.4 KB — comfortably under cap. 23000 → 91.3 KB. The previous limit
+    // (15000 → 60 KB) was over-conservative; widening the dense kernel's
+    // operating range avoids unnecessary fallback to per-position flash.
+    const LDS_CTX_LIMIT: usize = 22000;
     assert!(
         !(kv_cache.quant_q8 && kv_cache.physical_cap > LDS_CTX_LIMIT),
         "Q8 KV with physical_cap {} > {} hits the per-position long-context fallback, \
@@ -1469,8 +1503,12 @@ fn forward_prefill_chunk(
     let kv_dim = config.n_kv_heads * config.head_dim;
     let dim_row_bytes = dim * 4;
 
-    // 1. Embed N tokens into pbs.x_batch.
-    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
+    // 1. Embed N tokens into pbs.x_batch. HFQ4G256, Q8_0, and HFQ1G128 have
+    // batched variants (one launch for all N tokens). Other formats fall
+    // back to a per-token loop.
+    let has_batched_embed = matches!(weights.embd_format,
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ1G128);
+    if has_batched_embed {
         if !pre_uploaded {
             let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             let tokens_bytes: &[u8] = unsafe {
@@ -1481,16 +1519,16 @@ fn forward_prefill_chunk(
         match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?,
             EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?,
+            EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?,
             _ => unreachable!(),
         }
     } else {
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
-                EmbeddingFormat::HFQ1G128 => gpu.embedding_lookup_hfq1g128(&weights.token_embd, &s.x, tok, dim)?,
                 EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?,
                 EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
+                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ1G128 => unreachable!(),
             }
             gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
         }
@@ -1627,7 +1665,17 @@ fn forward_prefill_chunk(
         }
 
         // Batched causal flash attention.
-        const LDS_CTX_LIMIT: usize = 15000;
+        // gfx1151 has a 96 KB per-WG LDS cap. attention_q8_0_kv_batched_masked
+    // allocates `(max_ctx_len + 256 + head_dim) * 4` bytes for scores +
+    // workspace + q_shared. At max_ctx_len=22000 with head_dim=128 that's
+    // 87.4 KB — comfortably under cap. 23000 → 91.3 KB. The previous limit
+    // (15000 → 60 KB) was over-conservative; widening the dense kernel's
+    // operating range avoids unnecessary fallback to per-position flash.
+    // HIPFIRE_LDS_CTX_LIMIT lets benchmarks force-test the flash batched
+    // Q8 path at small seq_len (set to e.g. 100 to route a 4k prompt through
+    // the new kernel without needing a 22k+ prompt to trigger it).
+    let lds_ctx_limit: usize = std::env::var("HIPFIRE_LDS_CTX_LIMIT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(22000);
         if kv_cache.quant_asym4 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
             let st = kv_cache.givens_sin.as_ref().unwrap();
@@ -1657,32 +1705,20 @@ fn forward_prefill_chunk(
                 config.n_heads, config.n_kv_heads, config.head_dim,
                 kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
             )?;
-        } else if max_ctx_len > LDS_CTX_LIMIT {
-            // Long-context Q8 fallback: per-position flash.
-            //
-            // `pbs.positions` was uploaded as raw i32 bits but the dtype is
-            // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`
-            // would reinterpret those bytes as floats, so positions like 15000
-            // would surface as ~1e-3 subnormals that cast to 0. Reconstruct
-            // from `start_pos + b` directly — the buffer layout is exactly
-            // [start_pos .. start_pos + n] in linear order.
-            let q_dim = config.n_heads * config.head_dim;
-            let pos_buf_tmp = gpu.hip.malloc(4)?;
-            for b in 0..n {
-                let pos_b = start_pos + b;
-                let seq_len_b = pos_b + 1;
-                let pos_i32 = pos_b as i32;
-                gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                gpu.attention_flash_q8_0(
-                    &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &out_b, &pos_buf_tmp, seq_len_b,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    kv_cache.physical_cap, &pbs.flash_partials,
-                )?;
-            }
-            let _ = gpu.hip.free(pos_buf_tmp);
+        } else if max_ctx_len > lds_ctx_limit {
+            // Long-context Q8: batched flash attention. Single launch over
+            // [n_heads, max_tiles, batch] grid, partials reduced via the
+            // dedicated head_dim-flexible q8_0 reducer. Replaces the old
+            // per-position fallback that issued one launch per row +
+            // hip.malloc + memcpy_htod per row.
+            gpu.attention_flash_q8_0_batched_masked(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
+                None, 0, 0,
+            )?;
         } else {
             gpu.attention_q8_0_kv_batched_masked(
                 &pbs.fa_q_batch,
@@ -1932,9 +1968,14 @@ impl ForwardScratch {
         let dim = config.dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
-        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats
-        // max_chunks = ceil(2048 / 128) = 16
-        let max_chunks = 16;
+        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats.
+        // chunk_size in `attention_flash` is hardcoded to 128, so
+        // max_chunks must cover ceil(max_seq / 128). For Bonsai's 65k
+        // context that's 512 chunks. Per-head footprint:
+        // 32 heads × 512 chunks × 130 floats = 8.4 MB. Trivial vs the
+        // 1.1 GB model weight footprint, but enough that we don't want
+        // to over-size further than needed.
+        let max_chunks = (config.max_seq_len + 127) / 128;
         let partial_stride = 2 + config.head_dim;
         let partials_size = config.n_heads * max_chunks * partial_stride;
         Ok(Self {
@@ -2179,10 +2220,24 @@ pub fn forward_scratch_layers_compute(
         } else if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_q8_0_kv(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            // attention_q8_0_kv allocates `(seq_len + block_size + head_dim) * 4`
+            // bytes of LDS. gfx1151's 96 KB per-WG cap puts the hard limit at
+            // seq_len ~24000 with head_dim=128 (block_size clamps to 256).
+            // Threshold 22000 leaves ~9 KB margin; flash decode (tile + reduce
+            // with O(1) shared mem) takes over above that.
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash_q8_0(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len,
+                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap, &scratch.attn_partials,
+                )?;
+            } else {
+                gpu.attention_q8_0_kv(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         } else if kv_cache.quantized {
             gpu.kv_cache_write_q4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
@@ -2193,14 +2248,38 @@ pub fn forward_scratch_layers_compute(
         } else {
             gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
             gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            // attention_f32 allocates `(seq_len + block_size + head_dim) * 4`
+            // bytes of LDS. gfx1151's 96 KB per-WG cap puts the hard limit at
+            // seq_len ~24000 with head_dim=128 (block_size clamps to 256).
+            // Threshold 22000 leaves ~9 KB margin; flash decode (split-K +
+            // multi-block reduce) is mathematically equivalent modulo FP
+            // reordering and has O(1) shared-mem usage.
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.attn_partials,
+                    seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            } else {
+                gpu.attention_f32(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         }
 
-        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        // wo + residual. Dtypes with a fused gemv_residual kernel take that
+        // path (1 launch); others use the existing gemv + add_inplace
+        // sequence with scratch.o as the pre-allocated temp (avoids the
+        // per-call alloc/free overhead the generic weight_gemv_residual
+        // fallback would add).
+        if has_fused_residual_gemv(layer.wo.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.wo, &scratch.attn_out, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        }
 
         gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
@@ -2225,8 +2304,13 @@ pub fn forward_scratch_layers_compute(
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        // w_down + residual: same fused vs scratch-tmp split as wo.
+        if has_fused_residual_gemv(layer.w_down.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        }
     }
 
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
@@ -2307,21 +2391,54 @@ pub fn forward_early_exit(
         if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_q8_0_kv(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash_q8_0(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len,
+                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap, &scratch.attn_partials,
+                )?;
+            } else {
+                gpu.attention_q8_0_kv(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         } else {
             gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
             gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            // attention_f32 allocates `(seq_len + block_size + head_dim) * 4`
+            // bytes of LDS. gfx1151's 96 KB per-WG cap puts the hard limit at
+            // seq_len ~24000 with head_dim=128 (block_size clamps to 256).
+            // Threshold 22000 leaves ~9 KB margin; flash decode (split-K +
+            // multi-block reduce) is mathematically equivalent modulo FP
+            // reordering and has O(1) shared-mem usage.
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.attn_partials,
+                    seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            } else {
+                gpu.attention_f32(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         }
 
-        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        // wo + residual. Dtypes with a fused gemv_residual kernel take that
+        // path (1 launch); others use the existing gemv + add_inplace
+        // sequence with scratch.o as the pre-allocated temp (avoids the
+        // per-call alloc/free overhead the generic weight_gemv_residual
+        // fallback would add).
+        if has_fused_residual_gemv(layer.wo.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.wo, &scratch.attn_out, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        }
 
         gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
@@ -2346,8 +2463,13 @@ pub fn forward_early_exit(
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        // w_down + residual: same fused vs scratch-tmp split as wo.
+        if has_fused_residual_gemv(layer.w_down.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        }
 
         // Early exit check at checkpoint layers
         if checkpoint_layers.contains(&layer_idx) && exit_threshold > 0.0 {
@@ -2464,10 +2586,24 @@ pub fn forward_scratch_compute(
         } else if kv_cache.quantized && kv_cache.quant_q8 {
             gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_q8_0_kv(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            // attention_q8_0_kv allocates `(seq_len + block_size + head_dim) * 4`
+            // bytes of LDS. gfx1151's 96 KB per-WG cap puts the hard limit at
+            // seq_len ~24000 with head_dim=128 (block_size clamps to 256).
+            // Threshold 22000 leaves ~9 KB margin; flash decode (tile + reduce
+            // with O(1) shared mem) takes over above that.
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash_q8_0(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len,
+                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap, &scratch.attn_partials,
+                )?;
+            } else {
+                gpu.attention_q8_0_kv(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         } else if kv_cache.quantized {
             gpu.kv_cache_write_q4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_q4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
@@ -2478,14 +2614,38 @@ pub fn forward_scratch_compute(
         } else {
             gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
             gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-            gpu.attention_f32(
-                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-            )?;
+            // attention_f32 allocates `(seq_len + block_size + head_dim) * 4`
+            // bytes of LDS. gfx1151's 96 KB per-WG cap puts the hard limit at
+            // seq_len ~24000 with head_dim=128 (block_size clamps to 256).
+            // Threshold 22000 leaves ~9 KB margin; flash decode (split-K +
+            // multi-block reduce) is mathematically equivalent modulo FP
+            // reordering and has O(1) shared-mem usage.
+            let seq_len = pos + 1;
+            if seq_len > 22_000 {
+                gpu.attention_flash(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.attn_partials,
+                    seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            } else {
+                gpu.attention_f32(
+                    &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &scratch.attn_out, &scratch.pos_buf, seq_len, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
+                )?;
+            }
         }
 
-        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        // wo + residual. Dtypes with a fused gemv_residual kernel take that
+        // path (1 launch); others use the existing gemv + add_inplace
+        // sequence with scratch.o as the pre-allocated temp (avoids the
+        // per-call alloc/free overhead the generic weight_gemv_residual
+        // fallback would add).
+        if has_fused_residual_gemv(layer.wo.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.wo, &scratch.attn_out, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+        }
 
         gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
@@ -2510,8 +2670,13 @@ pub fn forward_scratch_compute(
         }
 
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        // w_down + residual: same fused vs scratch-tmp split as wo.
+        if has_fused_residual_gemv(layer.w_down.gpu_dtype) {
+            weight_gemv_residual(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.x)?;
+        } else {
+            weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+            gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        }
     }
 
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;

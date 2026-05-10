@@ -31,12 +31,23 @@ fn main() {
         .unwrap_or(0.0);
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
 
-    let prompt_text = {
-        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--givens4", "--givens2", "--temp", "--maxgen"];
+    // --prompt-file FILE reads the prompt text from disk, bypassing ARG_MAX
+    // limits for long-context (32k+) prompts. Mirrors infer_qwen3.
+    let prompt_file = args.iter().position(|a| a == "--prompt-file")
+        .and_then(|i| args.get(i + 1).cloned());
+
+    let prompt_text = if let Some(pf) = prompt_file {
+        std::fs::read_to_string(&pf)
+            .unwrap_or_else(|e| { eprintln!("failed to read --prompt-file {pf}: {e}"); std::process::exit(2); })
+    } else {
+        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--givens4", "--givens2", "--temp", "--maxgen", "--prompt-file"];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..].iter().filter(|a| {
             if skip_next { skip_next = false; return false; }
-            if skip_flags.contains(&a.as_str()) { skip_next = a.as_str() == "--temp" || a.as_str() == "--maxgen"; return false; }
+            if skip_flags.contains(&a.as_str()) {
+                skip_next = matches!(a.as_str(), "--temp" | "--maxgen" | "--prompt-file");
+                return false;
+            }
             true
         }).map(|s| s.as_str()).collect();
         if parts.is_empty() { "Hello".to_string() } else { parts.join(" ") }
@@ -69,6 +80,11 @@ fn main() {
         eprintln!("Tokenizer: {} tokens (from GGUF)", t.vocab_size());
         t
     };
+
+    // Default-on prompt normalization (collapse 3+ \n to 2). Per CLAUDE.md
+    // this is worth +24% τ on PEP-8 code prompts. Opt out via
+    // HIPFIRE_NORMALIZE_PROMPT=0 for whitespace-load-bearing prompts.
+    let prompt_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_text).into_owned();
 
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
 
@@ -107,7 +123,14 @@ fn main() {
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // KV cache
-    let kv_seq_len = config.max_seq_len.min(2048);
+    // Cap KV at 2048 by default, override via HIPFIRE_KV_MAX_SEQ. Long-context
+    // probes (needle-in-haystack 4k+) need the full ctx. Mirrors infer_qwen3.
+    let kv_seq_len_default: usize = 2048;
+    let kv_seq_len = std::env::var("HIPFIRE_KV_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(config.max_seq_len))
+        .unwrap_or(config.max_seq_len.min(kv_seq_len_default));
     let mut kv_cache = if use_givens4 {
         KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_givens2 {
@@ -136,12 +159,18 @@ fn main() {
     // Prefill: WMMA-fused batched path via llama::forward_prefill_batch when
     // weights + KV qualify; per-token forward_scratch fallback otherwise. The
     // batched path natively supports Q8 + asym{2,3,4}; HFQ4 KV stays sequential.
+    // Errors from forward_prefill_batch are surfaced and trigger the per-token
+    // fallback rather than panicking — mirrors infer_qwen3.
     let t1 = Instant::now();
     let batched_ok = !use_hfq4kv;
-    let mut next_token = if batched_ok {
+    let batched_result = if batched_ok {
         llama::forward_prefill_batch(
             &mut gpu, &weights, &config, &prompt_tokens, 0, &mut kv_cache, &scratch, None,
-        ).expect("forward_prefill_batch failed");
+        )
+    } else {
+        Err(hip_bridge::HipError::new(0, "HFQ4 KV requires sequential prefill"))
+    };
+    let mut next_token = if let Ok(()) = batched_result {
         let prompt_ms = t1.elapsed().as_millis();
         eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [batched]",
             prompt_ms, prompt_tokens.len(),
@@ -149,6 +178,11 @@ fn main() {
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         llama::argmax(&logits)
     } else {
+        if let Err(e) = &batched_result {
+            if batched_ok {
+                eprintln!("forward_prefill_batch failed ({e}); falling back to sequential per-token");
+            }
+        }
         for (pos, &token) in prompt_tokens.iter().enumerate() {
             let (_, rng) = llama::forward_scratch(
                 &mut gpu, &weights, &config, token, pos, &mut kv_cache,

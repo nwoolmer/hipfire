@@ -54,14 +54,21 @@ fn main() {
         None => false,
     };
 
-    let prompt_text = {
-        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--givens4", "--givens2", "--temp", "--maxgen", "--guards"];
+    // --prompt-file FILE reads the entire prompt text from disk, bypassing
+    // ARG_MAX limits for long-context (32k+) prompts.
+    let prompt_file = args.iter().position(|a| a == "--prompt-file")
+        .and_then(|i| args.get(i + 1).cloned());
+
+    let prompt_text = if let Some(pf) = prompt_file {
+        std::fs::read_to_string(&pf)
+            .unwrap_or_else(|e| { eprintln!("failed to read --prompt-file {pf}: {e}"); std::process::exit(2); })
+    } else {
+        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--givens4", "--givens2", "--temp", "--maxgen", "--guards", "--prompt-file"];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..].iter().filter(|a| {
             if skip_next { skip_next = false; return false; }
             if skip_flags.contains(&a.as_str()) {
-                // --temp, --maxgen, and --guards take a value argument.
-                skip_next = matches!(a.as_str(), "--temp" | "--maxgen" | "--guards");
+                skip_next = matches!(a.as_str(), "--temp" | "--maxgen" | "--guards" | "--prompt-file");
                 return false;
             }
             true
@@ -101,6 +108,12 @@ fn main() {
         eprintln!("Tokenizer: {} tokens (from GGUF)", t.vocab_size());
         t
     };
+
+    // Default-on prompt normalization (collapse 3+ consecutive newlines to 2).
+    // Per CLAUDE.md: worth +24% τ on PEP-8 code prompts (159 → 196 tok/s on
+    // 27B-3.5 LRU DFlash) without correctness cost. Opt out via
+    // HIPFIRE_NORMALIZE_PROMPT=0 for raw whitespace-load-bearing prompts.
+    let prompt_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_text).into_owned();
 
     let prompt_tokens = if use_guards {
         // Production framing path: route through hipfire_runtime::prompt_frame so
@@ -155,7 +168,14 @@ fn main() {
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // KV cache
-    let kv_seq_len = config.max_seq_len.min(2048);
+    // Cap KV at 2048 by default, override via HIPFIRE_KV_MAX_SEQ. Long-
+    // context probes (needle-in-haystack 4k+) need the full ctx.
+    let kv_seq_len_default: usize = 2048;
+    let kv_seq_len = std::env::var("HIPFIRE_KV_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(config.max_seq_len))
+        .unwrap_or(config.max_seq_len.min(kv_seq_len_default));
     let mut kv_cache = if use_givens4 {
         KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_givens2 {
@@ -181,12 +201,38 @@ fn main() {
     let repeat_penalty: f32 = 1.1;
     let repeat_window: usize = 64;
 
-    // Prefill: try batched (skip for non-standard KV formats), fallback to sequential
+    // Prefill order of preference:
+    //   1. forward_prefill_batch — WMMA-fused chunked path. Supports HFQ1G128 +
+    //      MQ3 + HFQ4G256 + Q8/asym2/asym3/asym4 KV. ~6× faster than
+    //      prefill_forward on Bonsai 8B (was 100 → 620 tok/s after fixing the
+    //      output-indexing bug in gemm_hfq1g128_residual_wmma).
+    //   2. prefill_forward — older non-WMMA per-row GEMM path. Required for
+    //      KV layouts that the batched path does not support yet (HFQ4 KV).
+    //   3. Sequential per-token forward_scratch — when even prefill_forward
+    //      doesn't fit (givens4/2 + non-batched configs).
+    //
+    // forward_prefill_batch writes logits into `scratch.logits` and returns
+    // (); prefill_forward returns Vec<f32>. Normalize both into Vec<f32>.
+    //
+    // Failures are surfaced (not swallowed): when path 1 errors we print
+    // why before falling back, so a kernel regression doesn't silently
+    // collapse to the slow path with no signal to the user.
     let t1 = Instant::now();
-    let prefill_logits = if use_givens4 || use_givens2 || use_hfq4kv {
+    let mut prefill_path: &'static str = "batched";
+    let prefill_logits: hip_bridge::HipResult<Vec<f32>> = if use_givens4 || use_givens2 || use_hfq4kv {
+        prefill_path = "sequential[guards/quant-kv]";
         Err(hip_bridge::HipError::new(0, "quantized KV requires sequential prefill"))
     } else {
-        llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache)
+        match llama::forward_prefill_batch(
+            &mut gpu, &weights, &config, &prompt_tokens, 0, &mut kv_cache, &scratch, None,
+        ) {
+            Ok(()) => gpu.download_f32(&scratch.logits),
+            Err(e) => {
+                eprintln!("forward_prefill_batch failed ({e}); falling back to prefill_forward");
+                prefill_path = "non-WMMA per-row";
+                llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache)
+            }
+        }
     };
 
     // Production sampler config (used only when --guards on). Mirrors
@@ -204,7 +250,7 @@ fn main() {
 
     let mut next_token = if let Ok(logits) = prefill_logits {
         let prompt_ms = t1.elapsed().as_millis();
-        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [batched]",
+        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [{prefill_path}]",
             prompt_ms, prompt_tokens.len(),
             prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
         llama::argmax(&logits)

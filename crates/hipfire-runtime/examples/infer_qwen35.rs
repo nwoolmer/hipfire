@@ -81,6 +81,11 @@ fn main() {
             hipfire_runtime::tokenizer::Tokenizer::from_gguf(&gguf).expect("tokenizer failed")
         });
 
+    // Default-on prompt normalization (collapse 3+ \n to 2). Per CLAUDE.md
+    // worth +24% τ on PEP-8 code prompts. Mirrors infer_qwen3 / infer_hfq
+    // and the daemon path. Opt out via HIPFIRE_NORMALIZE_PROMPT=0.
+    let prompt_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_text).into_owned();
+
     let prompt_tokens = if use_guards {
         // Production framing path: route through hipfire_runtime::prompt_frame so
         // the example's prompt assembly matches the daemon byte-for-byte.
