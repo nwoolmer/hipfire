@@ -1381,6 +1381,212 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
 /// weights. 8 B header (4 fp16) + 64 B packed 2-bit indices = 72 B/group —
 /// bandwidth-identical to uniform MQ2. The "true non-uniform 4-entry codebook"
 /// described in `docs/plans/mq-sub4bit-research-queue.md` Q1.
+/// Map a safetensors parent tensor name to the corresponding llama.cpp
+/// imatrix tensor base name. Returns None if the safetensors tensor isn't
+/// one of the routed-expert MoE tensors we have imatrix data for.
+///
+/// Examples:
+///   `model.language_model.layers.0.mlp.experts.gate_up_proj`
+///     → Some(("blk.0.ffn_gate_exps.weight", 0))
+///   `model.language_model.layers.7.mlp.experts.down_proj`
+///     → Some(("blk.7.ffn_down_exps.weight", 7))
+fn safetensors_to_imatrix_key(parent: &str) -> Option<(String, usize)> {
+    // Expected pattern: model.language_model.layers.{N}.mlp.experts.{gate_up_proj|down_proj}
+    let suffix_gate = ".mlp.experts.gate_up_proj";
+    let suffix_down = ".mlp.experts.down_proj";
+    let (prefix, kind) = if let Some(p) = parent.strip_suffix(suffix_gate) {
+        (p, "ffn_gate_exps")
+    } else if let Some(p) = parent.strip_suffix(suffix_down) {
+        (p, "ffn_down_exps")
+    } else {
+        return None;
+    };
+    // Extract layer N from "...layers.{N}".
+    let layer_marker = ".layers.";
+    let layer_idx_start = prefix.rfind(layer_marker)? + layer_marker.len();
+    let layer_str = &prefix[layer_idx_start..];
+    let n: usize = layer_str.parse().ok()?;
+    Some((format!("blk.{}.{}.weight", n, kind), n))
+}
+
+/// Pull per-expert column-weights from an imatrix GGUF for a given
+/// MoE-expert parent tensor (e.g. `...experts.gate_up_proj`). Returns
+/// `Some(per_expert_col_weights)` where the outer Vec has `n_experts`
+/// entries, each an inner Vec of length K with `sqrt(in_sum2[j] / counts)`
+/// (the per-column importance scale).
+///
+/// Returns None when the parent doesn't map to a known imatrix key, or
+/// the tensor isn't present in the imatrix.
+fn imatrix_col_weights_for_parent(
+    gguf: &gguf_input::GgufFile,
+    parent: &str,
+    n_experts: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let (base_key, _layer) = safetensors_to_imatrix_key(parent)?;
+    let in_sum2_name = format!("{}.in_sum2", base_key);
+    let counts_name = format!("{}.counts", base_key);
+    let in_sum2 = gguf.tensors.iter().find(|t| t.name == in_sum2_name)?;
+    let counts = gguf.tensors.iter().find(|t| t.name == counts_name)?;
+    // Shape: in_sum2 is [K, n_experts] (GGUF column-major-ish: shape[0]=K is innermost).
+    if in_sum2.shape.len() != 2 || counts.shape.len() != 2 {
+        return None;
+    }
+    let k = in_sum2.shape[0];
+    let n_exp = in_sum2.shape[1];
+    if n_exp != n_experts {
+        eprintln!("  imatrix: {} n_experts mismatch ({} vs {})",
+            in_sum2_name, n_exp, n_experts);
+        return None;
+    }
+    let in_sum2_bytes = gguf.tensor_data(in_sum2);
+    let counts_bytes = gguf.tensor_data(counts);
+    let in_sum2_flat: Vec<f32> = in_sum2_bytes.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let counts_flat: Vec<f32> = counts_bytes.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    if in_sum2_flat.len() != k * n_exp || counts_flat.len() != n_exp {
+        eprintln!("  imatrix: {} length mismatch", in_sum2_name);
+        return None;
+    }
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(n_exp);
+    for e in 0..n_exp {
+        let count = counts_flat[e].max(1.0);
+        let offset = e * k;
+        let mut col_w: Vec<f32> = Vec::with_capacity(k);
+        for j in 0..k {
+            // in_sum2 stores SUM of x_j² over `count` activations; mean is
+            // in_sum2/count. Take sqrt for the per-column importance scale
+            // (matches the C-norm used by GPTQ / Hessian-diagonal methods).
+            col_w.push((in_sum2_flat[offset + j] / count).sqrt());
+        }
+        out.push(col_w);
+    }
+    Some(out)
+}
+
+/// Imatrix-weighted MQ2-Lloyd quantization. Per-column importance weights
+/// from a calibration imatrix shift the Lloyd codebook centroids toward
+/// values that minimize the IMPORTANCE-WEIGHTED MSE rather than uniform
+/// MSE. Helps preserve precision on high-activation columns.
+///
+/// Mathematical caveat: the FWHT rotation mixes columns within a block, so
+/// per-position weighting in the rotated domain is not exactly equivalent
+/// to per-column weighting in the original domain (off-diagonal terms in
+/// the rotated Hessian are non-zero). This is a first-order approximation:
+/// it tilts centroid choice toward high-importance positions but misses
+/// the cross-column coupling that a proper GPTQ-LDLQ solve would capture.
+///
+/// `col_weights` is shape [K] (per-original-column importance values, e.g.
+/// sqrt(E[x²]) from an imatrix). For each 256-weight block at offset b in
+/// `f32_data` row-major, the relevant slice is
+/// `col_weights[(b % blocks_per_row) * 256 .. + 256]`.
+fn quantize_mq2g256_lloyd_weighted(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let blocks_per_row = col_weights.len() / group_size;
+    assert!(blocks_per_row > 0, "col_weights too short");
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            // Per-position weights for this block — from the matching column
+            // slice of the importance vector. (See caveat above re: FWHT.)
+            let col_off = (b % blocks_per_row) * group_size;
+            let block_w: &[f32] = &col_weights[col_off..col_off + group_size];
+
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125),
+                percentile(0.375),
+                percentile(0.625),
+                percentile(0.875),
+            ];
+
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 8;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    // Weighted centroid update: cb[k] = sum_{i in k} w_i * v_i / sum_{i in k} w_i.
+                    // (The assignment step is UNWEIGHTED — w_i is a per-point
+                    // scalar that cancels from argmin_k |v_i - cb[k]|²; only
+                    // the centroid update changes from uniform Lloyd.)
+                    let mut weighted_sums = [0.0f64; 4];
+                    let mut weight_totals = [0.0f64; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        let pw = block_w[i] as f64;
+                        weighted_sums[best] += pw * w as f64;
+                        weight_totals[best] += pw;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if weight_totals[k] > 0.0 {
+                            cb[k] = (weighted_sums[k] / weight_totals[k]) as f32;
+                        }
+                    }
+                }
+            }
+
+            // Sort centroids ascending (canonical header).
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            let mut inv: [u8; 4] = [0; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+
+    output
+}
+
 fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
@@ -3157,6 +3363,22 @@ fn main() {
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
+
+    // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
+    // When provided, MQ2-Lloyd quantization uses per-column importance weights
+    // to bias centroid placement. See `quantize_mq2g256_lloyd_weighted`.
+    let imatrix_path: Option<&str> = args.iter().position(|a| a == "--imatrix")
+        .map(|i| args[i + 1].as_str());
+    let imatrix_gguf: Option<gguf_input::GgufFile> = imatrix_path.map(|p| {
+        eprintln!("Loading imatrix: {p}");
+        gguf_input::GgufFile::open(Path::new(p))
+            .unwrap_or_else(|e| { eprintln!("imatrix open failed: {e}"); std::process::exit(2); })
+    });
+    if let Some(ref gg) = imatrix_gguf {
+        let n_in_sum2 = gg.tensors.iter().filter(|t| t.name.ends_with(".in_sum2")).count();
+        let n_counts  = gg.tensors.iter().filter(|t| t.name.ends_with(".counts")).count();
+        eprintln!("  imatrix: {} in_sum2 + {} counts tensors", n_in_sum2, n_counts);
+    }
     // q8f16 = all weights Q8 (interleaved blocks)
     // q4f16 = all weights Q4_F16_G64
     // q8-mixed = Q8 attn + Q4_K FFN (best tok/s for VRAM-constrained)
@@ -3215,6 +3437,25 @@ fn main() {
     let use_mq4_mq2lloyd_kmap = format == "mq4-mq2lloyd-kmap"
         || format == "mq4-mq2lloyd-respectkmap"
         || format == "mq4-mq2lloyd-kmap-promote";
+    // Imatrix-weighted variant: like mq4-mq2lloyd-kmap, but the Lloyd
+    // codebook for each non-promoted expert is fit with per-column
+    // importance weights from a llama.cpp imatrix file (--imatrix flag).
+    // The kmap-promoted ~30 % of expert layers still stay at MQ6.
+    let use_mq4_mq2lloyd_imatrix = format == "mq4-mq2lloyd-imatrix"
+        || format == "mq4-mq2lloyd-kmap-imatrix"
+        || format == "mq4-mq2lloyd-imatrix-kmap";
+    if use_mq4_mq2lloyd_imatrix {
+        if imatrix_path.is_none() {
+            eprintln!("error: --format mq4-mq2lloyd-imatrix requires --imatrix <PATH>");
+            std::process::exit(2);
+        }
+        eprintln!(
+            "note: --format mq4-mq2lloyd-imatrix uses per-column importance\n\
+             weights from the supplied calibration imatrix. Promoted experts\n\
+             still stay at MQ6 (kmap-respect). Falls back to uniform Lloyd\n\
+             for any expert whose imatrix tensor is missing."
+        );
+    }
     if use_mq4_mq2lloyd_kmap {
         eprintln!(
             "note: --format mq4-mq2lloyd-kmap respects K-map promotion —\n\
@@ -3375,7 +3616,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_kmap) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq2lloyd_kmap) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -3635,12 +3876,13 @@ fn main() {
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
             let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
-            // For the kmap-respecting MQ2-Lloyd variant, kmap_promote experts
+            // For the kmap-respecting MQ2-Lloyd variants, kmap_promote experts
             // get MQ6 instead of MQ2-Lloyd. Falls through to expert_mq6 below.
             let expert_mq6 = (use_mq6g256
                               || use_mq4_mq6exp
                               || (kmap_promote && use_mq4g256)
-                              || (kmap_promote && use_mq4_mq2lloyd_kmap))
+                              || (kmap_promote && use_mq4_mq2lloyd_kmap)
+                              || (kmap_promote && use_mq4_mq2lloyd_imatrix))
                 && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
@@ -3652,11 +3894,28 @@ fn main() {
             // Native MQ2-Lloyd: ship qt=19 bytes directly, no round-trip.
             // Requires runtime support for DType::MQ2G256Lloyd on experts.
             // For -native (no kmap respect): always MQ2-Lloyd on every expert.
-            // For -kmap (kmap respect): only non-promoted experts go MQ2-Lloyd;
-            // promoted ones hit `expert_mq6` above.
+            // For -kmap / -imatrix (kmap respect): only non-promoted experts
+            // go MQ2-Lloyd; promoted ones hit `expert_mq6` above.
             let expert_mq2lloyd_native = (use_mq4_mq2lloyd_native
-                                          || (use_mq4_mq2lloyd_kmap && !kmap_promote))
+                                          || (use_mq4_mq2lloyd_kmap && !kmap_promote)
+                                          || (use_mq4_mq2lloyd_imatrix && !kmap_promote))
                 && supports_g256;
+            // Per-expert column-weights from the imatrix file, used only by
+            // the imatrix variant. Built once per parent (cheap), then sliced
+            // per expert inside the rayon loop. Falls back to None when the
+            // imatrix tensor for this parent isn't found (e.g. a non-expert
+            // tensor we accidentally route here, or a layer that wasn't in
+            // the calibration set).
+            let imatrix_lookup_name = format!("{}{}", parent, base_name);
+            let imatrix_per_expert: Option<Vec<Vec<f32>>> =
+                if use_mq4_mq2lloyd_imatrix && imatrix_gguf.is_some() && expert_mq2lloyd_native {
+                    imatrix_col_weights_for_parent(
+                        imatrix_gguf.as_ref().unwrap(), &imatrix_lookup_name, n_experts,
+                    )
+                } else { None };
+            if use_mq4_mq2lloyd_imatrix && expert_mq2lloyd_native && imatrix_per_expert.is_none() {
+                eprintln!("  imatrix: no entry for {} → falling back to uniform Lloyd", imatrix_lookup_name);
+            }
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -3670,7 +3929,29 @@ fn main() {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if expert_mq6 {
+                let (quantized, qt, gs) = if expert_mq2lloyd_native {
+                    // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
+                    // Imatrix-weighted when per-expert column importance is
+                    // available; uniform Lloyd otherwise.
+                    let q = match imatrix_per_expert.as_ref() {
+                        Some(table) if x < table.len() && !table[x].is_empty() => {
+                            quantize_mq2g256_lloyd_weighted(&f32_slice, &table[x], &signs1, &signs2)
+                        }
+                        _ => quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2),
+                    };
+                    (q, QuantType::MQ2G256Lloyd, 256u32)
+                } else if expert_mq2lloyd_roundtrip {
+                    // MQ2-Lloyd → F32 → HFQ4 round-trip. The MQ2 step injects
+                    // the 2-bit Lloyd-codebook noise; the HFQ4 step re-packs
+                    // for runtime. Final on-disk format is HFQ4G256, no
+                    // engine changes required.
+                    let mq2_bytes = quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2);
+                    let dequant = dequantize_mq2g256_lloyd_to_f32(
+                        &mq2_bytes, f32_slice.len(), &signs1, &signs2,
+                    );
+                    let q = quantize_hfq4g256(&dequant);
+                    (q, QuantType::HFQ4G256, 256u32)
+                } else if expert_mq6 {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32)
                 } else if expert_hfq6 {
@@ -3697,7 +3978,9 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if expert_mq2lloyd_native {
+                if imatrix_per_expert.is_some() { "MQ2L+imatrix" } else { "MQ2G256L" }
+            } else if expert_mq2lloyd_roundtrip { "MQ2L→HFQ4" } else if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -3790,7 +4073,7 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix
                     || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
@@ -3899,10 +4182,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
