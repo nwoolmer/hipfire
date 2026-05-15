@@ -1464,6 +1464,50 @@ fn imatrix_col_weights_for_parent(
     Some(out)
 }
 
+/// Per-layer "importance score" from an imatrix GGUF, used by Phase 5
+/// tiered MQ-Lloyd to rank routed-expert layers.
+///
+/// Importance proxy: **mean activation magnitude per expert** =
+/// `sum(in_sum2) / sum(counts)`. The mean (not sum) is the right
+/// per-layer comparator because `counts` is approximately constant
+/// across layers in a typical imatrix calibration (every layer sees
+/// the same total tokens). Per-expert mean activation magnitude varies
+/// substantially because different layers operate at different
+/// activation scales.
+///
+/// Returns `None` if the imatrix doesn't have ffn_gate_exps tensors
+/// (non-MoE imatrix). Returns a Vec<f64> of length n_layers; layers
+/// not present get f64::NAN.
+fn imatrix_layer_activation_counts(
+    gguf: &gguf_input::GgufFile,
+    n_layers: usize,
+) -> Option<Vec<f64>> {
+    let mut out = vec![f64::NAN; n_layers];
+    let mut found_any = false;
+    for n in 0..n_layers {
+        let in_sum2_name = format!("blk.{}.ffn_gate_exps.weight.in_sum2", n);
+        let counts_name = format!("blk.{}.ffn_gate_exps.weight.counts", n);
+        let sum2 = gguf.tensors.iter().find(|t| t.name == in_sum2_name);
+        let cts = gguf.tensors.iter().find(|t| t.name == counts_name);
+        if let (Some(s2), Some(c)) = (sum2, cts) {
+            let s2_bytes = gguf.tensor_data(s2);
+            let c_bytes = gguf.tensor_data(c);
+            let sum2_total: f64 = s2_bytes.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]) as f64)
+                .sum();
+            let counts_total: f64 = c_bytes.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]) as f64)
+                .sum();
+            if counts_total > 0.0 {
+                // mean activation magnitude per K-column per expert in this layer
+                out[n] = sum2_total / counts_total;
+                found_any = true;
+            }
+        }
+    }
+    if found_any { Some(out) } else { None }
+}
+
 /// Imatrix-weighted MQ2-Lloyd quantization. Per-column importance weights
 /// from a calibration imatrix shift the Lloyd codebook centroids toward
 /// values that minimize the IMPORTANCE-WEIGHTED MSE rather than uniform
@@ -3467,6 +3511,43 @@ fn main() {
              3 bpw fallback when 2 bpw can't avoid attractors on code-gen."
         );
     }
+    // Phase 5: importance-aware MQ2/MQ3 layer tiering. Requires --imatrix.
+    // Per-layer aggregate counts rank layers by routing activity; the top
+    // `tier_ratio` fraction of NON-PROMOTED layers gets MQ3-Lloyd (3.5 bpw)
+    // for higher precision on hot layers, the bottom fraction gets
+    // MQ2-Lloyd (2.25 bpw) for size. K-map-promoted layers stay at MQ6.
+    //
+    // Granularity is PER LAYER (not per expert within a layer) because the
+    // MoE-indexed kernels require uniform dtype across experts within a
+    // tensor — the kernel reads expert_ptrs and assumes a fixed byte
+    // stride per group (72 B for MQ2 vs 112 B for MQ3).
+    let use_mq4_mqlloyd_tiered = format == "mq4-mqlloyd-tiered"
+        || format == "mq4-mqlloyd-tiered-imatrix"
+        || format == "mqlloyd-tiered";
+    let tier_ratio: f64 = args.iter().position(|a| a == "--tier-ratio")
+        .and_then(|i| args.get(i + 1).and_then(|s| s.parse().ok()))
+        .or_else(|| std::env::var("HIPFIRE_TIER_RATIO").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(0.30);
+    if use_mq4_mqlloyd_tiered {
+        if imatrix_path.is_none() {
+            eprintln!("error: --format mq4-mqlloyd-tiered requires --imatrix <PATH>");
+            std::process::exit(2);
+        }
+        if !allow_mq3_lloyd_for_mixed {
+            eprintln!(
+                "note: --format mq4-mqlloyd-tiered requires --allow-mq3-lloyd or\n\
+                 HIPFIRE_ALLOW_MQ3_LLOYD=1 (uses MQ3-Lloyd on the hot layers)."
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "note: --format mq4-mqlloyd-tiered uses imatrix .counts to rank\n\
+             routed-expert layers by aggregate activation. Top {:.0}% of\n\
+             non-promoted layers go to MQ3-Lloyd (3.5 bpw); the rest go to\n\
+             MQ2-Lloyd (2.25 bpw). K-map-promoted layers stay at MQ6.",
+            tier_ratio * 100.0
+        );
+    }
     if use_mq4_mq2lloyd_imatrix {
         if imatrix_path.is_none() {
             eprintln!("error: --format mq4-mq2lloyd-imatrix requires --imatrix <PATH>");
@@ -3639,7 +3720,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -3821,6 +3902,53 @@ fn main() {
         map
     };
 
+    // Phase 5: per-layer tier set — which routed-expert layers go MQ3-Lloyd
+    // vs MQ2-Lloyd. Only populated for `--format mq4-mqlloyd-tiered`.
+    // Computed once from imatrix .counts; kmap-promoted layers are excluded
+    // (they always go MQ6).
+    let mq3_tier_layers: std::collections::HashSet<usize> = if use_mq4_mqlloyd_tiered {
+        if let Some(ref gguf) = imatrix_gguf {
+            if let Some(layer_counts) = imatrix_layer_activation_counts(gguf, n_layers) {
+                // Indexes of layers NOT promoted by K-map. We need a name
+                // representative of each layer's expert tensor to query
+                // kmap; use the canonical safetensors name format.
+                let candidates: Vec<usize> = (0..n_layers).filter(|&l| {
+                    let probe_name = format!(
+                        "model.language_model.layers.{}.mlp.experts.gate_up_proj", l);
+                    kmap.get(&probe_name) != Some(&QuantLevel::Promote6)
+                }).collect();
+                let mut ranked: Vec<(usize, f64)> = candidates.iter()
+                    .filter(|&&l| layer_counts[l].is_finite())
+                    .map(|&l| (l, layer_counts[l]))
+                    .collect();
+                // Sort by count DESC (hot layers first).
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let n_mq3 = ((ranked.len() as f64) * tier_ratio).round() as usize;
+                let n_mq3 = n_mq3.min(ranked.len());
+                let set: std::collections::HashSet<usize> =
+                    ranked.iter().take(n_mq3).map(|&(l, _)| l).collect();
+                eprintln!(
+                    "Tiered MQ-Lloyd: {} candidate non-promoted layers; \
+                     {} (top {:.0}%) → MQ3-Lloyd, {} → MQ2-Lloyd",
+                    ranked.len(), set.len(), tier_ratio * 100.0,
+                    ranked.len().saturating_sub(set.len())
+                );
+                if set.len() <= 16 {
+                    eprintln!("  MQ3-Lloyd layers (by count): {:?}",
+                        ranked.iter().take(n_mq3).map(|&(l, c)| (l, c as u64)).collect::<Vec<_>>());
+                }
+                set
+            } else {
+                eprintln!("warning: imatrix has no ffn_gate_exps counts — tiering disabled");
+                std::collections::HashSet::new()
+            }
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Quantize
     let mut hfq_tensors = Vec::new();
     let mut total_params = 0u64;
@@ -3899,6 +4027,22 @@ fn main() {
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
             let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            // Phase 5 tiering decision needs the layer index for this parent.
+            // Computed once here and reused by both expert_mq2lloyd_native
+            // and expert_mq3lloyd_native below.
+            let parent_layer: Option<usize> = {
+                let marker = ".layers.";
+                parent.rfind(marker).and_then(|i| {
+                    let rest = &parent[i + marker.len()..];
+                    rest.split('.').next().and_then(|s| s.parse().ok())
+                })
+            };
+            let tiered_layer_is_mq3 = use_mq4_mqlloyd_tiered
+                && !kmap_promote
+                && parent_layer.map(|l| mq3_tier_layers.contains(&l)).unwrap_or(false);
+            let tiered_layer_is_mq2 = use_mq4_mqlloyd_tiered
+                && !kmap_promote
+                && parent_layer.map(|l| !mq3_tier_layers.contains(&l)).unwrap_or(false);
             // For the kmap-respecting MQ2-Lloyd variants, kmap_promote experts
             // get MQ6 instead of MQ2-Lloyd. Falls through to expert_mq6 below.
             let expert_mq6 = (use_mq6g256
@@ -3922,12 +4066,19 @@ fn main() {
             // go MQ2-Lloyd; promoted ones hit `expert_mq6` above.
             let expert_mq2lloyd_native = (use_mq4_mq2lloyd_native
                                           || (use_mq4_mq2lloyd_kmap && !kmap_promote)
-                                          || (use_mq4_mq2lloyd_imatrix && !kmap_promote))
+                                          || (use_mq4_mq2lloyd_imatrix && !kmap_promote)
+                                          || tiered_layer_is_mq2)
                 && supports_g256;
             // MQ3-Lloyd asymmetric: non-promoted experts → qt=20 (3.5 bpw).
             // Promoted ones hit `expert_mq6` above (note: kmap_promote already
             // includes use_mq4_mq3lloyd_kmap via the expert_mq6 expression).
-            let expert_mq3lloyd_native = use_mq4_mq3lloyd_kmap && !kmap_promote && supports_g256;
+            //
+            // Phase 5 tiered variant: also MQ3-Lloyd on hot non-promoted
+            // layers (the ones in `mq3_tier_layers`, decided above by imatrix
+            // .counts ranking).
+            let expert_mq3lloyd_native = ((use_mq4_mq3lloyd_kmap && !kmap_promote)
+                                          || tiered_layer_is_mq3)
+                && supports_g256;
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -4106,7 +4257,7 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered
                     || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
@@ -4215,10 +4366,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
