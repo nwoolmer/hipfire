@@ -1000,6 +1000,68 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
     output
 }
 
+/// Inverse FWHT used by `dequantize_mq2g256_lloyd_to_f32`. Mirrors
+/// `cpu_fwht_256` with `signs1` / `signs2` roles swapped — F is involutory
+/// up to a 1/16 scale on each side, so F^{-1}(y) = signs1 * (1/16) *
+/// FWHT_butt(signs2 * y).
+fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 256);
+    for i in 0..256 { x[i] *= signs2[i]; }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale = 0.0625; // 1/sqrt(256) = 1/16
+    for i in 0..256 { x[i] *= scale * signs1[i]; }
+}
+
+/// Dequantize MQ2-G256-Lloyd bytes back to F32. Used for the round-trip
+/// quality probe (quantize_mq2g256_lloyd → dequantize → quantize_hfq4g256)
+/// so we can measure how much PPL the MQ2-Lloyd noise alone injects when
+/// the experts are subsequently shipped as plain MQ4. Inverse of
+/// `quantize_mq2g256_lloyd` modulo FP rounding.
+fn dequantize_mq2g256_lloyd_to_f32(
+    data: &[u8], n_weights: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<f32> {
+    let group_size = 256;
+    let block_bytes = 72;
+    let n_blocks = (n_weights + group_size - 1) / group_size;
+    assert!(data.len() == n_blocks * block_bytes);
+    let mut out = vec![0.0f32; n_weights];
+    use rayon::prelude::*;
+    out.par_chunks_mut(group_size).enumerate().for_each(|(b, out_chunk)| {
+        let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+        let cb: [f32; 4] = [
+            f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+            f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+            f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+        ];
+        let mut group = [0.0f32; 256];
+        for i in 0..64 {
+            let byte_val = blk[8 + i];
+            for j in 0..4 {
+                let idx = (byte_val >> (j * 2)) & 0x3;
+                group[4 * i + j] = cb[idx as usize];
+            }
+        }
+        cpu_inv_fwht_256(&mut group, signs1, signs2);
+        let actual = out_chunk.len();
+        out_chunk.copy_from_slice(&group[..actual]);
+    });
+    out
+}
+
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
@@ -2304,6 +2366,40 @@ fn main() {
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
     let use_mq4_mq6exp = format == "mq4-mq6exp" || format == "mq4-mq6experts";
+    // Round-trip quality probe: route routed-MoE experts through MQ2-Lloyd
+    // quantize → dequantize → re-quantize as HFQ4. The .hfq ships as plain
+    // MQ4 (HFQ4G256), no runtime changes. Measures whether 2-bit noise on
+    // routed experts survives the MoE sparse-usage rescue, before sinking
+    // a week into new MoE-2bit GEMV kernels.
+    let use_mq4_mq2lloydexp = format == "mq4-mq2lloydexp"
+        || format == "mq4-mq2lloydexperts"
+        || format == "mq4-mq2lloyd-exp";
+    if use_mq4_mq2lloydexp {
+        eprintln!(
+            "note: --format mq4-mq2lloydexp is a quality probe — routed MoE\n\
+             experts go through MQ2-Lloyd round-trip (quantize → dequantize)\n\
+             before being re-quantized as MQ4. Output is shipped as plain\n\
+             MQ4 (no runtime changes needed). Measures whether MoE sparse\n\
+             usage rescues MQ2-Lloyd at the experts before investing in new\n\
+             MoE-2bit GEMV kernels."
+        );
+    }
+    // Native Phase-2 form: routed MoE experts ship as native MQ2G256Lloyd
+    // (qt=19). Requires runtime support — the qwen35 MoE forward path must
+    // dispatch the new gemv_mq2g256_lloyd_moe_*_indexed* kernels (or fall
+    // through to weight_gemv's MQ2G256Lloyd arm for the slow per-expert
+    // path).
+    let use_mq4_mq2lloyd_native = format == "mq4-mq2lloyd-native"
+        || format == "mq4-mq2lloydexp-native"
+        || format == "mq4-mq2lloyd-routed";
+    if use_mq4_mq2lloyd_native {
+        eprintln!(
+            "note: --format mq4-mq2lloyd-native ships routed MoE experts as\n\
+             native MQ2G256Lloyd (qt=19, 72 B/group). Runtime must support\n\
+             the MQ2-Lloyd MoE dispatch (weight_gemv arm exists; indexed\n\
+             fast path requires forward-path arms in hipfire-arch-qwen35)."
+        );
+    }
     if use_mq4_mq6exp {
         eprintln!(
             "warning: --format mq4-mq6exp is deprecated. Use --format mq4 instead — \
@@ -2367,7 +2463,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if use_mq2g256_lloyd && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -2629,6 +2725,14 @@ fn main() {
             let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
+            // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
+            // (overrides any kmap promotion). The intent is to inject MQ2
+            // noise specifically on the routed-expert tensors, so even
+            // K-map "Promote6" experts get the MQ2-Lloyd round-trip here.
+            let expert_mq2lloyd_roundtrip = use_mq4_mq2lloydexp && supports_g256;
+            // Native MQ2-Lloyd: ship qt=19 bytes directly, no round-trip.
+            // Requires runtime support for DType::MQ2G256Lloyd on experts.
+            let expert_mq2lloyd_native = use_mq4_mq2lloyd_native && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -2642,7 +2746,24 @@ fn main() {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if expert_mq6 {
+                let (quantized, qt, gs) = if expert_mq2lloyd_native {
+                    // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
+                    // Runtime DType::MQ2G256Lloyd path dispatches via the
+                    // new MoE indexed kernels (or weight_gemv per-expert).
+                    let q = quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2);
+                    (q, QuantType::MQ2G256Lloyd, 256u32)
+                } else if expert_mq2lloyd_roundtrip {
+                    // MQ2-Lloyd → F32 → HFQ4 round-trip. The MQ2 step injects
+                    // the 2-bit Lloyd-codebook noise; the HFQ4 step re-packs
+                    // for runtime. Final on-disk format is HFQ4G256, no
+                    // engine changes required.
+                    let mq2_bytes = quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2);
+                    let dequant = dequantize_mq2g256_lloyd_to_f32(
+                        &mq2_bytes, f32_slice.len(), &signs1, &signs2,
+                    );
+                    let q = quantize_hfq4g256(&dequant);
+                    (q, QuantType::HFQ4G256, 256u32)
+                } else if expert_mq6 {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32)
                 } else if expert_hfq6 {
@@ -2669,7 +2790,7 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if expert_mq2lloyd_native { "MQ2G256L" } else if expert_mq2lloyd_roundtrip { "MQ2L→HFQ4" } else if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -2750,7 +2871,8 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native
+                    || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
                     let signs1 = gen_fwht_signs(42, 256);
@@ -2858,10 +2980,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
