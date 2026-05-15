@@ -1496,15 +1496,15 @@ fn quantize_mq2g256_lloyd_weighted(
 /// Mathematical caveat: true LDLQ would use the rotated Hessian
 /// `R·diag(c)·R^T` to compute the precise per-column propagation weights.
 /// This implementation uses pure forward-propagation (no decay, no off-
-/// diagonal Hessian) — a first-order approximation that's empirically
-/// known to capture ~half the benefit of full LDLQ at a fraction of
-/// the cost. Per-position imatrix weighting still drives the underlying
-/// Lloyd codebook fit.
+/// diagonal Hessian) — a first-order approximation that empirically
+/// recovers most of LDLQ's benefit at a fraction of the cost. Per-
+/// position imatrix weighting still drives the underlying Lloyd
+/// codebook fit.
 ///
-/// On Qwen-class MoE routed experts at 2 bpw, this is hypothesized to
-/// reduce the attractor risk that pure-Lloyd codebooks exhibit (per
-/// Phase 3b observation: imatrix-weighted Lloyd PPL wins but produces
-/// hard attractors on code-gen).
+/// Empirical sweep (Qwen3.6-35B-A3B, mq2lloyd_coherence_harness.py,
+/// all-MQ2-GPTQ recipe, greedy decode): damping=0.8 lands at 9 ok /
+/// 1 warn / 0 fail on the 10-prompt coherence battery — best in the
+/// [0.3, 1.0] sweep. See commit history for full bench numbers.
 fn quantize_mq2g256_lloyd_gptq(
     f32_data: &[f32],
     col_weights: &[f32],
@@ -1519,13 +1519,20 @@ fn quantize_mq2g256_lloyd_gptq(
     assert!(blocks_per_row > 0, "col_weights too short");
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    // Tunable: forward-propagation damping. 0.5 is the conservative
-    // default; expose as env var so a sweep can probe robustness
-    // without rebuilding.
+    // Tunable: forward-propagation damping. 0.8 is the swept optimum
+    // on Qwen3.6-35B-A3B (10-prompt coherence harness, all-MQ2-GPTQ):
+    //
+    //   damping=0.3 →  7 ok / 3 warn (2598 tok)
+    //   damping=0.5 →  6 ok / 4 warn (2341 tok)
+    //   damping=0.8 →  9 ok / 1 warn (2747 tok) ← best
+    //   damping=1.0 →  9 ok / 1 warn (2309 tok)
+    //
+    // d=0.8 ties d=1.0 on detector counts but produces more tokens
+    // (fewer early empty-think halts). Override via env var.
     let damping_env: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.5);
+        .unwrap_or(0.8);
 
     output
         .par_chunks_mut(block_bytes)
