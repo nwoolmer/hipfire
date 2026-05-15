@@ -200,6 +200,20 @@ impl HfqFile {
         &self.path
     }
 
+    /// The upstream HuggingFace Jinja `chat_template` baked into this
+    /// .hfq's `tokenizer_config` metadata. `None` when the source model
+    /// did not ship a chat_template (rare for instruct models, common
+    /// for base models). The runtime renders this when present so prompt
+    /// framing matches the model's training-time expectation; absent or
+    /// failing renders fall back to the hand-rolled `prompt_frame` path.
+    pub fn chat_template(&self) -> Option<String> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        meta.get("tokenizer_config")?
+            .get("chat_template")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     /// Look up a tensor's metadata (name, quant_type, shape, byte offset/size)
     /// without copying its data. The weight pager calls this at load time to
     /// register byte ranges without forcing eager VRAM allocation.
@@ -499,6 +513,26 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
         21 => { // HFQ1-G128 — PrismML 1-bit, FP16 scale, 18 bytes per 128 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ1G128, m, k, row_stride: 0 })
+        }
+        30 => { // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale.
+                // Per-row hdr 16 B + (K/32) blocks × 17 B. See docs/quant-formats/hfp4.md.
+                // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs);
+                // refuse here so a stale or externally-quantized file fails at
+                // load instead of panicking on first dispatch.
+                // Note: original upstream qtype was 21; renumbered to 30 to avoid
+                // collision with HFQ1G128 (reserved at 21 on this branch). Update
+                // any externally-quantized HFP4 .hfq files accordingly.
+            assert!(k % 256 == 0, "HFP4G32 v1 weight {st_name} has K={k} but kernel requires K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0 })
+        }
+        33 => { // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement).
+                // Same byte layout as qtype 30; format_flags=0x05 in row hdr.
+                // See docs/quant-formats/hfp4.md.
+                // Note: original upstream qtype was 24; renumbered to 33 (see HFP4G32 note).
+            assert!(k % 256 == 0, "MFP4G32 weight {st_name} has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0 })
         }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
