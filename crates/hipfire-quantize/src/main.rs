@@ -3707,6 +3707,24 @@ fn main() {
              reduced attractor risk at 2 bpw."
         );
     }
+    // All-MQ2-GPTQ: route BOTH gate_up AND down through MQ2-Lloyd-GPTQ.
+    // Tests whether sequential error feedback closes the attractor gap
+    // enough to drop the down=MQ3 compensation antirez uses, saving
+    // ~30 % more on routed-expert size.
+    let use_mq4_mq2lloyd_gptq_all = format == "mq4-mq2lloyd-gptq-all"
+        || format == "mq4-mq2lloyd-gptq"
+        || format == "all-mq2-gptq";
+    if use_mq4_mq2lloyd_gptq_all && imatrix_path.is_none() {
+        eprintln!("error: --format mq4-mq2lloyd-gptq-all requires --imatrix <PATH>");
+        std::process::exit(2);
+    }
+    if use_mq4_mq2lloyd_gptq_all {
+        eprintln!(
+            "note: --format mq4-mq2lloyd-gptq-all — ALL routed experts (both\n\
+             gate_up AND down) at MQ2-Lloyd with sequential-GPTQ codebook\n\
+             assignment. Tests the size-reduction hypothesis from Lever 2."
+        );
+    }
     if use_mq4_mqlloyd_antirez {
         if imatrix_path.is_none() {
             eprintln!("error: --format mq4-mqlloyd-antirez requires --imatrix <PATH>");
@@ -3923,7 +3941,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -4264,6 +4282,7 @@ fn main() {
                               || (kmap_promote && use_mq4g256)
                               || (kmap_promote && use_mq4_mq2lloyd_kmap)
                               || (kmap_promote && use_mq4_mq2lloyd_imatrix)
+                              || (kmap_promote && use_mq4_mq2lloyd_gptq_all)
                               || (kmap_promote && use_mq4_mq3lloyd_kmap))
                 && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
@@ -4278,12 +4297,21 @@ fn main() {
             // For -native (no kmap respect): always MQ2-Lloyd on every expert.
             // For -kmap / -imatrix (kmap respect): only non-promoted experts
             // go MQ2-Lloyd; promoted ones hit `expert_mq6` above.
+            // All-MQ2-GPTQ test: ALL routed experts at MQ2-Lloyd, both
+            // gate_up and down. Respects kmap_promote (promoted layers
+            // still get MQ6). Uses sequential-GPTQ Lloyd everywhere via
+            // the `use_gptq_for_all_mq2` flag below.
+            let all_mq2_gptq = use_mq4_mq2lloyd_gptq_all && !kmap_promote;
             let expert_mq2lloyd_native = (use_mq4_mq2lloyd_native
                                           || (use_mq4_mq2lloyd_kmap && !kmap_promote)
                                           || (use_mq4_mq2lloyd_imatrix && !kmap_promote)
                                           || tiered_layer_is_mq2
-                                          || antirez_mq2)
+                                          || antirez_mq2
+                                          || all_mq2_gptq)
                 && supports_g256;
+            // GPTQ assignment fires for both gate_up and down when in
+            // all-MQ2-GPTQ mode (not just gate_up like the antirez split).
+            let use_gptq_for_gate_up = use_gptq_for_gate_up || (all_mq2_gptq && imatrix_path.is_some());
             // MQ3-Lloyd asymmetric: non-promoted experts → qt=20 (3.5 bpw).
             // Promoted ones hit `expert_mq6` above (note: kmap_promote already
             // includes use_mq4_mq3lloyd_kmap via the expert_mq6 expression).
@@ -4304,7 +4332,8 @@ fn main() {
             let imatrix_lookup_name = format!("{}{}", parent, base_name);
             let imatrix_per_expert: Option<Vec<Vec<f32>>> =
                 if (use_mq4_mq2lloyd_imatrix || use_mq4_mqlloyd_antirez
-                    || use_mq4_mqlloyd_antirez_gptq)
+                    || use_mq4_mqlloyd_antirez_gptq
+                    || use_mq4_mq2lloyd_gptq_all)
                     && imatrix_gguf.is_some() && expert_mq2lloyd_native {
                     imatrix_col_weights_for_parent(
                         imatrix_gguf.as_ref().unwrap(), &imatrix_lookup_name, n_experts,
@@ -4481,7 +4510,7 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all
                     || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
@@ -4590,10 +4619,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
