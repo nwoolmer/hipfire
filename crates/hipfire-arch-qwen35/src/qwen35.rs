@@ -1994,9 +1994,13 @@ fn moe_ffn_decode_impl(
     let routed_gate_up_mq3_lloyd = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ3G256Lloyd)
         .unwrap_or(false);
-    let routed_indexed_eligible = (routed_mq4 && routed_gate_up_mq4)
-        || (routed_mq2_lloyd && routed_gate_up_mq2_lloyd)
-        || (routed_mq3_lloyd && routed_gate_up_mq3_lloyd);
+    // Mixed-tensor variant (Phase 6 antirez recipe): gate_up and down can
+    // have DIFFERENT MQ-Lloyd quants. Eligibility relaxed to "any combo
+    // of {MQ4, MQ2-Lloyd, MQ3-Lloyd}" on each independently.
+    let gate_up_indexed_dt = routed_gate_up_mq4 || routed_gate_up_mq2_lloyd
+        || routed_gate_up_mq3_lloyd;
+    let down_indexed_dt = routed_mq4 || routed_mq2_lloyd || routed_mq3_lloyd;
+    let routed_indexed_eligible = gate_up_indexed_dt && down_indexed_dt;
     let use_gpu_topk = k == 8 && gate_side_mq4 && routed_indexed_eligible;
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
@@ -2112,13 +2116,14 @@ fn moe_ffn_decode_impl(
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
-        if routed_mq3_lloyd {
+        // gate_up dispatch keyed on gate_up dtype (NOT down).
+        if routed_gate_up_mq3_lloyd {
             gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, gate_up_k,
             )?;
-        } else if routed_mq2_lloyd {
+        } else if routed_gate_up_mq2_lloyd {
             gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
@@ -2132,6 +2137,7 @@ fn moe_ffn_decode_impl(
             )?;
         }
         gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+        // down dispatch keyed on down dtype (independent of gate_up).
         if routed_mq3_lloyd {
             gpu.gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed(
                 &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
@@ -4128,20 +4134,23 @@ fn prefill_moe_ffn_body_batched(
     let down_m = ffn.experts[0].down.m;
     let down_k = ffn.experts[0].down.k;
     let gate_up_k = ffn.experts[0].gate_up.k;
-    // MoE-indexed batched dispatch swap: MQ4 routed → HFQ4 kernels;
-    // MQ2-Lloyd routed → MQ2-Lloyd kernels (Phase 2 asymmetric 2-bit);
-    // MQ3-Lloyd routed → MQ3-Lloyd kernels (Phase 4 — 3 bpw fallback).
-    let prefill_routed_mq2_lloyd =
+    // MoE-indexed batched dispatch — gate_up and down keyed on THEIR OWN
+    // dtype (Phase 6 antirez recipe may have gate_up=MQ2 + down=MQ3).
+    let prefill_gate_up_mq2_lloyd =
         ffn.experts[0].gate_up.gpu_dtype == DType::MQ2G256Lloyd;
-    let prefill_routed_mq3_lloyd =
+    let prefill_gate_up_mq3_lloyd =
         ffn.experts[0].gate_up.gpu_dtype == DType::MQ3G256Lloyd;
-    if prefill_routed_mq3_lloyd {
+    let prefill_down_mq2_lloyd =
+        ffn.experts[0].down.gpu_dtype == DType::MQ2G256Lloyd;
+    let prefill_down_mq3_lloyd =
+        ffn.experts[0].down.gpu_dtype == DType::MQ3G256Lloyd;
+    if prefill_gate_up_mq3_lloyd {
         gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
             &ffn.expert_gate_up_ptrs, topk_indices,
             &pbs.x_rot_batch, gate_batch, up_batch,
             2 * mi, gate_up_k, k_top, n,
         )?;
-    } else if prefill_routed_mq2_lloyd {
+    } else if prefill_gate_up_mq2_lloyd {
         gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
             &ffn.expert_gate_up_ptrs, topk_indices,
             &pbs.x_rot_batch, gate_batch, up_batch,
@@ -4161,13 +4170,13 @@ fn prefill_moe_ffn_body_batched(
 
     // Down projection with per-(token, expert) scaling and atomic
     // residual-add into pbs.x_batch.
-    if prefill_routed_mq3_lloyd {
+    if prefill_down_mq3_lloyd {
         gpu.gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched(
             &ffn.expert_down_ptrs, topk_indices, topk_weights,
             rot_batch, &pbs.x_batch,
             down_m, down_k, k_top, n,
         )?;
-    } else if prefill_routed_mq2_lloyd {
+    } else if prefill_down_mq2_lloyd {
         gpu.gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched(
             &ffn.expert_down_ptrs, topk_indices, topk_weights,
             rot_batch, &pbs.x_batch,
