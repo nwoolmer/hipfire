@@ -1519,6 +1519,14 @@ fn quantize_mq2g256_lloyd_gptq(
     assert!(blocks_per_row > 0, "col_weights too short");
     let mut output = vec![0u8; n_blocks * block_bytes];
 
+    // Tunable: forward-propagation damping. 0.5 is the conservative
+    // default; expose as env var so a sweep can probe robustness
+    // without rebuilding.
+    let damping_env: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5);
+
     output
         .par_chunks_mut(block_bytes)
         .enumerate()
@@ -1597,7 +1605,7 @@ fn quantize_mq2g256_lloyd_gptq(
             //   factor=0.5 — half-damping; safer against runaway accumulation
             //   factor=0.0 — no propagation (degenerates to standard Lloyd)
             // 0.5 is a conservative starting point.
-            let damping = 0.5f32;
+            let damping = damping_env;
             let mut indices = [0u8; 256];
             let mut residual = 0.0f32;
             for i in 0..256 {
