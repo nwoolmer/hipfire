@@ -1873,15 +1873,20 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
 /// Mirrors `is_mq3_any` in `forward_prefill_batch_single_chunk_captured`
 /// (line 3325) so both cross-checks treat plain and Lloyd-MQ3 identically.
 fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
-    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
-    is_mq3_any(ffn.router.gpu_dtype)
-        || is_mq3_any(ffn.shared_expert_gate.gpu_dtype)
-        || is_mq3_any(ffn.shared_expert.gate.gpu_dtype)
-        || is_mq3_any(ffn.shared_expert.up.gpu_dtype)
-        || is_mq3_any(ffn.shared_expert.down.gpu_dtype)
+    // Plain MQ3 (uniform, no codebook) has NO MoE indexed kernels — refuse
+    // anywhere. MQ3-Lloyd is OK on **routed experts only** (Phase 4 added
+    // gemv_mq3g256_lloyd_moe_*_indexed*); still refused on router/shared
+    // (no kernels for those slots).
+    let any_mq3 = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    let plain_mq3 = |dt: DType| matches!(dt, DType::MQ3G256);
+    any_mq3(ffn.router.gpu_dtype)
+        || any_mq3(ffn.shared_expert_gate.gpu_dtype)
+        || any_mq3(ffn.shared_expert.gate.gpu_dtype)
+        || any_mq3(ffn.shared_expert.up.gpu_dtype)
+        || any_mq3(ffn.shared_expert.down.gpu_dtype)
         || ffn.experts.iter().any(|e|
-            is_mq3_any(e.gate_up.gpu_dtype)
-            || is_mq3_any(e.down.gpu_dtype))
+            plain_mq3(e.gate_up.gpu_dtype)
+            || plain_mq3(e.down.gpu_dtype))
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -1980,8 +1985,18 @@ fn moe_ffn_decode_impl(
     let routed_gate_up_mq2_lloyd = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ2G256Lloyd)
         .unwrap_or(false);
+    // MQ3-Lloyd routed-experts (Phase 4 — 3 bpw fallback when 2 bpw isn't
+    // enough). Same FWHT-rotation chain; dispatch swaps to the new
+    // `gemv_mq3g256_lloyd_moe_*` indexed kernels.
+    let routed_mq3_lloyd = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ3G256Lloyd)
+        .unwrap_or(false);
+    let routed_gate_up_mq3_lloyd = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ3G256Lloyd)
+        .unwrap_or(false);
     let routed_indexed_eligible = (routed_mq4 && routed_gate_up_mq4)
-        || (routed_mq2_lloyd && routed_gate_up_mq2_lloyd);
+        || (routed_mq2_lloyd && routed_gate_up_mq2_lloyd)
+        || (routed_mq3_lloyd && routed_gate_up_mq3_lloyd);
     let use_gpu_topk = k == 8 && gate_side_mq4 && routed_indexed_eligible;
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
@@ -2082,7 +2097,7 @@ fn moe_ffn_decode_impl(
     }
 
     // ── 4. Top-K routed experts ──
-    if routed_mq4 || routed_mq2_lloyd {
+    if routed_mq4 || routed_mq2_lloyd || routed_mq3_lloyd {
         gpu.ensure_mq_signs()?;
     }
 
@@ -2091,12 +2106,19 @@ fn moe_ffn_decode_impl(
         // IDs and weights from device buffers. 3 launches for routed
         // compute, zero D2H sync — hipGraph-capturable. Dispatch swaps
         // by routed-expert dtype: MQ4 → HFQ4 indexed (rotated weights),
-        // MQ2-Lloyd → MQ2-Lloyd indexed (rotated weights + codebook).
+        // MQ2-Lloyd → MQ2-Lloyd indexed (rotated weights + codebook),
+        // MQ3-Lloyd → MQ3-Lloyd indexed (Phase 4).
         let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
-        if routed_mq2_lloyd {
+        if routed_mq3_lloyd {
+            gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
+        } else if routed_mq2_lloyd {
             gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
@@ -2110,7 +2132,13 @@ fn moe_ffn_decode_impl(
             )?;
         }
         gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
-        if routed_mq2_lloyd {
+        if routed_mq3_lloyd {
+            gpu.gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed(
+                &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
+                s.rot_batch, x_residual,
+                down_m, down_k,
+            )?;
+        } else if routed_mq2_lloyd {
             gpu.gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed(
                 &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
                 s.rot_batch, x_residual,
@@ -4101,10 +4129,19 @@ fn prefill_moe_ffn_body_batched(
     let down_k = ffn.experts[0].down.k;
     let gate_up_k = ffn.experts[0].gate_up.k;
     // MoE-indexed batched dispatch swap: MQ4 routed → HFQ4 kernels;
-    // MQ2-Lloyd routed → new MQ2-Lloyd kernels (Phase 2 asymmetric 2-bit).
+    // MQ2-Lloyd routed → MQ2-Lloyd kernels (Phase 2 asymmetric 2-bit);
+    // MQ3-Lloyd routed → MQ3-Lloyd kernels (Phase 4 — 3 bpw fallback).
     let prefill_routed_mq2_lloyd =
         ffn.experts[0].gate_up.gpu_dtype == DType::MQ2G256Lloyd;
-    if prefill_routed_mq2_lloyd {
+    let prefill_routed_mq3_lloyd =
+        ffn.experts[0].gate_up.gpu_dtype == DType::MQ3G256Lloyd;
+    if prefill_routed_mq3_lloyd {
+        gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
+            &ffn.expert_gate_up_ptrs, topk_indices,
+            &pbs.x_rot_batch, gate_batch, up_batch,
+            2 * mi, gate_up_k, k_top, n,
+        )?;
+    } else if prefill_routed_mq2_lloyd {
         gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
             &ffn.expert_gate_up_ptrs, topk_indices,
             &pbs.x_rot_batch, gate_batch, up_batch,
@@ -4124,7 +4161,13 @@ fn prefill_moe_ffn_body_batched(
 
     // Down projection with per-(token, expert) scaling and atomic
     // residual-add into pbs.x_batch.
-    if prefill_routed_mq2_lloyd {
+    if prefill_routed_mq3_lloyd {
+        gpu.gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched(
+            &ffn.expert_down_ptrs, topk_indices, topk_weights,
+            rot_batch, &pbs.x_batch,
+            down_m, down_k, k_top, n,
+        )?;
+    } else if prefill_routed_mq2_lloyd {
         gpu.gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched(
             &ffn.expert_down_ptrs, topk_indices, topk_weights,
             rot_batch, &pbs.x_batch,
