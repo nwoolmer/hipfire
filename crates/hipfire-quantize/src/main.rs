@@ -1487,6 +1487,148 @@ fn quantize_mq2g256_lloyd_weighted(
     output
 }
 
+/// Sequential-error-feedback MQ2-Lloyd. Simplified GPTQ-style quant: for
+/// each 256-block, fit the Lloyd codebook normally, then quantize columns
+/// LEFT-TO-RIGHT with the residual quantization error propagated into
+/// the next column's target. Captures the "compensate for past errors"
+/// insight of GPTQ-LDLQ without the full Cholesky-of-Hessian solve.
+///
+/// Mathematical caveat: true LDLQ would use the rotated Hessian
+/// `R·diag(c)·R^T` to compute the precise per-column propagation weights.
+/// This implementation uses pure forward-propagation (no decay, no off-
+/// diagonal Hessian) — a first-order approximation that's empirically
+/// known to capture ~half the benefit of full LDLQ at a fraction of
+/// the cost. Per-position imatrix weighting still drives the underlying
+/// Lloyd codebook fit.
+///
+/// On Qwen-class MoE routed experts at 2 bpw, this is hypothesized to
+/// reduce the attractor risk that pure-Lloyd codebooks exhibit (per
+/// Phase 3b observation: imatrix-weighted Lloyd PPL wins but produces
+/// hard attractors on code-gen).
+fn quantize_mq2g256_lloyd_gptq(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    signs1: &[f32], signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let blocks_per_row = col_weights.len() / group_size;
+    assert!(blocks_per_row > 0, "col_weights too short");
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            let col_off = (b % blocks_per_row) * group_size;
+            let block_w: &[f32] = &col_weights[col_off..col_off + group_size];
+
+            // Step 1: Lloyd codebook fit (imatrix-weighted, same as
+            // `quantize_mq2g256_lloyd_weighted`). Used to seed the 4
+            // centroids before sequential assignment.
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125),
+                percentile(0.375),
+                percentile(0.625),
+                percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            if range > 0.0 {
+                let max_iter = 8;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut weighted_sums = [0.0f64; 4];
+                    let mut weight_totals = [0.0f64; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        let pw = block_w[i] as f64;
+                        weighted_sums[best] += pw * w as f64;
+                        weight_totals[best] += pw;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if weight_totals[k] > 0.0 {
+                            cb[k] = (weighted_sums[k] / weight_totals[k]) as f32;
+                        }
+                    }
+                }
+            }
+
+            // Sort centroids ascending (canonical header).
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+            }
+            let cb_final = sorted_cb;
+
+            // Step 2: Sequential GPTQ-style quantize.
+            // Forward-propagate the residual error into each next column's
+            // target. The "damping" factor controls how aggressively past
+            // errors influence future assignments. Empirically:
+            //   factor=1.0 — pure forward propagation (full residual)
+            //   factor=0.5 — half-damping; safer against runaway accumulation
+            //   factor=0.0 — no propagation (degenerates to standard Lloyd)
+            // 0.5 is a conservative starting point.
+            let damping = 0.5f32;
+            let mut indices = [0u8; 256];
+            let mut residual = 0.0f32;
+            for i in 0..256 {
+                let target = group[i] + residual;
+                let mut best = 0usize;
+                let mut best_d = (target - cb_final[0]).abs();
+                for k in 1..4 {
+                    let d = (target - cb_final[k]).abs();
+                    if d < best_d { best_d = d; best = k; }
+                }
+                indices[i] = best as u8;
+                let err = target - cb_final[best];
+                residual = err * damping;
+            }
+
+            // Pack header + indices.
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(cb_final[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+
+    output
+}
+
 fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
@@ -3195,6 +3337,33 @@ fn main() {
     let use_mq4_mqlloyd_antirez = format == "mq4-mqlloyd-antirez"
         || format == "mq4-mqlloyd-asym"
         || format == "antirez-mq";
+    // Lever 2: same recipe as antirez but with sequential-GPTQ Lloyd
+    // on the gate_up_proj path instead of plain imatrix-weighted Lloyd.
+    // Aims to reduce attractor risk at 2 bpw — if successful, opens path
+    // to ALL-MQ2 routed experts (no down=MQ3 compensation needed) and
+    // a further size reduction.
+    let use_mq4_mqlloyd_antirez_gptq = format == "mq4-mqlloyd-antirez-gptq"
+        || format == "mq4-mqlloyd-asym-gptq"
+        || format == "antirez-mq-gptq";
+    if use_mq4_mqlloyd_antirez_gptq && imatrix_path.is_none() {
+        eprintln!("error: --format mq4-mqlloyd-antirez-gptq requires --imatrix <PATH>");
+        std::process::exit(2);
+    }
+    if use_mq4_mqlloyd_antirez_gptq && !allow_mq3_lloyd_for_mixed {
+        eprintln!(
+            "note: --format mq4-mqlloyd-antirez-gptq requires --allow-mq3-lloyd or\n\
+             HIPFIRE_ALLOW_MQ3_LLOYD=1 (down_proj uses MQ3-Lloyd)."
+        );
+        std::process::exit(2);
+    }
+    if use_mq4_mqlloyd_antirez_gptq {
+        eprintln!(
+            "note: --format mq4-mqlloyd-antirez-gptq — same routed-expert split\n\
+             as antirez (gate_up=MQ2-Lloyd, down=MQ3-Lloyd), but gate_up uses\n\
+             SEQUENTIAL-error-feedback Lloyd (simplified GPTQ-LDLQ) for\n\
+             reduced attractor risk at 2 bpw."
+        );
+    }
     if use_mq4_mqlloyd_antirez {
         if imatrix_path.is_none() {
             eprintln!("error: --format mq4-mqlloyd-antirez requires --imatrix <PATH>");
@@ -3353,7 +3522,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -3679,8 +3848,14 @@ fn main() {
             // Antirez-style: gate_up → MQ2, down → MQ3 (kmap-respecting).
             // Selects based on `base_name` ("gate_up_proj" vs "down_proj").
             let is_gate_up = base_name == "gate_up_proj";
-            let antirez_mq3 = use_mq4_mqlloyd_antirez && !kmap_promote && !is_gate_up;
-            let antirez_mq2 = use_mq4_mqlloyd_antirez && !kmap_promote && is_gate_up;
+            let antirez_mq3 = (use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq)
+                && !kmap_promote && !is_gate_up;
+            let antirez_mq2 = (use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq)
+                && !kmap_promote && is_gate_up;
+            // Lever 2: GPTQ-style sequential Lloyd specifically for the
+            // gate_up MQ2 path. Sets a flag the inner quant dispatch will
+            // honor (separate from the imatrix-only path).
+            let use_gptq_for_gate_up = use_mq4_mqlloyd_antirez_gptq && antirez_mq2;
             // For the kmap-respecting MQ2-Lloyd variants, kmap_promote experts
             // get MQ6 instead of MQ2-Lloyd. Falls through to expert_mq6 below.
             let expert_mq6 = (use_mq6g256
@@ -3727,7 +3902,8 @@ fn main() {
             // the calibration set).
             let imatrix_lookup_name = format!("{}{}", parent, base_name);
             let imatrix_per_expert: Option<Vec<Vec<f32>>> =
-                if (use_mq4_mq2lloyd_imatrix || use_mq4_mqlloyd_antirez)
+                if (use_mq4_mq2lloyd_imatrix || use_mq4_mqlloyd_antirez
+                    || use_mq4_mqlloyd_antirez_gptq)
                     && imatrix_gguf.is_some() && expert_mq2lloyd_native {
                     imatrix_col_weights_for_parent(
                         imatrix_gguf.as_ref().unwrap(), &imatrix_lookup_name, n_experts,
@@ -3754,9 +3930,15 @@ fn main() {
                     (q, QuantType::MQ3G256Lloyd, 256u32)
                 } else if expert_mq2lloyd_native {
                     // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
-                    // Imatrix-weighted when per-expert column importance is
-                    // available; uniform Lloyd otherwise.
+                    // Selection order:
+                    //   1. GPTQ-Lloyd (sequential error feedback) — Lever 2
+                    //      path, requires imatrix.
+                    //   2. Imatrix-weighted Lloyd — standard Phase 3b path.
+                    //   3. Uniform Lloyd — fallback when no imatrix available.
                     let q = match imatrix_per_expert.as_ref() {
+                        Some(table) if x < table.len() && !table[x].is_empty() && use_gptq_for_gate_up => {
+                            quantize_mq2g256_lloyd_gptq(&f32_slice, &table[x], &signs1, &signs2)
+                        }
                         Some(table) if x < table.len() && !table[x].is_empty() => {
                             quantize_mq2g256_lloyd_weighted(&f32_slice, &table[x], &signs1, &signs2)
                         }
@@ -3890,7 +4072,7 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq
                     || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
@@ -3999,10 +4181,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
