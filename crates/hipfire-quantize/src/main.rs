@@ -2863,6 +2863,24 @@ fn main() {
     let use_mq4_mq2lloyd_native = format == "mq4-mq2lloyd-native"
         || format == "mq4-mq2lloydexp-native"
         || format == "mq4-mq2lloyd-routed";
+    // kmap-respecting variant: like mq4-mq2lloyd-native, but routed-expert
+    // tensors that the kmap flags as Promote6 stay at MQ6 (instead of being
+    // demoted to MQ2-Lloyd). Reduces precision-loss on the ~30% of layers
+    // that the alternating K-map identifies as important. Larger file
+    // (extra MQ6 layers) but expected to recover quality on attractor-prone
+    // prompts that mq4-mq2lloyd-native truncated early.
+    let use_mq4_mq2lloyd_kmap = format == "mq4-mq2lloyd-kmap"
+        || format == "mq4-mq2lloyd-respectkmap"
+        || format == "mq4-mq2lloyd-kmap-promote";
+    if use_mq4_mq2lloyd_kmap {
+        eprintln!(
+            "note: --format mq4-mq2lloyd-kmap respects K-map promotion —\n\
+             experts flagged Promote6 (~30 % of layers) stay at MQ6G256;\n\
+             remaining ~70 % get MQ2G256Lloyd (qt=19). File size is larger\n\
+             than mq4-mq2lloyd-native but quality on attractor-prone prompts\n\
+             should be markedly better."
+        );
+    }
     if use_mq4_mq2lloyd_native {
         eprintln!(
             "note: --format mq4-mq2lloyd-native ships routed MoE experts as\n\
@@ -2956,7 +2974,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_kmap) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -3216,7 +3234,13 @@ fn main() {
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
             let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
-            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
+            // For the kmap-respecting MQ2-Lloyd variant, kmap_promote experts
+            // get MQ6 instead of MQ2-Lloyd. Falls through to expert_mq6 below.
+            let expert_mq6 = (use_mq6g256
+                              || use_mq4_mq6exp
+                              || (kmap_promote && use_mq4g256)
+                              || (kmap_promote && use_mq4_mq2lloyd_kmap))
+                && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
@@ -3226,7 +3250,12 @@ fn main() {
             let expert_mq2lloyd_roundtrip = use_mq4_mq2lloydexp && supports_g256;
             // Native MQ2-Lloyd: ship qt=19 bytes directly, no round-trip.
             // Requires runtime support for DType::MQ2G256Lloyd on experts.
-            let expert_mq2lloyd_native = use_mq4_mq2lloyd_native && supports_g256;
+            // For -native (no kmap respect): always MQ2-Lloyd on every expert.
+            // For -kmap (kmap respect): only non-promoted experts go MQ2-Lloyd;
+            // promoted ones hit `expert_mq6` above.
+            let expert_mq2lloyd_native = (use_mq4_mq2lloyd_native
+                                          || (use_mq4_mq2lloyd_kmap && !kmap_promote))
+                && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -3369,7 +3398,7 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native
+                if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap
                     || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
@@ -3478,10 +3507,10 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native {
+            } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
