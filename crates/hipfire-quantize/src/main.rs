@@ -1519,16 +1519,21 @@ fn quantize_mq2g256_lloyd_gptq(
     assert!(blocks_per_row > 0, "col_weights too short");
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    // Tunable: forward-propagation damping. 0.8 is the swept optimum
-    // on Qwen3.6-35B-A3B (10-prompt coherence harness, all-MQ2-GPTQ):
+    // Tunable: forward-propagation damping. d=0.8 is the chosen
+    // default after a [0.3, 1.0] sweep on Qwen3.6-35B-A3B:
     //
-    //   damping=0.3 →  7 ok / 3 warn (2598 tok)
-    //   damping=0.5 →  6 ok / 4 warn (2341 tok)
-    //   damping=0.8 →  9 ok / 1 warn (2747 tok) ← best
-    //   damping=1.0 →  9 ok / 1 warn (2309 tok)
+    //   d=0.3 → PPL 12.24 | 7 ok / 3 warn — fails fibonacci_c
+    //   d=0.5 → PPL 12.84 | 6 ok / 4 warn
+    //   d=0.8 → PPL 14.66 | 9 ok / 1 warn — passes fibonacci_c ← best
+    //   d=1.0 → PPL 18.28 | 9 ok / 1 warn
     //
-    // d=0.8 ties d=1.0 on detector counts but produces more tokens
-    // (fewer early empty-think halts). Override via env var.
+    // PPL favors low damping (less error accumulation in average
+    // likelihood); coherence favors moderate-high damping (fewer
+    // attractor traps). d=0.3 has the best PPL but FAILS the
+    // fibonacci_c prompt that originally motivated this work —
+    // PPL averages across prompts and hides catastrophic regression
+    // on specific high-value prompts. d=0.8 is the smallest damping
+    // that passes the full coherence battery. Override via env var.
     let damping_env: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
         .ok()
         .and_then(|s| s.parse().ok())
