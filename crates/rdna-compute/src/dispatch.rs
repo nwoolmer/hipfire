@@ -19545,6 +19545,29 @@ impl Gpu {
         }
     }
 
+    /// V4F MoE routing affinity: sqrt(softplus(x)) elementwise in-place.
+    #[allow(dead_code)]
+    pub fn sqrt_softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sqrt_softplus_f32",
+            kernels::SQRT_SOFTPLUS_F32_SRC, "sqrt_softplus_f32")?;
+        let func = &self.functions["sqrt_softplus_f32"];
+        let n = x.numel() as i32;
+        let xp = x.buf.as_ptr();
+        let mut nv = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Apply α scaling to the 24-element HC control vector
     /// after `hc_compute_control` has run (which produces α=1 output).
     /// Rescales c[i] = α[seg(i)] · (c[i] - base[i]) + base[i] so each
