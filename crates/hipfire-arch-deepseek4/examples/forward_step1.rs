@@ -22,14 +22,14 @@ fn main() -> Result<(), String> {
     let mut state = DeepseekV4State::new(&cfg)?;
 
     // Call decode_step on a sweep of input tokens. Each call returns
-    // a Vec<f32> of vocab_size logits.
+    // a Vec<f32> of vocab_size logits. Print top-5 for each.
     for token_id in [100u32, 0, 1, 123, 1000, 5000, 10000, 50000] {
         let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, token_id, 0)?;
-        let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let argmax = logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-        eprintln!("token {token_id:>5} → argmax token {} (logit={:.3}, max_abs={:.3})",
-            argmax.0, argmax.1, max_abs);
+        let mut indexed: Vec<(usize, f32)> = logits.into_iter().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top5: Vec<String> = indexed[..5].iter()
+            .map(|(i, v)| format!("{i}:{v:.2}")).collect();
+        eprintln!("token {token_id:>5} → top-5: [{}]", top5.join(", "));
     }
 
     // Read back residual_streams; verify stream 0 has nonzero values and
