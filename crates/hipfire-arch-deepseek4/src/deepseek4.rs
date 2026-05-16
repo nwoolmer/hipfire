@@ -467,6 +467,12 @@ pub struct DeepseekV4State {
     /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`.
     pub routed_expert_out: Option<rdna_compute::GpuTensor>,
 
+    /// Buffer of all-ones, length `head_dim`, used as the weight arg
+    /// to the per-head Q RMSNorm (upstream V4F has NO learnable scale
+    /// on the post-wq_b Q-norm, just rsqrt(mean(sq)+eps)). Allocated
+    /// once on first attention layer.
+    pub q_head_ones: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -517,6 +523,7 @@ impl DeepseekV4State {
             router_scores: None,
             topk_indices: None,
             routed_expert_out: None,
+            q_head_ones: None,
             n_tokens: 0,
             _scaffold: (),
         })
