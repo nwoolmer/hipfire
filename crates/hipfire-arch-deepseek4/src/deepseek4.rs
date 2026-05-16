@@ -226,12 +226,21 @@ pub struct DeepseekV4LayerWeights {
     pub _scaffold: (),
 }
 
-/// V4F weights — scaffold-stage placeholder.
+/// V4F weights — scaffold-stage placeholder with two GPU-resident
+/// globals already uploaded (`token_embd`, `output_norm`). Per-layer
+/// uploads (LoRAs, KV, HC, experts) land in forward bring-up; this
+/// commit establishes the upload contract end-to-end with the cheapest
+/// pair of tensors.
 ///
 /// `mtp_layer` is `Some` after Phase 5 lands (when the
 /// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
 /// tensors are quantized alongside main layers).
 pub struct DeepseekV4Weights {
+    /// Token embedding table. Stored as raw Q8F16 bytes on GPU
+    /// (matches the `embed.weight` quant_type from Phase 1 ingest).
+    pub token_embd: Option<rdna_compute::GpuTensor>,
+    /// Final output norm (RMSNorm scale, F16).
+    pub output_norm: Option<rdna_compute::GpuTensor>,
     /// One bundle per `num_hidden_layers` (43 on V4F).
     pub layers: Vec<DeepseekV4LayerWeights>,
     /// MTP head — structurally identical to a main layer, plus an

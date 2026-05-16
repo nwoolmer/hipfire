@@ -32,6 +32,22 @@ impl DeepseekV4 {
     /// Catches missing-tensor / naming-mismatch problems before forward
     /// triggers them. Per-layer tensor inventory derived from the V4F
     /// safetensors index (see Phase 1 commit 8ccfa42).
+    /// Upload one global HFQ tensor verbatim (raw bytes) to GPU.
+    /// Used for embed/norm/head where the on-disk quant format
+    /// matches the format the kernels expect to consume.
+    fn upload_global_raw(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        gpu.upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+    }
+
     pub fn load_weights_host_only_walk(
         hfq: &HfqFile,
         cfg: &DeepseekV4Config,
@@ -161,6 +177,8 @@ impl DeepseekV4 {
         }
 
         Ok(DeepseekV4Weights {
+            token_embd: None,
+            output_norm: None,
             layers,
             mtp_layer: None,  // skipped by quantize per `mtp.` prefix; Phase 5 work.
             _scaffold: (),
@@ -190,18 +208,17 @@ impl Architecture for DeepseekV4 {
     fn load_weights(
         hfq: &mut HfqFile,
         cfg: &Self::Config,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        // Phase 1.5 (host-only) walk: enumerate the V4F tensor names and
-        // confirm every expected per-layer + global tensor is present in
-        // the HFQ index. GPU upload, dtype conversion, and `WeightTensor`
-        // construction land in forward bring-up.
-        //
-        // This catches missing-tensor / naming-mismatch problems before
-        // the forward path triggers them. Returns a populated layer Vec
-        // with all `_scaffold: ()` slots; the real WeightTensor handles
-        // get filled in as Phases 2-5 wire the kernels.
-        Self::load_weights_host_only_walk(hfq, cfg)
+        // Phase 1.5 host walk verifies every expected tensor is in the
+        // HFQ index. After it returns we upload the two cheapest
+        // globals — `embed.weight` and `norm.weight` — as the minimum
+        // viable end-to-end test of the GPU upload pipeline. Per-layer
+        // uploads (LoRAs, KV, HC, experts) land in forward bring-up.
+        let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
+        weights.token_embd = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
+        weights.output_norm = Some(Self::upload_global_raw(hfq, gpu, "norm.weight")?);
+        Ok(weights)
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {

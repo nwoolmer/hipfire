@@ -80,6 +80,30 @@ fn main() {
         }
     }
 
+    // Try the GPU-upload variant if a GPU is available.
+    // Skip cleanly if GPU init fails (host-only environments).
+    match rdna_compute::Gpu::init() {
+        Ok(mut gpu) => {
+            use hipfire_runtime::arch::Architecture;
+            // `load_weights` wants &mut HfqFile; HfqFile is currently
+            // owned, so move it back into a mutable binding.
+            let mut hfq2 = hipfire_runtime::hfq::HfqFile::open(
+                std::path::Path::new(path)
+            ).expect("re-open for upload");
+            match DeepseekV4::load_weights(&mut hfq2, &cfg, &mut gpu) {
+                Ok(w) => {
+                    eprintln!(
+                        "GPU upload OK: token_embd={} output_norm={}",
+                        if w.token_embd.is_some() { "Some" } else { "None" },
+                        if w.output_norm.is_some() { "Some" } else { "None" }
+                    );
+                }
+                Err(e) => eprintln!("GPU upload FAILED: {e}"),
+            }
+        }
+        Err(e) => eprintln!("GPU init failed ({e:?}) — skipping upload check"),
+    }
+
     // Spot-check a few known V4F tensor names through the public API.
     for name in &[
         "embed.weight",
