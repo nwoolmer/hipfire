@@ -130,22 +130,6 @@ fn unimplemented_step(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Bind ffn_out to zero (diagnostic / temporary stub).
-fn ffn_zero(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
-    if state.ffn_out.is_none() {
-        state.ffn_out = Some(gpu.zeros(&[cfg.hidden_size], DType::F32)
-            .map_err(|e| format!("alloc ffn_out: {e:?}"))?);
-    }
-    let ffn_out = state.ffn_out.as_ref().unwrap();
-    gpu.hip.memset(&ffn_out.buf, 0, ffn_out.byte_size())
-        .map_err(|e| format!("memset ffn_out: {e:?}"))?;
-    Ok(())
-}
-
 /// FFN block (partial — shared expert only; routed experts pending).
 ///
 /// V4F has one shared expert + 256 routed experts (top-6 selected
@@ -675,7 +659,6 @@ fn attn_stub(
 /// expert-dispatch step reads topk_indices, fetches per-expert weights
 /// from `layer.expert_w{1,2,3}` (requires `HIPFIRE_V4F_UPLOAD_EXPERTS=1`),
 /// and accumulates weighted expert outputs into ffn_out.
-#[allow(dead_code)]
 fn moe_route(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -1050,30 +1033,6 @@ fn q_lora(
     // call rope_tail_halfsplit once on (q, k) together.
     // For now: skip rotation here; the KV step will do it.
 
-    Ok(())
-}
-
-/// Step 2 (attention block): RMSNorm of residual stream 0 against
-/// `layer.attn_norm`. Output in `state.tmp [hidden] f32`.
-fn attn_rms_norm(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
-    let attn_norm = layer.attn_norm.as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} attn_norm not uploaded"))?;
-    let streams = state.residual_streams.as_ref()
-        .ok_or_else(|| "residual_streams not allocated".to_string())?;
-    let tmp = state.tmp.as_ref()
-        .ok_or_else(|| "tmp not allocated".to_string())?;
-
-    // Stream 0 view: first `hidden` floats of the [hc_mult, hidden] tensor.
-    let stream0 = streams.sub_offset(0, cfg.hidden_size);
-    gpu.rmsnorm_f32(&stream0, attn_norm, tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("rmsnorm_f32 layer {layer_idx}: {e:?}"))?;
     Ok(())
 }
 
