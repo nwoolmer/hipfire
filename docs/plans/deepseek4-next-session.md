@@ -1,5 +1,12 @@
 # V4F bring-up — handoff for next session
 
+**FULL mHC FORWARD LIVE as of commit dbed40b.** The 4.27e37 overflow
+was a bug — `hc_compute_control` and `hc_mix_4stream` declared
+residual inputs as `const __half*` but V4F's F32 residuals were being
+read as F16 pairs. Fixed → bounded magnitudes, real input-varying
+output. See newer "FULL V4F mHC FORWARD LIVE" section in
+project_deepseek4_arch_scaffold.md (memory) for sample outputs.
+
 State as of 2026-05-16 (updated late-session):
 
 **Done:**
@@ -34,20 +41,31 @@ State as of 2026-05-16 (updated late-session):
   ffn_gate, ffn_up, ffn_silu_rot, final_norm, final_norm_rot,
   logits). All lazy-allocated.
 
-**Live numerical issue:**
+**Live numerical issue (RESOLVED 2026-05-16, see commit dbed40b):**
 
-Enabling HC mix (steps 8 and 12) produces magnitude overflow
-across 43 layers (residuals hit 4.27e37 ≈ f32 overflow). Even
-with abs() pre-processing on Sinkhorn input, even with FFN/attn
-zeroed. Root cause: V4F's training-time residual scaling +
-pre-Sinkhorn activation chain isn't replicated. Pipeline currently
-DISABLES HC mix, leaving residuals at the embedding's ~0.17
-magnitude and producing real (if simplistic) logits.
+OLD: Enabling HC mix produces 4.27e37 magnitude overflow.
 
-To fix HC numerics: needs paper read on the activation chain.
-Candidates for the missing piece:
-- Pre-Sinkhorn activation on c_ctrl (sqrtsoftplus per config?
-  softplus? exp?)
+ROOT CAUSE: `hc_compute_control` and `hc_mix_4stream` declared
+residual-side inputs as `const __half*`, but V4F residuals are
+F32 (hipfire convention). Kernels read F32 bytes as F16 pairs →
+fixed-pattern garbage saturating across 43 layers.
+
+FIX: F32 declarations + remove __half2float conversions on residual
+side. Weights (W_fn, base) stay F16 since stored as F16 in HFQ.
+
+**RESULT:**
+- All 4 residual streams have signal (4096/4096 nonzero each)
+- Stream magnitudes bounded (~9 for stream 0, ~25 for streams 1-3)
+- Logits in [13-18] range, max_abs ~30
+- Input-varying output (8 inputs → 6 distinct argmaxes)
+- Rudimentary script/topic awareness ('stick' → Chinese chars;
+  'Ġв' → 'Ġdekameters'; 'à¨' → 'Ġincrease')
+
+Sinkhorn now uses paper-faithful exp() pre-processing (commit
+103ca35) + col-then-row normalisation. α scaling kernel
+hc_apply_alpha (commit b815e4c) wires the per-segment α^pre/α^res/
+α^post into the control vector before Sinkhorn fires. Input
+mapping hc_input_map_4stream produces A·X as the transform input.
 - Mix output scaling factor
 - Per-layer learnable residual scale that bounds compounding
 - Some combination of the above
@@ -96,10 +114,19 @@ on V4F-class precision before declaring success.
 Drop the `mtp.` prefix-skip in `hipfire-quantize`, treat MTP layer
 as layer 43, wire as DFlash drafter.
 
-## Total estimated time to first token: ~1.5 weeks focused
+## Total estimated time to first COHERENT token: ~3-5 days focused
 
-(Revised down from 2 weeks: load_weights upload now done; only
-forward bodies + correctness gate remain.)
+(Revised down again: load_weights done, full mHC forward live, MoE
+router code written. Remaining: real SWA attention with KV cache
+(~2 days), MoE expert dispatch loop with d2h-sync handling (~1
+day), positional RoPE YaRN scaling for long contexts (~half day).)
+
+**Current state: produces non-coherent input-varying logits.**
+For coherent text generation we need (in order of impact):
+  1. Real SWA attention + KV cache plumbing
+  2. MoE expert dispatch (top-K=6 from routed_experts)
+  3. Tighter HC numerics (currently sigmoid + 2σ + abs/exp Sinkhorn
+     work but don't match training residual-stream balance exactly)
 
 ## Risks
 
