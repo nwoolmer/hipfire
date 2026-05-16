@@ -268,28 +268,36 @@ fn ffn_routed(
         return Ok(());  // experts not uploaded; nothing to dispatch
     }
 
-    // 1. Run router: compute scores and top-K indices.
+    // 1. Run router: compute unbiased scores on-device. We do top-K on
+    //    CPU below because V4F's selection uses BIASED scores while the
+    //    routing weights use UNBIASED scores (per upstream model.py:
+    //    Gate.forward). On-device top_k would mix these up.
     moe_route(cfg, weights, state, gpu, layer_idx)?;
 
-    // 2. d2h the top-K indices and the score-vector to compute weights
-    //    on host (small: k=6 + n_exp=256 floats per layer).
-    let topk = state.topk_indices.as_ref().unwrap();
+    // 2. d2h the unbiased score vector (256 f32 = 1 KB per layer).
     let scores = state.router_scores.as_ref().unwrap();
-    // `topk_indices` is allocated as F32 but `indexer_top_k` writes raw
-    // i32 bytes into it. Download as f32 then reinterpret bits as i32.
-    let topk_host_f32 = gpu.download_f32(topk)
-        .map_err(|e| format!("d2h topk l{layer_idx}: {e:?}"))?;
     let scores_host = gpu.download_f32(scores)
         .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
 
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
-    let topk_ids: Vec<u32> = topk_host_f32.iter().take(k)
-        .map(|f| {
-            let raw = i32::from_le_bytes(f.to_le_bytes());
-            raw.max(0).min((n_exp - 1) as i32) as u32
-        })
+
+    // 3. CPU top-K with bias-shifted scores.
+    let bias_host = &layer.gate_bias_host;
+    let mut biased: Vec<f32> = scores_host.iter().take(n_exp)
+        .enumerate()
+        .map(|(i, &s)| s + bias_host.get(i).copied().unwrap_or(0.0))
         .collect();
+    // Greedy top-K: n_exp=256, k=6 → 6 linear scans (~1.5K f32 cmps).
+    let mut topk_ids: Vec<u32> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (i, _) = biased.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        topk_ids.push(i as u32);
+        biased[i] = f32::NEG_INFINITY;  // mask so the next pass picks a different expert
+    }
+
     let mut wts: Vec<f32> = topk_ids.iter().map(|&i| scores_host[i as usize]).collect();
     let w_sum: f32 = wts.iter().sum();
     if w_sum <= 0.0 {

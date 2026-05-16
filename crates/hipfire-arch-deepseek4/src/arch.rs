@@ -317,8 +317,14 @@ impl Architecture for DeepseekV4 {
             layer.gate_weight = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.ffn.gate.weight"))?);
             if l >= cfg.num_hash_layers {
-                layer.gate_bias = Some(Self::upload_global_raw(hfq, gpu,
-                    &format!("layers.{l}.ffn.gate.bias"))?);
+                // Store F32 on GPU (was F16 on disk) so the bias can
+                // either be added on-device or downloaded once for CPU
+                // topk. Also cache host-side for the CPU-routing path.
+                let bias_name = format!("layers.{l}.ffn.gate.bias");
+                let bias_gpu = Self::upload_global_f16_as_f32(hfq, gpu, &bias_name)?;
+                layer.gate_bias_host = gpu.download_f32(&bias_gpu)
+                    .map_err(|e| format!("d2h gate_bias l{l}: {e:?}"))?;
+                layer.gate_bias = Some(bias_gpu);
             }
 
             // Shared expert.
