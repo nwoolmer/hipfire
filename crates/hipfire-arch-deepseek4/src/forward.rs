@@ -102,6 +102,7 @@ pub fn decode_step(
         // dispatch lands in a follow-up (MoE routing complexity).
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
         ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+        ffn_routed(cfg, weights, state, gpu, layer_idx)?;
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
     }
 
@@ -219,6 +220,127 @@ fn ffn_stub(
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
     gpu.gemv_mq4g256_prerotated(shared_w2, silu_rot, ffn_out, cfg.hidden_size, im)
         .map_err(|e| format!("gemv shared_w2 layer {layer_idx}: {e:?}"))?;
+
+    Ok(())
+}
+
+/// Routed-expert dispatch (V4F top-6 MoE). Accumulates `routed_scaling
+/// _factor · Σ_k w_k · expert_{idx_k}(ffn_x_rot)` into `ffn_out`
+/// (which already holds the shared-expert output from `ffn_stub`).
+///
+/// Gated on HIPFIRE_V4F_MOE=1 AND expert blobs present (uploaded via
+/// HIPFIRE_V4F_UPLOAD_EXPERTS=1) AND layer is score-routed
+/// (layer_idx >= num_hash_layers). Hash-routed layers 0..3 fall back
+/// to shared-only (tid2eid lookup table is skipped at quant time).
+///
+/// Math (per upstream `inference/model.py:Gate.forward` and `Expert.
+/// forward`):
+///   scores = sqrt(softplus(gate.weight @ x))             [n_exp]
+///   indices = topk(scores + bias, k=6)[1]                [k]   ← +bias for selection
+///   weights = scores[indices]                            [k]   ← unbiased scores for weights
+///   weights /= weights.sum(); weights *= route_scale     [k]
+///   for each (idx, w) in (indices, weights):
+///     gate_e = w1[idx] @ x                  ← clamp to swiglu_limit (skipped)
+///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
+///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
+///     ffn_out += e_out * routed_scaling_factor
+fn ffn_routed(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    if std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    if layer_idx < cfg.num_hash_layers {
+        // Hash routing — tid2eid table skipped at quant time, no expert
+        // selection possible. Shared expert alone for these layers.
+        return Ok(());
+    }
+    let layer = &weights.layers[layer_idx];
+    if layer.expert_w1_blob.is_none() || layer.expert_w2_blob.is_none()
+        || layer.expert_w3_blob.is_none()
+    {
+        return Ok(());  // experts not uploaded; nothing to dispatch
+    }
+
+    // 1. Run router: compute scores and top-K indices.
+    moe_route(cfg, weights, state, gpu, layer_idx)?;
+
+    // 2. d2h the top-K indices and the score-vector to compute weights
+    //    on host (small: k=6 + n_exp=256 floats per layer).
+    let topk = state.topk_indices.as_ref().unwrap();
+    let scores = state.router_scores.as_ref().unwrap();
+    let topk_host = gpu.download_f32(topk)
+        .map_err(|e| format!("d2h topk l{layer_idx}: {e:?}"))?;
+    let scores_host = gpu.download_f32(scores)
+        .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
+
+    let k = cfg.num_experts_per_tok;
+    let n_exp = cfg.n_routed_experts;
+    let topk_ids: Vec<u32> = topk_host.iter().take(k)
+        .map(|f| (*f as i32).max(0).min((n_exp - 1) as i32) as u32)
+        .collect();
+    let mut wts: Vec<f32> = topk_ids.iter().map(|&i| scores_host[i as usize]).collect();
+    let w_sum: f32 = wts.iter().sum();
+    if w_sum <= 0.0 {
+        // Degenerate router output — skip rather than NaN downstream.
+        return Ok(());
+    }
+    let route_scale = 1.5f32;  // V4F config; not in DeepseekV4Config yet.
+    for w in wts.iter_mut() { *w = (*w / w_sum) * route_scale; }
+
+    // 3. Per-expert SwiGLU dispatch. Reuse shared scratch (ffn_gate,
+    //    ffn_up, ffn_silu_rot) — by the time we get here, the shared
+    //    expert path has finished consuming them.
+    let im = cfg.moe_intermediate_size;
+    let stride_w1 = layer.expert_w1_stride;
+    let stride_w2 = layer.expert_w2_stride;
+    let stride_w3 = layer.expert_w3_stride;
+    let blob_w1 = layer.expert_w1_blob.as_ref().unwrap();
+    let blob_w2 = layer.expert_w2_blob.as_ref().unwrap();
+    let blob_w3 = layer.expert_w3_blob.as_ref().unwrap();
+
+    if state.routed_expert_out.is_none() {
+        state.routed_expert_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc routed_expert_out: {e:?}"))?);
+    }
+    let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
+    let gate = state.ffn_gate.as_ref().unwrap();
+    let up   = state.ffn_up.as_ref().unwrap();
+    let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
+    let expert_out = state.routed_expert_out.as_ref().unwrap();
+    let ffn_out = state.ffn_out.as_ref().unwrap();
+
+    for (k_idx, &expert_id) in topk_ids.iter().enumerate() {
+        let off_w1 = expert_id as usize * stride_w1;
+        let off_w2 = expert_id as usize * stride_w2;
+        let off_w3 = expert_id as usize * stride_w3;
+        let w1_view = blob_w1.sub_offset(off_w1, stride_w1);
+        let w2_view = blob_w2.sub_offset(off_w2, stride_w2);
+        let w3_view = blob_w3.sub_offset(off_w3, stride_w3);
+
+        gpu.gemv_mq2g256_lloyd(&w1_view, ffn_x_rot, gate, im, cfg.hidden_size)
+            .map_err(|e| format!("gemv expert_w1 l{layer_idx} e{expert_id}: {e:?}"))?;
+        gpu.gemv_mq2g256_lloyd(&w3_view, ffn_x_rot, up, im, cfg.hidden_size)
+            .map_err(|e| format!("gemv expert_w3 l{layer_idx} e{expert_id}: {e:?}"))?;
+        // silu(gate) * up → gate (in-place). Per-expert routing weight
+        // applied AFTER SwiGLU and BEFORE w2 per upstream model.py:603-606.
+        gpu.silu_mul_f32(gate, up, gate)
+            .map_err(|e| format!("silu_mul expert l{layer_idx} e{expert_id}: {e:?}"))?;
+        // Routing-weight scale done via scaled_add at accumulate step
+        // (more efficient than a separate scale_f32 pass over [im]).
+        gpu.rotate_x_mq(gate, silu_rot, im)
+            .map_err(|e| format!("rotate expert silu l{layer_idx} e{expert_id}: {e:?}"))?;
+        gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
+            .map_err(|e| format!("gemv expert_w2 l{layer_idx} e{expert_id}: {e:?}"))?;
+        // ffn_out += routing_weight[k] * routed_scaling_factor * expert_out
+        let coef = wts[k_idx] * cfg.routed_scaling_factor;
+        gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
+            .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
+    }
 
     Ok(())
 }

@@ -451,6 +451,10 @@ pub struct DeepseekV4State {
     /// Top-K expert indices, allocated as F32 view but interpreted
     /// as i32. Shape `[num_experts_per_tok = 6]`.
     pub topk_indices: Option<rdna_compute::GpuTensor>,
+    /// Per-routed-expert output scratch `[hidden]` F32. Reused for
+    /// each of the K=6 selected experts; weighted-accumulated into
+    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`.
+    pub routed_expert_out: Option<rdna_compute::GpuTensor>,
 
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
@@ -501,6 +505,7 @@ impl DeepseekV4State {
             hc_c: None,
             router_scores: None,
             topk_indices: None,
+            routed_expert_out: None,
             n_tokens: 0,
             _scaffold: (),
         })
