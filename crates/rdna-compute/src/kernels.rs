@@ -1590,6 +1590,10 @@ pub const SQRT_SOFTPLUS_F32_SRC: &str =
     include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 pub const V4F_ATTN_POS0_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_pos0.hip");
+pub const V4F_ATTN_SWA_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa.hip");
+pub const SWA_RING_WRITE_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write.hip");
 
 // Phase 4 — Tail-only RoPE:
 pub const ROPE_TAIL_HALFSPLIT_SRC: &str =

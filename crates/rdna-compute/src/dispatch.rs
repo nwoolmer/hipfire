@@ -19545,6 +19545,99 @@ impl Gpu {
         }
     }
 
+    /// Write a single KV vector into the SWA ring at slot.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn swa_ring_write_f32(
+        &mut self,
+        kv: &GpuTensor,
+        cache: &GpuTensor,
+        n_kv_heads: i32,
+        head_dim: i32,
+        window: i32,
+        slot: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("swa_ring_write_f32",
+            kernels::SWA_RING_WRITE_SRC, "swa_ring_write_f32")?;
+        let func = &self.functions["swa_ring_write_f32"];
+        let kp = kv.buf.as_ptr();
+        let cp = cache.buf.as_ptr();
+        let mut nh = n_kv_heads;
+        let mut hd = head_dim;
+        let mut wn = window;
+        let mut sl = slot;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        let grid = ((head_dim + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F SWA-windowed attention with attn_sink (multi-position).
+    /// Generalises `v4f_attn_pos0` to attend over a cache of up to
+    /// `window` past KV positions.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_swa(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+        n_valid: i32,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_swa",
+            kernels::V4F_ATTN_SWA_SRC, "v4f_attn_swa")?;
+        let func = &self.functions["v4f_attn_swa"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut nv = n_valid;
+        let mut wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [o_groups as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F position-0 attention: per-head sigmoid-of-(Q·K + attn_sink),
     /// times V, reduced over o_groups.
     #[allow(dead_code, clippy::too_many_arguments)]

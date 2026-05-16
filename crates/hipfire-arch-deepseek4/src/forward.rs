@@ -116,6 +116,7 @@ pub fn decode_step(
     let logits = state.logits.as_ref().unwrap();
     let logits_host = gpu.download_f32(logits)
         .map_err(|e| format!("download logits: {e:?}"))?;
+    state.n_tokens += 1;
     Ok(logits_host)
 }
 
@@ -343,41 +344,60 @@ fn attn_stub(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
+    // SWA attention with KV cache.
     if state.attn_out.is_none() {
         state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc attn_out: {e:?}"))?);
     }
-    // Position-0 attention with V4F's attn_sink. Per query head:
-    //   prob_h = sigmoid(Q[h] · K + attn_sink[h])
-    //   per_head_h = prob_h * V    (V = K, tied)
-    // Reduce 8 heads per o_group into one head_dim-sized slice of attn_out.
-    let q = state.q.as_ref().unwrap();
-    let kv = state.kv.as_ref().unwrap();
-    let attn_out = state.attn_out.as_ref().unwrap();
-    let _ = layer_idx;
+    let n_kv = cfg.num_key_value_heads;
+    let hd = cfg.head_dim;
+    let win = cfg.sliding_window;
 
-    // Get this layer's attn_sink tensor (F16 in HFQ; uploaded as F32 by upload helper).
-    // Actually upload_global_raw uploaded it verbatim as F32 since the source
-    // dtype was F32 → stored as F16 in HFQ → uploaded as F16 bytes. Wait:
-    // attn_sink dtype on disk is F32 per V4F. After HFQ quantizer's
-    // fallback-to-F16, ingest log showed "F16: ... attn.attn_sink [64]".
-    // Our load_weights uses upload_global_raw (F16 verbatim).
-    //
-    // For now, the v4f_attn_pos0 kernel reads attn_sink as F32. If F16
-    // on GPU, this would mis-read. TODO: convert attn_sink to F32 at
-    // upload time like we do for norms. For position-0 testing,
-    // pass kv as a stand-in for attn_sink (incorrect but unblocks the
-    // dispatch test) — flag for paper-correctness gate.
-    //
-    // Use the layer's actual attn_sink (F16→F32-converted at load).
+    // Lazy-allocate per-layer SWA K, V caches.
+    {
+        let attn = &mut state._attention[layer_idx];
+        if attn.swa_k.is_none() {
+            attn.swa_k = Some(gpu.zeros(&[n_kv, hd, win], DType::F32)
+                .map_err(|e| format!("alloc swa_k l{layer_idx}: {e:?}"))?);
+        }
+        if attn.swa_v.is_none() {
+            attn.swa_v = Some(gpu.zeros(&[n_kv, hd, win], DType::F32)
+                .map_err(|e| format!("alloc swa_v l{layer_idx}: {e:?}"))?);
+        }
+    }
+    let pos = state.n_tokens as usize;
+    let slot = pos % win;
+
+    // Write current kv into the SWA ring at slot via the dedicated kernel.
+    {
+        let kv = state.kv.as_ref().unwrap();
+        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+        let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+        gpu.swa_ring_write_f32(kv, swa_k,
+            n_kv as i32, hd as i32, win as i32, slot as i32)
+            .map_err(|e| format!("swa_k ring write: {e:?}"))?;
+        gpu.swa_ring_write_f32(kv, swa_v,
+            n_kv as i32, hd as i32, win as i32, slot as i32)
+            .map_err(|e| format!("swa_v ring write: {e:?}"))?;
+    }
+
+    let n_valid = (pos + 1).min(win) as i32;
+
+    let q = state.q.as_ref().unwrap();
+    let attn_out = state.attn_out.as_ref().unwrap();
     let layer = &weights.layers[layer_idx];
     let attn_sink = layer.attn_sink.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
-    gpu.v4f_attn_pos0(q, kv, attn_sink, attn_out,
+    let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+    let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+
+    gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out,
         cfg.num_attention_heads as i32,
-        cfg.head_dim as i32,
+        hd as i32,
         cfg.o_groups as i32,
-    ).map_err(|e| format!("v4f_attn_pos0: {e:?}"))?;
+        n_valid,
+        win as i32,
+    ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     Ok(())
 }
 

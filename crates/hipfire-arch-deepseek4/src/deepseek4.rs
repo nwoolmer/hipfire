@@ -331,14 +331,13 @@ pub struct IndexerLayerState {
 /// positions per step: a bounded ring of the last 128 raw KV rows
 /// (SWA window) plus 512 rows gathered from the indexer's top-k.
 pub struct MainAttentionLayerState {
-    /// SWA ring buffer for raw K (last `sliding_window = 128` positions).
-    pub _k_swa: (),
-    /// SWA ring buffer for raw V.
-    pub _v_swa: (),
-    /// K rows gathered from the indexer's top-k indices, max
-    /// `index_topk = 512` rows.
+    /// SWA ring K cache `[n_kv_heads, head_dim, sliding_window]` F32.
+    /// `None` until `decode_step` allocates on first call.
+    pub swa_k: Option<rdna_compute::GpuTensor>,
+    /// SWA ring V cache. V4F has tied K=V so this is a copy of swa_k.
+    pub swa_v: Option<rdna_compute::GpuTensor>,
+    /// K rows gathered from the indexer's top-k indices (Phase 2). Stub.
     pub _k_gathered: (),
-    /// V rows gathered from the indexer's top-k indices.
     pub _v_gathered: (),
 }
 
@@ -437,6 +436,11 @@ pub struct DeepseekV4State {
     /// as i32. Shape `[num_experts_per_tok = 6]`.
     pub topk_indices: Option<rdna_compute::GpuTensor>,
 
+    /// Monotonic position counter — how many tokens this session has
+    /// processed. Used to compute the SWA cache slot (`pos % window`)
+    /// and number of valid cached positions.
+    pub n_tokens: u64,
+
     pub _scaffold: (),
 }
 
@@ -453,7 +457,7 @@ impl DeepseekV4State {
                 _top_k_indices: (),
             });
             attention.push(MainAttentionLayerState {
-                _k_swa: (), _v_swa: (),
+                swa_k: None, swa_v: None,
                 _k_gathered: (), _v_gathered: (),
             });
         }
@@ -481,6 +485,7 @@ impl DeepseekV4State {
             hc_c: None,
             router_scores: None,
             topk_indices: None,
+            n_tokens: 0,
             _scaffold: (),
         })
     }
