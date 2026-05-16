@@ -1,35 +1,23 @@
 // V4F SWA-windowed attention with attn_sink (multi-position).
 //
-// Generalizes v4f_attn_pos0 to attend over up to `sliding_window = 128`
-// past positions plus the attn_sink. Computes:
+// Output is PER-HEAD (no group reduction). Upstream V4F preserves
+// the [n_heads, head_dim] attention output and feeds it into wo_a
+// (per-group O-LoRA) + wo_b for the residual contribution.
 //
-//   For each query head h:
-//     For each cached position p in [0, n_valid):
-//       score[p] = (Q[h] · K_cache[p]) + (attn_sink[h] if p == n_valid - sentinel_ix)
-//                 actually: scores are Q·K, sink is added as one extra entry.
-//     softmax([scores, attn_sink[h]]) → probs[n_valid + 1]
-//     contribution = sum over p < n_valid of probs[p] * V_cache[p]
+// For each query head h:
+//   For each cached position p in [0, n_valid):
+//     score[p] = Q[h] · K_cache[p] / sqrt(head_dim)
+//   softmax with sink-as-extra-entry:
+//     Z = sum_p exp(score[p] - max) + exp(sink_h - max)
+//     prob[p] = exp(score[p] - max) / Z
+//   attn_out[h, d] = sum_p prob[p] * V_cache[p, d]
 //
-//   For each o_group g (8 heads each):
-//     attn_out[g, :] = sum over 8 heads in group of contribution
-//
-// V4F: n_kv_heads = 1, head_dim = 512, n_query_heads = 64,
-//      o_groups = 8 → heads_per_group = 8.
-//
-// SWA cache layout: k_cache, v_cache: [n_kv_heads, head_dim, window].
-// Logical ordering for positions: 0..min(n_total, window) where the
-// LATEST is at slot (n_total - 1) % window. For simplicity the
-// caller passes `n_valid` = min(n_total, window) and we treat the
-// first n_valid slots as the cached positions in their ring order.
-// (Position numbering details handled at the caller; this kernel
-// just dot-products over n_valid slots.)
-//
-// Output bounded: |attn_out[g, d]| ≤ 8 · max(|V|) per group.
+// V4F: n_kv_heads = 1, head_dim = 512, n_query_heads = 64.
+// SWA cache layout: [n_kv_heads, head_dim, window].
 
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-#define MAX_HEADS_PER_GROUP 16  // n_heads / o_groups, V4F=8
 #define MAX_WINDOW 256           // sliding_window, V4F=128
 
 extern "C" __global__ void v4f_attn_swa(
@@ -37,71 +25,53 @@ extern "C" __global__ void v4f_attn_swa(
     const float* __restrict__ k_cache,     // [n_kv_heads, head_dim, window]
     const float* __restrict__ v_cache,     // [n_kv_heads, head_dim, window]
     const float* __restrict__ attn_sink,   // [n_heads]
-    float*       __restrict__ attn_out,    // [o_groups, head_dim]
+    float*       __restrict__ attn_out,    // [n_heads, head_dim]
     int n_heads,
     int head_dim,
-    int o_groups,
+    int o_groups,                           // unused — kept in signature for ABI compat
     int n_valid,                            // active positions in cache (≤ window)
     int window
 ) {
-    const int g = blockIdx.x;
-    const int d = threadIdx.x;
-    if (g >= o_groups || d >= head_dim) return;
+    (void)o_groups;
+    const int h = blockIdx.x;             // head index
+    const int d = threadIdx.x;            // dim index
+    if (h >= n_heads || d >= head_dim) return;
 
-    const int heads_per_g = n_heads / o_groups;
+    __shared__ float shared_probs[MAX_WINDOW];
 
-    __shared__ float shared_probs[MAX_HEADS_PER_GROUP * MAX_WINDOW];
-
-    // Scaled dot-product: divide by sqrt(head_dim) to keep softmax
-    // from saturating with high-dim head_dim values.
     const float inv_scale = rsqrtf((float)head_dim);
 
-    // Phase 1: compute probabilities for each head in this group.
+    // Phase 1: compute probabilities for this head. Thread 0 computes,
+    // broadcasts to others via shared memory.
     if (d == 0) {
-        for (int h_local = 0; h_local < heads_per_g; ++h_local) {
-            int h = g * heads_per_g + h_local;
-
-            // Compute scores[p] = (Q[h] · K[p]) / sqrt(head_dim) for p in [0, n_valid).
-            float max_score = -1e30f;
-            float scores[MAX_WINDOW];
-            for (int p = 0; p < n_valid; ++p) {
-                float s = 0.0f;
-                for (int i = 0; i < head_dim; ++i) {
-                    s += q[h * head_dim + i] * k_cache[i * window + p];
-                }
-                s *= inv_scale;
-                scores[p] = s;
-                if (s > max_score) max_score = s;
+        float max_score = -1e30f;
+        float scores[MAX_WINDOW];
+        for (int p = 0; p < n_valid; ++p) {
+            float s = 0.0f;
+            for (int i = 0; i < head_dim; ++i) {
+                s += q[h * head_dim + i] * k_cache[i * window + p];
             }
-            // Include attn_sink as an extra "position" in the softmax.
-            float sink = attn_sink[h];
-            if (sink > max_score) max_score = sink;
-
-            // Softmax normalization with stability.
-            float sum_exp = expf(sink - max_score);
-            for (int p = 0; p < n_valid; ++p) {
-                scores[p] = expf(scores[p] - max_score);
-                sum_exp += scores[p];
-            }
-            // probs[h_local, p] = scores[p] / sum_exp; sink prob discarded
-            // (it contributes nothing to V).
-            for (int p = 0; p < n_valid; ++p) {
-                shared_probs[h_local * MAX_WINDOW + p] = scores[p] / sum_exp;
-            }
+            s *= inv_scale;
+            scores[p] = s;
+            if (s > max_score) max_score = s;
+        }
+        float sink = attn_sink[h];
+        if (sink > max_score) max_score = sink;
+        float sum_exp = expf(sink - max_score);
+        for (int p = 0; p < n_valid; ++p) {
+            scores[p] = expf(scores[p] - max_score);
+            sum_exp += scores[p];
+        }
+        for (int p = 0; p < n_valid; ++p) {
+            shared_probs[p] = scores[p] / sum_exp;
         }
     }
     __syncthreads();
 
-    // Phase 2: each thread d computes one element of attn_out[g, d] =
-    // sum over heads in group of (sum over positions of probs * V[p, d]).
+    // Phase 2: attn_out[h, d] = sum_p prob[p] * V[d, p].
     float acc = 0.0f;
-    for (int h_local = 0; h_local < heads_per_g; ++h_local) {
-        for (int p = 0; p < n_valid; ++p) {
-            float prob = shared_probs[h_local * MAX_WINDOW + p];
-            // V is shared across heads (tied K=V, 1 kv head).
-            float v_val = v_cache[d * window + p];
-            acc += prob * v_val;
-        }
+    for (int p = 0; p < n_valid; ++p) {
+        acc += shared_probs[p] * v_cache[d * window + p];
     }
-    attn_out[g * head_dim + d] = acc;
+    attn_out[h * head_dim + d] = acc;
 }

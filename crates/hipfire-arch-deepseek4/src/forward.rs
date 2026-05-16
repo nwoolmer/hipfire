@@ -561,64 +561,132 @@ fn attn_stub(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
+    // Final attention contribution: shape [hidden]. Consumed by hc_attn_mix.
     if state.attn_out.is_none() {
         state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc attn_out: {e:?}"))?);
     }
-    // Choose attention path. Default to pos-0 (produces diverse
-    // multilingual words). HIPFIRE_V4F_ATTN=swa for SWA-windowed
-    // multi-position (currently repetition-prone — needs debugging).
+    // Raw attention output [n_heads, head_dim] — kernel writes here.
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_heads_head_dim = n_heads * head_dim;
+    if state.attn_out_raw.is_none() {
+        state.attn_out_raw = Some(gpu.alloc_tensor(&[n_heads, head_dim], DType::F32)
+            .map_err(|e| format!("alloc attn_out_raw: {e:?}"))?);
+    }
+    if state.attn_out_raw_rot.is_none() {
+        state.attn_out_raw_rot = Some(gpu.alloc_tensor(&[n_heads_head_dim], DType::F32)
+            .map_err(|e| format!("alloc attn_out_raw_rot: {e:?}"))?);
+    }
+    let n_groups = cfg.o_groups;
+    let o_lora_rank = cfg.o_lora_rank;
+    let groups_o_lora = n_groups * o_lora_rank;
+    if state.wo_a_out.is_none() {
+        state.wo_a_out = Some(gpu.alloc_tensor(&[groups_o_lora], DType::F32)
+            .map_err(|e| format!("alloc wo_a_out: {e:?}"))?);
+    }
+    if state.wo_a_out_rot.is_none() {
+        state.wo_a_out_rot = Some(gpu.alloc_tensor(&[groups_o_lora], DType::F32)
+            .map_err(|e| format!("alloc wo_a_out_rot: {e:?}"))?);
+    }
+
     let use_swa = std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() == Some("swa");
 
     let q = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
-    let attn_out = state.attn_out.as_ref().unwrap();
+    let attn_out_raw = state.attn_out_raw.as_ref().unwrap();
     let layer = &weights.layers[layer_idx];
     let attn_sink = layer.attn_sink.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
 
     if !use_swa {
         // Pos-0 attention (default). Each step independent.
-        gpu.v4f_attn_pos0(q, kv, attn_sink, attn_out,
-            cfg.num_attention_heads as i32,
-            cfg.head_dim as i32,
-            cfg.o_groups as i32,
+        gpu.v4f_attn_pos0(q, kv, attn_sink, attn_out_raw,
+            n_heads as i32, head_dim as i32, n_groups as i32,
         ).map_err(|e| format!("v4f_attn_pos0: {e:?}"))?;
-        return Ok(());
-    }
-
-    // SWA path.
-    let n_kv = cfg.num_key_value_heads;
-    let hd = cfg.head_dim;
-    let win = cfg.sliding_window;
-    {
-        let attn = &mut state._attention[layer_idx];
-        if attn.swa_k.is_none() {
-            attn.swa_k = Some(gpu.zeros(&[n_kv, hd, win], DType::F32)
-                .map_err(|e| format!("alloc swa_k l{layer_idx}: {e:?}"))?);
+    } else {
+        // SWA path.
+        let n_kv = cfg.num_key_value_heads;
+        let win = cfg.sliding_window;
+        {
+            let attn = &mut state._attention[layer_idx];
+            if attn.swa_k.is_none() {
+                attn.swa_k = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                    .map_err(|e| format!("alloc swa_k l{layer_idx}: {e:?}"))?);
+            }
+            if attn.swa_v.is_none() {
+                attn.swa_v = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                    .map_err(|e| format!("alloc swa_v l{layer_idx}: {e:?}"))?);
+            }
         }
-        if attn.swa_v.is_none() {
-            attn.swa_v = Some(gpu.zeros(&[n_kv, hd, win], DType::F32)
-                .map_err(|e| format!("alloc swa_v l{layer_idx}: {e:?}"))?);
+        let pos = state.n_tokens as usize;
+        let slot = pos % win;
+        {
+            let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+            let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+            gpu.swa_ring_write_f32(kv, swa_k, n_kv as i32, head_dim as i32, win as i32, slot as i32)
+                .map_err(|e| format!("swa_k write: {e:?}"))?;
+            gpu.swa_ring_write_f32(kv, swa_v, n_kv as i32, head_dim as i32, win as i32, slot as i32)
+                .map_err(|e| format!("swa_v write: {e:?}"))?;
         }
-    }
-    let pos = state.n_tokens as usize;
-    let slot = pos % win;
-    {
+        let n_valid = (pos + 1).min(win) as i32;
         let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
         let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-        gpu.swa_ring_write_f32(kv, swa_k, n_kv as i32, hd as i32, win as i32, slot as i32)
-            .map_err(|e| format!("swa_k write: {e:?}"))?;
-        gpu.swa_ring_write_f32(kv, swa_v, n_kv as i32, hd as i32, win as i32, slot as i32)
-            .map_err(|e| format!("swa_v write: {e:?}"))?;
+        gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
+            n_heads as i32, head_dim as i32, n_groups as i32,
+            n_valid, win as i32,
+        ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     }
-    let n_valid = (pos + 1).min(win) as i32;
-    let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
-    let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-    gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out,
-        cfg.num_attention_heads as i32, hd as i32, cfg.o_groups as i32,
-        n_valid, win as i32,
-    ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
+
+    // TODO: inverse tail RoPE on attn_out_raw's last qk_rope_head_dim
+    // dims per head. Upstream applies `apply_rotary_emb(o[..., -rd:],
+    // freqs_cis, True)` to undo the RoPE that V (=K, tied) had when
+    // it was written. Without this, the rotated tail dims are summed
+    // across positions with different phases and the result has
+    // incorrect angular state. Add when we have a rope_tail_inverse
+    // kernel.
+
+    // O-LoRA projection: wo_a per-group + wo_b.
+    //   wo_a: [n_groups * o_lora_rank, heads_per_group * head_dim] MQ4
+    //         = [8 * 1024, 8 * 512] = [8192, 4096]
+    //   Per group g: y_g [o_lora_rank=1024] = wo_a_g [1024, 4096] @ x_g [4096]
+    //   wo_b: [hidden, n_groups * o_lora_rank] MQ4 = [4096, 8192]
+    //   y [hidden=4096] = wo_b @ wo_a_out_rot [8192]
+    let wo_a = layer.wo_a.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a missing"))?;
+    let wo_b = layer.wo_b.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_b missing"))?;
+    let attn_out_raw_rot = state.attn_out_raw_rot.as_ref().unwrap();
+    let wo_a_out = state.wo_a_out.as_ref().unwrap();
+    let wo_a_out_rot = state.wo_a_out_rot.as_ref().unwrap();
+    let final_attn_out = state.attn_out.as_ref().unwrap();
+
+    // FWHT-rotate per-group slices of attn_out_raw (k=heads_per_group*head_dim).
+    let heads_per_group = n_heads / n_groups;
+    let per_group_in = heads_per_group * head_dim;
+    // wo_a is MQ4G256 with 136 bytes per 256 elements. Per-group slice
+    // has o_lora_rank * per_group_in elements → bytes = (m*k/256)*136.
+    let per_group_wa_bytes = (o_lora_rank * per_group_in / 256) * 136;
+
+    for g in 0..n_groups {
+        let raw_view = attn_out_raw.sub_offset(g * per_group_in, per_group_in);
+        let rot_view = attn_out_raw_rot.sub_offset(g * per_group_in, per_group_in);
+        let wo_a_view = wo_a.sub_offset(g * per_group_wa_bytes, per_group_wa_bytes);
+        let out_view = wo_a_out.sub_offset(g * o_lora_rank, o_lora_rank);
+        gpu.rotate_x_mq(&raw_view, &rot_view, per_group_in)
+            .map_err(|e| format!("rotate attn_out g{g} l{layer_idx}: {e:?}"))?;
+        gpu.gemv_mq4g256_prerotated(&wo_a_view, &rot_view, &out_view,
+                o_lora_rank, per_group_in)
+            .map_err(|e| format!("gemv wo_a g{g} l{layer_idx}: {e:?}"))?;
+    }
+
+    // FWHT-rotate wo_a_out then wo_b GEMV → final_attn_out [hidden].
+    gpu.rotate_x_mq(wo_a_out, wo_a_out_rot, groups_o_lora)
+        .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    gpu.gemv_mq4g256_prerotated(wo_b, wo_a_out_rot, final_attn_out,
+            cfg.hidden_size, groups_o_lora)
+        .map_err(|e| format!("gemv wo_b l{layer_idx}: {e:?}"))?;
+
     Ok(())
 }
 

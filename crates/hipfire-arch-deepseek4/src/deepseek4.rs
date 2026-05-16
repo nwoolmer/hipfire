@@ -473,6 +473,16 @@ pub struct DeepseekV4State {
     /// once on first attention layer.
     pub q_head_ones: Option<rdna_compute::GpuTensor>,
 
+    /// Raw attention output `[n_heads, head_dim]` F32 = 32768 elems.
+    /// Fed into the O-LoRA projection (wo_a + wo_b → state.attn_out).
+    pub attn_out_raw: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated `attn_out_raw` for wo_a GEMV input.
+    pub attn_out_raw_rot: Option<rdna_compute::GpuTensor>,
+    /// wo_a output `[n_groups * o_lora_rank]` F32 = 8192 elems.
+    pub wo_a_out: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated wo_a_out for the wo_b GEMV input.
+    pub wo_a_out_rot: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -524,6 +534,10 @@ impl DeepseekV4State {
             topk_indices: None,
             routed_expert_out: None,
             q_head_ones: None,
+            attn_out_raw: None,
+            attn_out_raw_rot: None,
+            wo_a_out: None,
+            wo_a_out_rot: None,
             n_tokens: 0,
             _scaffold: (),
         })
