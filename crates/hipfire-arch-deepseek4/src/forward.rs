@@ -273,15 +273,20 @@ fn ffn_routed(
     //    on host (small: k=6 + n_exp=256 floats per layer).
     let topk = state.topk_indices.as_ref().unwrap();
     let scores = state.router_scores.as_ref().unwrap();
-    let topk_host = gpu.download_f32(topk)
+    // `topk_indices` is allocated as F32 but `indexer_top_k` writes raw
+    // i32 bytes into it. Download as f32 then reinterpret bits as i32.
+    let topk_host_f32 = gpu.download_f32(topk)
         .map_err(|e| format!("d2h topk l{layer_idx}: {e:?}"))?;
     let scores_host = gpu.download_f32(scores)
         .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
 
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
-    let topk_ids: Vec<u32> = topk_host.iter().take(k)
-        .map(|f| (*f as i32).max(0).min((n_exp - 1) as i32) as u32)
+    let topk_ids: Vec<u32> = topk_host_f32.iter().take(k)
+        .map(|f| {
+            let raw = i32::from_le_bytes(f.to_le_bytes());
+            raw.max(0).min((n_exp - 1) as i32) as u32
+        })
         .collect();
     let mut wts: Vec<f32> = topk_ids.iter().map(|&i| scores_host[i as usize]).collect();
     let w_sum: f32 = wts.iter().sum();
