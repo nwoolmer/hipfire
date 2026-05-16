@@ -14480,6 +14480,49 @@ impl Gpu {
         result
     }
 
+    /// V4F SwiGLU with swiglu_limit clamp.
+    /// out[i] = silu(min(gate[i], L)) * clamp(up[i], -L, +L), where L = swiglu_limit.
+    pub fn v4f_silu_mul_clamp_f32(
+        &mut self, gate: &GpuTensor, up: &GpuTensor, out: &GpuTensor, swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_silu_mul_clamp",
+            kernels::V4F_SILU_MUL_CLAMP_SRC, "v4f_silu_mul_clamp_f32")?;
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+        let mut limit_val = swiglu_limit;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut limit_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "v4f_silu_mul_clamp_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "v4f_silu_mul_clamp_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(limit_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;

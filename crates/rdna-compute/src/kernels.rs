@@ -986,6 +986,11 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 pub const SILU_MUL_SRC: &str = include_str!("../../../kernels/src/silu_mul.hip");
 
 
+/// V4F SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
+/// L = swiglu_limit (V4F config = 10.0).
+pub const V4F_SILU_MUL_CLAMP_SRC: &str = include_str!("../../../kernels/src/v4f_silu_mul_clamp.hip");
+
+
 /// Softmax over last dimension (one block per row)
 pub const SOFTMAX_SRC: &str = include_str!("../../../kernels/src/softmax.hip");
 
