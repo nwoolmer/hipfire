@@ -20,7 +20,7 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Single-token decode step. Takes the token id of the previous
 /// position, returns the logits over `vocab_size`.
@@ -38,12 +38,9 @@ pub fn decode_step(
 ) -> Result<Vec<f32>, String> {
     // 1. Token embedding → initial residual streams.
     //    V4F uses `hc_mult = 4` parallel streams. Init pattern is
-    //    likely [embed, 0, 0, 0] (paper-specified; verify against
-    //    the V4F reference code before optimising).
-    //    Output: residual_streams [4, hidden = 4096] fp16
-    //    Uses: existing `embedding_lookup` against weights.token_embd
-    //    (which is Q8_0 raw bytes — the dequant kernel reads it).
-    unimplemented_step("embed → residual streams init")?;
+    //    [embed, 0, 0, 0] (paper-specified; verify against the V4F
+    //    reference code before optimising).
+    init_residual_streams(cfg, weights, state, gpu, token_id)?;
 
     // 2. Per-layer forward.
     for layer_idx in 0..cfg.num_hidden_layers {
@@ -149,5 +146,59 @@ pub fn decode_step(
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// Step 1 of forward: embedding lookup + 4-stream residual init.
+///
+/// V4F's HC pattern starts with `[embed, 0, 0, 0]` — stream 0 gets
+/// the embedding, streams 1-3 zero-initialised. Subsequent layers'
+/// HC mixes propagate signal across all four streams.
+///
+/// Allocates `state.residual_streams` and `state.embed_scratch`
+/// lazily on first call.
+fn init_residual_streams(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+) -> Result<(), String> {
+    let token_embd = weights.token_embd.as_ref()
+        .ok_or_else(|| "init_residual_streams: token_embd not uploaded".to_string())?;
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+
+    if state.embed_scratch.is_none() {
+        state.embed_scratch = Some(
+            gpu.alloc_tensor(&[hidden], DType::F16)
+                .map_err(|e| format!("alloc embed_scratch: {e:?}"))?
+        );
+    }
+    if state.residual_streams.is_none() {
+        let t = gpu.alloc_tensor(&[hc_mult, hidden], DType::F16)
+            .map_err(|e| format!("alloc residual_streams: {e:?}"))?;
+        state.residual_streams = Some(t);
+    }
+
+    // Dequant + lookup token row → embed_scratch [hidden].
+    let embed_scratch = state.embed_scratch.as_ref().unwrap();
+    gpu.embedding_lookup_q8(token_embd, embed_scratch, token_id, hidden)
+        .map_err(|e| format!("embedding_lookup_q8: {e:?}"))?;
+
+    // Copy embed_scratch → residual_streams[0, :], zero streams 1..hc_mult.
+    let streams = state.residual_streams.as_ref().unwrap();
+    let bytes_per_stream = hidden * 2;  // F16 = 2 bytes
+    gpu.memcpy_dtod_auto(&streams.buf, &embed_scratch.buf, bytes_per_stream)
+        .map_err(|e| format!("d2d copy stream 0: {e:?}"))?;
+    // Zero streams 1..hc_mult. Use the bridge's memset over the tail.
+    let tail_off = bytes_per_stream;
+    let tail_len = bytes_per_stream * (hc_mult - 1);
+    // Build a sub-view starting after stream 0.
+    let dst_view = streams.sub_offset(hidden, hidden * (hc_mult - 1));
+    let _ = (tail_off, tail_len);
+    gpu.hip.memset(&dst_view.buf, 0, dst_view.byte_size())
+        .map_err(|e| format!("memset streams 1..: {e:?}"))?;
+
     Ok(())
 }
