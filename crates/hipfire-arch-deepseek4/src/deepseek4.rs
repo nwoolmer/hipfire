@@ -154,8 +154,18 @@ struct RawYarnScaling {
 
 impl DeepseekV4Config {
     pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
-        let raw: RawDeepseekV4Config = serde_json::from_str(&hfq.metadata_json)
-            .map_err(|e| format!("deepseek4: parsing metadata_json failed: {e}"))?;
+        // The quantizer wraps the V4F config inside an outer
+        // `{"architecture":..., "config":{...}, "tokenizer":...,
+        // "tokenizer_config":...}` envelope (matches the Qwen3.5
+        // pattern; see crates/hipfire-quantize/src/main.rs around
+        // line ~3805). Unwrap the inner `config` slice before parsing.
+        let wrapper: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("deepseek4: metadata_json not valid JSON: {e}"))?;
+        let inner = wrapper.get("config").ok_or_else(|| {
+            "deepseek4: metadata_json missing `config` wrapper".to_string()
+        })?;
+        let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
+            .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
         Ok(DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
