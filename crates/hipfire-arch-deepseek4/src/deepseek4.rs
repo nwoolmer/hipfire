@@ -360,8 +360,20 @@ pub struct DeepseekV4State {
     pub embed_scratch: Option<rdna_compute::GpuTensor>,
 
     /// Per-step scratch `[hidden]` F32 — used for RMSNorm output,
-    /// Q-LoRA intermediate, etc. Reused across layers.
+    /// FWHT-rotated input to first GEMV, etc. Reused across layers.
     pub tmp: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
+    /// `wq_a @ x`, input to `wq_b`. Reused across layers.
+    pub q_lat: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck rotated `[q_lora_rank]` F32. FWHT-rotated
+    /// view of q_lat, input to the MQ4 GEMV against wq_b.
+    pub q_lat_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Full Q `[n_heads * head_dim = 64 * 512 = 32768]` F32. Output
+    /// of `wq_b @ q_lat_rot`. Tail-only RoPE applied in place.
+    pub q: Option<rdna_compute::GpuTensor>,
 
     pub _scaffold: (),
 }
@@ -389,6 +401,9 @@ impl DeepseekV4State {
             residual_streams: None,  // allocated on first `decode_step` (needs Gpu).
             embed_scratch: None,
             tmp: None,
+            q_lat: None,
+            q_lat_rot: None,
+            q: None,
             _scaffold: (),
         })
     }

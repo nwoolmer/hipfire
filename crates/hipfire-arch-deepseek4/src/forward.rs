@@ -50,17 +50,15 @@ pub fn decode_step(
 
         // ── 2a. Attention block ───────────────────────────────────────
         //
-        // i. RMSNorm against `layer.attn_norm` on residual stream[0].
-        //    Output in state.tmp [hidden] f32. (V4F paper: one stream
-        //    feeds the transform; we conservatively use stream 0 —
-        //    revisit during numerical-correctness gate.)
-        attn_rms_norm(cfg, weights, state, gpu, layer_idx)?;
+        // i+ii. Fused RMSNorm + Q-LoRA. The fused_rmsnorm_rotate_mq
+        //       kernel inside q_lora() does the RMSNorm AND the
+        //       FWHT rotation needed by MQ4 GEMV in a single call.
+        //       (V4F paper: one stream feeds the transform; we
+        //       conservatively use stream 0 — revisit during
+        //       numerical-correctness gate.)
+        q_lora(cfg, weights, state, gpu, layer_idx)?;
 
-        // ii. Q via Q-LoRA: x @ wq_a → q_lat, q_lat @ wq_b → q
-        //     q has shape [n_heads = 64, head_dim = 512].
-        //     Then apply tail-only RoPE on q[:, head_dim - 64..].
-        //     Uses: `gpu.rope_tail_halfsplit` with freq_base = rope_theta = 10000.
-        unimplemented_step("Q-LoRA + tail RoPE on Q")?;
+        // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
 
         // iii. Joint KV: x @ wkv → kv, split into k + v.
         //      Apply tail RoPE on k. Append k/v to SWA ring at
@@ -147,6 +145,91 @@ pub fn decode_step(
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// Step 3 (attention block): Q via Q-LoRA + tail-only RoPE.
+///
+///   x = state.tmp (post-RMSNorm)  -- but actually we should re-do
+///       RMSNorm here with the fused-rotate variant so x is in the
+///       FWHT-rotated domain that MQ4 expects.
+///
+///   Algorithm:
+///     1. fused_rmsnorm_rotate_mq(stream0, attn_norm, x_rot, hidden, eps)
+///        → x_rot [hidden] in MQ-rotated domain
+///     2. gemv_mq4g256_prerotated(wq_a, x_rot, q_lat, q_lora_rank, hidden)
+///        → q_lat [q_lora_rank=1024]
+///     3. rotate_x_mq(q_lat, q_lat_rot, q_lora_rank)
+///        → q_lat_rot [q_lora_rank]
+///     4. gemv_mq4g256_prerotated(wq_b, q_lat_rot, q, n_heads*head_dim, q_lora_rank)
+///        → q [n_heads*head_dim = 32768]
+///     5. rope_tail_halfsplit on q (only last qk_rope_head_dim=64 of each
+///        head's 512 dims)
+///
+/// Reuses `state.tmp` as the rotated post-RMSNorm input. Reuses
+/// `state.q_lat`, `state.q_lat_rot`, `state.q`.
+fn q_lora(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let attn_norm = layer.attn_norm.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_norm missing"))?;
+    let wq_a = layer.wq_a.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_a missing"))?;
+    let wq_b = layer.wq_b.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_b missing"))?;
+    let streams = state.residual_streams.as_ref().unwrap();
+
+    // Allocate Q-LoRA state slots once.
+    if state.q_lat.is_none() {
+        state.q_lat = Some(gpu.alloc_tensor(&[cfg.q_lora_rank], DType::F32)
+            .map_err(|e| format!("alloc q_lat: {e:?}"))?);
+    }
+    if state.q_lat_rot.is_none() {
+        state.q_lat_rot = Some(gpu.alloc_tensor(&[cfg.q_lora_rank], DType::F32)
+            .map_err(|e| format!("alloc q_lat_rot: {e:?}"))?);
+    }
+    if state.q.is_none() {
+        let q_total = cfg.num_attention_heads * cfg.head_dim;
+        state.q = Some(gpu.alloc_tensor(&[q_total], DType::F32)
+            .map_err(|e| format!("alloc q: {e:?}"))?);
+    }
+
+    let stream0 = streams.sub_offset(0, cfg.hidden_size);
+    let tmp = state.tmp.as_ref().unwrap();
+    let q_lat = state.q_lat.as_ref().unwrap();
+    let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
+    let q = state.q.as_ref().unwrap();
+
+    // 1. Fused RMSNorm + FWHT-rotate stream0 → tmp.
+    gpu.fused_rmsnorm_rotate_mq(&stream0, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
+        .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
+
+    // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
+    gpu.gemv_mq4g256_prerotated(wq_a, tmp, q_lat, cfg.q_lora_rank, cfg.hidden_size)
+        .map_err(|e| format!("gemv_mq4g256 wq_a layer {layer_idx}: {e:?}"))?;
+
+    // 3. Rotate q_lat for the second GEMV.
+    gpu.rotate_x_mq(q_lat, q_lat_rot, cfg.q_lora_rank)
+        .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
+
+    // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
+    let q_total = cfg.num_attention_heads * cfg.head_dim;
+    gpu.gemv_mq4g256_prerotated(wq_b, q_lat_rot, q, q_total, cfg.q_lora_rank)
+        .map_err(|e| format!("gemv_mq4g256 wq_b layer {layer_idx}: {e:?}"))?;
+
+    // 5. Apply tail-only RoPE on last qk_rope_head_dim of each head.
+    // TODO: this needs a `pos_buf` tensor with the current position
+    // and a separate K argument (rope_tail_halfsplit applies to both
+    // Q and K). For Q-only forward we'd pass q as both args, but that
+    // would double-apply rotation. Defer until KV step lands and we
+    // call rope_tail_halfsplit once on (q, k) together.
+    // For now: skip rotation here; the KV step will do it.
+
     Ok(())
 }
 
