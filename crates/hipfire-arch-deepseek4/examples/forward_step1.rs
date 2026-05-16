@@ -21,10 +21,16 @@ fn main() -> Result<(), String> {
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let mut state = DeepseekV4State::new(&cfg)?;
 
-    // Call decode_step on token 100. Even though the function returns Err
-    // at the end (`layout-only — no executable forward yet`), the first
-    // step (init_residual_streams) should populate the state.
-    let _ = decode_step(&cfg, &weights, &mut state, &mut gpu, 100, 0);
+    // Call decode_step on token 100. The function now runs through
+    // the full pipeline (43 layers + final norm + lm_head). Returns
+    // a Vec<f32> of vocab_size logits.
+    let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, 100, 0)?;
+    let nz = logits.iter().filter(|v| v.abs() > 1e-6).count();
+    let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let argmax = logits.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    eprintln!("\nlogits[{}]: nonzero={nz}, max_abs={max_abs:.4}, argmax=token {} (logit={:.4})",
+        cfg.vocab_size, argmax.0, argmax.1);
 
     // Read back residual_streams; verify stream 0 has nonzero values and
     // streams 1..hc_mult are all zero.

@@ -101,50 +101,142 @@ pub fn decode_step(
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
-        // i. RMSNorm against `layer.ffn_norm` on residual stream[0].
-        unimplemented_step("FFN RMSNorm")?;
-
-        // ii. Router: x @ gate.weight + (gate.bias if not hash_routed)
-        //     → top-k expert indices (= num_experts_per_tok = 6).
-        //     V4F: noaux_tc routing, sqrtsoftplus scoring.
-        //     First `num_hash_layers` layers (= 3 on V4F) use the
-        //     `tid2eid` hash table instead of softmax routing.
-        unimplemented_step("MoE router (noaux_tc or hash)")?;
-
-        // iii. Shared expert: x @ shared_w1, x @ shared_w3 (gate/up),
-        //      silu(gate) * up, then @ shared_w2 (down).
-        //      Output: shared_out [hidden].
-        unimplemented_step("shared expert (w1/w3/w2)")?;
-
-        // iv. Routed experts: for each of top-k (= 6) expert indices E,
-        //     run x @ expert_w1[E], x @ expert_w3[E], silu*up,
-        //     @ expert_w2[E]. Sum with topk_weights[E] * expert_out.
-        //     Output: routed_out [hidden].
-        unimplemented_step("routed experts (top-6 of 256)")?;
-
-        // v. x_ffn = shared_out + routed_scaling_factor * routed_out.
-        //    routed_scaling_factor = 1.5 (config).
-        unimplemented_step("FFN combine: shared + routed_scaling * routed")?;
-
-        // vi. HC FFN mix:
-        //      a. `gpu.hc_compute_control(x_flat, hc_ffn_fn, hc_ffn_base, c_ctrl)`
-        //      b. `gpu.hc_sinkhorn_4x4(A, ...)`
-        //      c. `gpu.hc_mix_4stream(streams, A, hc_ffn_scale, x_ffn, streams_out)`
-        unimplemented_step("HC ffn mix")?;
+        // FFN computation (router + experts + shared + scaling) is
+        // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
+        // same kernel sequence as HC attn mix. Real FFN expert
+        // dispatch lands in a follow-up (MoE routing complexity).
+        ffn_stub(cfg, state, gpu, layer_idx)?;
+        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
     }
 
     // 3. Final norm + LM head.
-    //    a. RMSNorm of residual_streams[0] against weights.output_norm
-    //    b. logits = x @ weights.head (Q8F16 or MQ4 quantized GEMV)
-    //    c. Apply head-level Hyper-Connection scale if present
-    //       (V4F: hc_head_base/fn/scale exist; check if applied at output).
-    unimplemented_step("final norm + lm_head")?;
+    //    Note: V4F has head-level HC (hc_head_base/fn/scale).
+    //    For minimal forward: skip the head-HC mix (TODO: head HC
+    //    likely projects 4 streams → 1 then applies head_weight)
+    //    and just run final norm + standard lm_head.
+    final_norm_and_head(cfg, weights, state, gpu)?;
 
-    Err("V4F forward: layout-only — no executable forward yet".to_string())
+    // Download logits to host and return.
+    let logits = state.logits.as_ref().unwrap();
+    let logits_host = gpu.download_f32(logits)
+        .map_err(|e| format!("download logits: {e:?}"))?;
+    Ok(logits_host)
 }
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// FFN STUB: ffn_out = stream0 copy. Real FFN: router + top-6
+/// expert dispatch + shared expert + scaling — pending.
+fn ffn_stub(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    _layer_idx: usize,
+) -> Result<(), String> {
+    if state.ffn_out.is_none() {
+        state.ffn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc ffn_out: {e:?}"))?);
+    }
+    let streams = state.residual_streams.as_ref().unwrap();
+    let ffn_out = state.ffn_out.as_ref().unwrap();
+    let bytes = cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&ffn_out.buf, &streams.buf, bytes)
+        .map_err(|e| format!("d2d stub ffn_out: {e:?}"))?;
+    Ok(())
+}
+
+/// HC FFN mix — same pattern as `hc_attn_mix` but with `hc_ffn_*`
+/// tensors and `ffn_out` as transform_out.
+fn hc_ffn_mix(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let hc_fn    = layer.hc_ffn_fn.as_ref().unwrap();
+    let hc_base  = layer.hc_ffn_base.as_ref().unwrap();
+    let hc_scale = layer.hc_ffn_scale.as_ref().unwrap();
+    let streams = state.residual_streams.as_ref().unwrap();
+    let ffn_out = state.ffn_out.as_ref().unwrap();
+
+    let n_ctrl = 24;
+    let x_dim = cfg.hidden_size * cfg.hc_mult;
+    let c_view = state.tmp.as_ref().unwrap().sub_offset(0, n_ctrl);
+
+    gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
+        n_ctrl as i32, x_dim as i32)
+        .map_err(|e| format!("hc_compute_control ffn layer {layer_idx}: {e:?}"))?;
+
+    let a_view = state.tmp.as_ref().unwrap().sub_offset(0, 16);
+    gpu.hc_sinkhorn_4x4(&a_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+        .map_err(|e| format!("hc_sinkhorn_4x4 ffn layer {layer_idx}: {e:?}"))?;
+
+    let streams_out = state.q.as_ref().unwrap();
+    gpu.hc_mix_4stream(streams, &a_view, hc_scale, ffn_out, streams_out,
+        cfg.hidden_size as i32)
+        .map_err(|e| format!("hc_mix_4stream ffn layer {layer_idx}: {e:?}"))?;
+
+    let bytes = cfg.hc_mult * cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
+        .map_err(|e| format!("d2d hc_ffn_mix → streams: {e:?}"))?;
+    Ok(())
+}
+
+/// Final norm + lm_head.
+///
+/// `final_norm = rmsnorm(stream0, output_norm)` [hidden]
+/// `logits = head_weight @ final_norm`             [vocab_size]
+///
+/// head_weight is MQ4G256, so we need to FWHT-rotate final_norm
+/// first via `rotate_x_mq`, then call `gemv_mq4g256_prerotated`.
+fn final_norm_and_head(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let output_norm = weights.output_norm.as_ref()
+        .ok_or_else(|| "output_norm not uploaded".to_string())?;
+    let head = weights.head.as_ref()
+        .ok_or_else(|| "head not uploaded".to_string())?;
+    let streams = state.residual_streams.as_ref().unwrap();
+
+    if state.final_norm.is_none() {
+        state.final_norm = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc final_norm: {e:?}"))?);
+    }
+    if state.final_norm_rot.is_none() {
+        state.final_norm_rot = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc final_norm_rot: {e:?}"))?);
+    }
+    if state.logits.is_none() {
+        state.logits = Some(gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
+            .map_err(|e| format!("alloc logits: {e:?}"))?);
+    }
+
+    let stream0 = streams.sub_offset(0, cfg.hidden_size);
+    let final_norm = state.final_norm.as_ref().unwrap();
+    let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
+    let logits = state.logits.as_ref().unwrap();
+
+    // 1. RMSNorm
+    gpu.rmsnorm_f32(&stream0, output_norm, final_norm, cfg.rms_norm_eps)
+        .map_err(|e| format!("final rmsnorm_f32: {e:?}"))?;
+
+    // 2. FWHT-rotate for MQ4 GEMV
+    gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
+        .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
+
+    // 3. lm_head: head @ final_norm_rot → logits [vocab_size]
+    gpu.gemv_mq4g256_prerotated(head, final_norm_rot, logits,
+        cfg.vocab_size, cfg.hidden_size)
+        .map_err(|e| format!("gemv_mq4g256 head: {e:?}"))?;
+
     Ok(())
 }
 

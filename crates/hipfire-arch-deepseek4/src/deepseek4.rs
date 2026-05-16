@@ -291,8 +291,10 @@ pub struct DeepseekV4Weights {
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
     pub token_embd: Option<rdna_compute::GpuTensor>,
-    /// Final output norm (RMSNorm scale, F16).
+    /// Final output norm (RMSNorm scale, F32 — converted from F16 at load time).
     pub output_norm: Option<rdna_compute::GpuTensor>,
+    /// LM head weight (MQ4G256, shape [vocab_size, hidden]).
+    pub head: Option<rdna_compute::GpuTensor>,
     /// One bundle per `num_hidden_layers` (43 on V4F).
     pub layers: Vec<DeepseekV4LayerWeights>,
     /// MTP head — structurally identical to a main layer, plus an
@@ -392,6 +394,21 @@ pub struct DeepseekV4State {
     /// view of `q` until real attention + O-LoRA lands.
     pub attn_out: Option<rdna_compute::GpuTensor>,
 
+    /// Per-token FFN output `[hidden]` F32, fed to HC FFN mix as
+    /// `transform_out`. Stub for now (= stream0 copy).
+    pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Final pre-lm_head normalized residual `[hidden]` F32. Output
+    /// of the global RMSNorm against `output_norm`.
+    pub final_norm: Option<rdna_compute::GpuTensor>,
+
+    /// LM head output logits `[vocab_size = 129280]` F32. Output of
+    /// `head_weight @ final_norm`.
+    pub logits: Option<rdna_compute::GpuTensor>,
+
+    /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
+    pub final_norm_rot: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -424,6 +441,10 @@ impl DeepseekV4State {
             kv: None,
             pos_buf: None,
             attn_out: None,
+            ffn_out: None,
+            final_norm: None,
+            logits: None,
+            final_norm_rot: None,
             _scaffold: (),
         })
     }

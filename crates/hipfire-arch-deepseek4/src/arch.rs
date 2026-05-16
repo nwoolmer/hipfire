@@ -205,6 +205,7 @@ impl DeepseekV4 {
         Ok(DeepseekV4Weights {
             token_embd: None,
             output_norm: None,
+            head: None,
             layers,
             mtp_layer: None,  // skipped by quantize per `mtp.` prefix; Phase 5 work.
             _scaffold: (),
@@ -251,6 +252,7 @@ impl Architecture for DeepseekV4 {
         // weight; convert at upload time.
         weights.token_embd  = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
         weights.output_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "norm.weight")?);
+        weights.head        = Some(Self::upload_global_raw(hfq, gpu, "head.weight")?);
 
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {
