@@ -28,6 +28,16 @@ extern "C" __global__ void hc_sinkhorn_4x4(
 ) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;  // stub: single-thread.
 
+    // Sinkhorn requires non-negative input. The HC control vector
+    // (c = W_fn @ x + base) can be mixed-sign; abs() it to guarantee
+    // bounded output. Paper-canonical preprocessing may be
+    // exp()/softplus/etc instead — to verify. abs is a safe lower
+    // bound: it preserves magnitude order, kills sign.
+    for (int i = 0; i < 16; ++i) {
+        float v = matrix[i];
+        matrix[i] = v < 0.0f ? -v : v;
+    }
+
     for (int it = 0; it < iters; ++it) {
         // Row normalisation: each row sums to 1.
         for (int r = 0; r < 4; ++r) {

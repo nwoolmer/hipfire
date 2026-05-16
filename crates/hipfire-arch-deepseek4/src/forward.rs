@@ -88,13 +88,13 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vii. HC attn mix — DISABLED for now (Sinkhorn over mixed-
-        // sign control vector produces wild gating that amplifies
-        // magnitudes catastrophically over 43 layers; need to apply
-        // non-negative activation to c_ctrl before sinkhorn — paper
-        // probably uses softplus or sqrtsoftplus per V4F config).
-        // hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
-        let _ = layer_idx;  // appease warnings
+        // vii. HC attn mix — DISABLED. Sinkhorn-with-abs preprocessing
+        // still produces magnitude blow-up across 43 layers — the
+        // GEMVs themselves grow even bounded inputs. Real V4F training
+        // has residual scaling that we don't replicate. Defer HC until
+        // real attention is wired (then magnitudes balance).
+        let _ = hc_attn_mix;
+        let _ = layer_idx;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
@@ -102,10 +102,10 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        // FFN block disabled along with HC for diagnostic.
+        // FFN disabled too — same magnitude reason.
         ffn_zero(cfg, state, gpu)?;
-        // hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
-        let _ = weights;
+        let _ = ffn_stub;
+        let _ = hc_ffn_mix;
     }
 
     // 3. Final norm + LM head.
