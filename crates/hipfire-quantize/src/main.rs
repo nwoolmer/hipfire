@@ -4097,35 +4097,24 @@ fn main() {
             // V4F routed experts are FP4 (E2M1) per upstream `inference/
             // model.py:132-137` and config `expert_dtype:"fp4"`. Safetensors
             // shape is [out, in/2] with each byte packing two nibbles; the
-            // paired scale tensor is `<name>.scale` UE8M0 with block size
-            // 32 along logical K. Detect via implied block size: FP4 has
-            // weight_cols * 2 / scale_cols == 32, FP8 has weight_cols /
-            // scale_cols == {16,128}.
+            // paired scale tensor is `<name>.scale` UE8M0 with block size 32
+            // along logical K.
             //
-            // Logical shape doubles in the K dim before MQ2-Lloyd.
+            // The outer condition `name.contains(".ffn.experts.")` already
+            // excludes shared_experts (which use the non-routed `.shared_
+            // experts.` infix). So everything reaching here is a routed
+            // expert → unconditionally FP4 unpack. Logical K dim doubles.
             let name_owned = name.to_string();
-            let (f32_data, logical_shape) = if meta.dtype == "I8"
+            let (f32_data, logical_shape) = if (meta.dtype == "I8"
+                || meta.dtype == "F8_E4M3")
                 && fp8_scale_for.contains_key(&name_owned)
             {
                 let (sfi, sname) = &fp8_scale_for[&name_owned];
                 let (smeta, sbytes) = st_files[*sfi]
                     .tensor_data(sname)
                     .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
-                let cols_storage = meta.shape[1];
-                let scale_cols = smeta.shape[1];
-                let logical_block_fp4 = cols_storage * 2 / scale_cols;
-                let storage_block_fp8 = cols_storage / scale_cols;
-                let is_fp4_block = logical_block_fp4 == 32 && scale_cols > 0;
-                let is_fp8_block = storage_block_fp8 == 16 || storage_block_fp8 == 128;
-                if is_fp4_block && !is_fp8_block {
-                    let (vals, logical) = dequantize_e2m1_ue8m0_to_f32(
-                        raw_data, &meta.shape, sbytes, &smeta.shape);
-                    (vals, logical)
-                } else {
-                    let vals = tensor_to_f32_with_optional_fp8_scale(
-                        name, raw_data, meta, &fp8_scale_for, &st_files);
-                    (vals, meta.shape.clone())
-                }
+                dequantize_e2m1_ue8m0_to_f32(
+                    raw_data, &meta.shape, sbytes, &smeta.shape)
             } else {
                 let vals = tensor_to_f32_with_optional_fp8_scale(
                     name, raw_data, meta, &fp8_scale_for, &st_files);
