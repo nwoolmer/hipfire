@@ -340,17 +340,22 @@ pub struct MainAttentionLayerState {
     pub _v_gathered: (),
 }
 
-/// V4F state — scaffold. Real impl will hold:
-/// - 4 residual streams (Hyper-Connections, see Phase 3)
-/// - per-layer `MainAttentionLayerState` (SWA + gathered)
-/// - per-layer `IndexerLayerState` (compressed-K cache, top-k scratch)
-/// - per-arch sampler/embedding scratch reused across decode steps
+/// V4F per-decode state. Held on the daemon's per-session struct,
+/// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
-    /// One entry per layer (43 + 1 MTP = 44). Layers with
-    /// `compress_ratio == 0` skip the indexer; that variant of the
-    /// scaffold sets `compress_ratio = 0` and leaves the cache empty.
+    /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
+    /// skip the indexer.
     pub _indexer: Vec<IndexerLayerState>,
     pub _attention: Vec<MainAttentionLayerState>,
+
+    /// Hyper-Connections residual streams `[hc_mult = 4, hidden = 4096]`.
+    /// `None` until `new_state` allocates on first session.
+    pub residual_streams: Option<rdna_compute::GpuTensor>,
+
+    /// Single-row embedding scratch `[hidden]` for the current decode
+    /// step's token lookup. `None` until allocated.
+    pub embed_scratch: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -371,7 +376,13 @@ impl DeepseekV4State {
                 _k_gathered: (), _v_gathered: (),
             });
         }
-        Ok(DeepseekV4State { _indexer: indexer, _attention: attention, _scaffold: () })
+        Ok(DeepseekV4State {
+            _indexer: indexer,
+            _attention: attention,
+            residual_streams: None,  // allocated on first `decode_step` (needs Gpu).
+            embed_scratch: None,
+            _scaffold: (),
+        })
     }
 }
 
