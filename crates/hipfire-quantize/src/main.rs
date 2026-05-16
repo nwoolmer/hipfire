@@ -3775,13 +3775,21 @@ fn main() {
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
     let is_moe = arch_id == 6;
-    // Q8 router: always on for MoE models. 4-bit router quantization destroys
-    // routing precision on precision-sensitive models (Qwen3.6-A3B: 152/256
-    // expert rows drop below 0.99 cosine similarity at HFQ4G256). Cost: ~0.05%
-    // model size. See github.com/Kaden-Schutt/hipfire/issues/171.
-    let q8_router = is_moe || q8_router_flag;
+    // V4F (arch_id=7) is also MoE but ships per-expert separate 2D
+    // tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`) instead of
+    // Qwen3.5's stacked 3D `mlp.experts.gate_up_proj`. Phase 1 ingest
+    // handles V4F's per-expert tensors individually through the
+    // standard 2D quant path; the routing fan-out into top-k experts
+    // happens at forward time, not quant time.
+    let is_v4f = arch_id == 7;
+    let is_moe_like = is_moe || is_v4f;
+    // Q8 router: always on for MoE-class models.
+    let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
+    }
+    if is_v4f {
+        eprintln!("  V4F detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -4000,6 +4008,57 @@ fn main() {
         // We split into per-expert 2D MQ4G256 quantized tensors named
         //   model.language_model.layers.{N}.mlp.experts.{X}.{base}.weight
         // so the engine loader can fish them out by expert index.
+        // ── V4F per-expert tensor path ─────────────────────────────────────
+        // V4F ships per-expert 2D tensors at `layers.L.ffn.experts.E.{w1,w2,w3}.weight`.
+        // (Not 3D-stacked like Qwen3.5 MoE.) Route them through the MQ-family
+        // quant path directly. No imatrix yet for V4F — pass unit column
+        // weights so the underlying Lloyd codebook fit is uniform; the
+        // GPTQ sequential error-feedback assignment still applies and is
+        // worth +1-2 % coherence (project_gptq_lloyd_mq2_win.md).
+        if is_v4f
+            && name.contains(".ffn.experts.")
+            && name.ends_with(".weight")
+            && meta.shape.len() == 2
+        {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files,
+            );
+            let k = meta.shape[1];
+            if k % 256 == 0
+                && (use_mq4_mq2lloyd_gptq_all || use_mq4_mqlloyd_antirez_gptq
+                    || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_imatrix
+                    || use_mq4_mqlloyd_antirez)
+            {
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let unit_col_weights: Vec<f32> = vec![1.0; k];
+                let q = if use_mq4_mq2lloyd_gptq_all
+                    || use_mq4_mqlloyd_antirez_gptq
+                {
+                    quantize_mq2g256_lloyd_gptq(&f32_data, &unit_col_weights, &signs1, &signs2)
+                } else {
+                    quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2)
+                };
+                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ2L-V4F", name, meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::MQ2G256Lloyd,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            // Fall through to standard path for non-MQ2 formats.
+        }
+
         if is_moe
             && name.contains("mlp.experts.")
             && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
