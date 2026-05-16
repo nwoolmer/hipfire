@@ -304,8 +304,10 @@ fn ffn_routed(
         // Degenerate router output — skip rather than NaN downstream.
         return Ok(());
     }
-    let route_scale = 1.5f32;  // V4F config; not in DeepseekV4Config yet.
-    for w in wts.iter_mut() { *w = (*w / w_sum) * route_scale; }
+    // Normalize weights to sum to 1 (V4F's `weights /= weights.sum()`).
+    // The route_scale (= routed_scaling_factor = 1.5) is applied at the
+    // accumulation step below, not here — avoids double-counting.
+    for w in wts.iter_mut() { *w /= w_sum; }
 
     // 3. Per-expert SwiGLU dispatch. Reuse shared scratch (ffn_gate,
     //    ffn_up, ffn_silu_rot) — by the time we get here, the shared
