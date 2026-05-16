@@ -19456,6 +19456,54 @@ impl Gpu {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // DeepSeek V4 Flash (arch_id = 7) — stub dispatch wrappers
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // These call the stub HIP kernels added in commits acfe377 / 79488aa.
+    // Each wrapper's signature is the contract the V4F forward path will
+    // bind to; the kernel bodies are placeholder reference impls until
+    // forward bring-up lands. Replace `unimplemented!` once the underlying
+    // arch crate is wired.
+
+    /// Phase 3 — Sinkhorn-normalise a 4×4 gating matrix (in place).
+    /// `matrix` is row-major 16 floats; `iters` = `hc_sinkhorn_iters`
+    /// from V4F config (= 20). `eps` = `hc_eps` (= 1e-6).
+    #[allow(dead_code)]
+    pub fn hc_sinkhorn_4x4(
+        &mut self,
+        matrix: &GpuTensor,
+        eps: f32,
+        iters: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(matrix.numel(), 16, "hc_sinkhorn_4x4 expects a 4x4 matrix");
+        self.ensure_kernel(
+            "hc_sinkhorn_4x4",
+            kernels::HC_SINKHORN_4X4_SRC,
+            "hc_sinkhorn_4x4",
+        )?;
+        let func = &self.functions["hc_sinkhorn_4x4"];
+        let m_ptr = matrix.buf.as_ptr();
+        let mut eps_v = eps;
+        let mut iters_v = iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &m_ptr as *const _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut iters_v as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [1, 1, 1],  // stub single-thread; optimised version uses 4 threads
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
 
