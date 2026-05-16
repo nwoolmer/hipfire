@@ -395,8 +395,20 @@ pub struct DeepseekV4State {
     pub attn_out: Option<rdna_compute::GpuTensor>,
 
     /// Per-token FFN output `[hidden]` F32, fed to HC FFN mix as
-    /// `transform_out`. Stub for now (= stream0 copy).
+    /// `transform_out`. Currently = shared expert output (real),
+    /// routed experts pending.
     pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
+    /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
+    pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Shared expert SwiGLU gate scratch `[moe_intermediate=2048]` F32.
+    pub ffn_gate: Option<rdna_compute::GpuTensor>,
+    /// Shared expert SwiGLU up scratch `[moe_intermediate]` F32.
+    pub ffn_up:   Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated silu(gate)*up for the down GEMV.
+    pub ffn_silu_rot: Option<rdna_compute::GpuTensor>,
 
     /// Final pre-lm_head normalized residual `[hidden]` F32. Output
     /// of the global RMSNorm against `output_norm`.
@@ -442,6 +454,10 @@ impl DeepseekV4State {
             pos_buf: None,
             attn_out: None,
             ffn_out: None,
+            ffn_x_rot: None,
+            ffn_gate: None,
+            ffn_up: None,
+            ffn_silu_rot: None,
             final_norm: None,
             logits: None,
             final_norm_rot: None,

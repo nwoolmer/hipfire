@@ -43,6 +43,8 @@ fn main() -> Result<(), String> {
     let hidden = cfg.hidden_size;
     let hc_mult = cfg.hc_mult;
     // F32 now (4 bytes per element).
+    let mut s0_max_abs = 0.0f32;
+    let mut s_other_max_abs = 0.0f32;
     let mut s0_nonzero = 0;
     let mut s1_nonzero = 0;
     let mut s2_nonzero = 0;
@@ -59,12 +61,15 @@ fn main() -> Result<(), String> {
                     _ => s3_nonzero += 1,
                 }
             }
+            if s == 0 { s0_max_abs = s0_max_abs.max(v.abs()); }
+            else { s_other_max_abs = s_other_max_abs.max(v.abs()); }
         }
     }
-    eprintln!("stream 0 nonzero count: {s0_nonzero} / {hidden}");
+    eprintln!("stream 0 nonzero count: {s0_nonzero} / {hidden}, max_abs={s0_max_abs:.4e}");
     eprintln!("stream 1 nonzero count: {s1_nonzero} / {hidden}");
     eprintln!("stream 2 nonzero count: {s2_nonzero} / {hidden}");
     eprintln!("stream 3 nonzero count: {s3_nonzero} / {hidden}");
+    eprintln!("streams 1+ max_abs: {s_other_max_abs:.4e}");
     let s_other_nonzero = s1_nonzero + s2_nonzero + s3_nonzero;
 
     // After decode_step (43 layers of Q-LoRA + KV + RoPE + HC mix), HC

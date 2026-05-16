@@ -86,18 +86,15 @@ pub fn decode_step(
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
-        //
-        // Real impl needs: SWA-windowed FlashAttn + indexer gather +
-        // O-LoRA (whose wo_a/wo_b shapes don't match standard LoRA
-        // factorization — paper-verification TODO).
-        //
-        // Stub: set attn_out = stream0 (a no-op identity). Lets the
-        // HC mix downstream still exercise the full pipeline; the
-        // numerical output is meaningless until real attention lands.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vii. HC attn mix.
-        hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
+        // vii. HC attn mix — DISABLED for now (Sinkhorn over mixed-
+        // sign control vector produces wild gating that amplifies
+        // magnitudes catastrophically over 43 layers; need to apply
+        // non-negative activation to c_ctrl before sinkhorn — paper
+        // probably uses softplus or sqrtsoftplus per V4F config).
+        // hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
+        let _ = layer_idx;  // appease warnings
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
@@ -105,8 +102,10 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        ffn_stub(cfg, state, gpu, layer_idx)?;
-        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+        // FFN block disabled along with HC for diagnostic.
+        ffn_zero(cfg, state, gpu)?;
+        // hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+        let _ = weights;
     }
 
     // 3. Final norm + LM head.
@@ -128,23 +127,102 @@ fn unimplemented_step(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// FFN STUB: ffn_out = stream0 copy. Real FFN: router + top-6
-/// expert dispatch + shared expert + scaling — pending.
-fn ffn_stub(
+/// Bind ffn_out to zero (diagnostic / temporary stub).
+fn ffn_zero(
     cfg: &DeepseekV4Config,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    _layer_idx: usize,
 ) -> Result<(), String> {
+    if state.ffn_out.is_none() {
+        state.ffn_out = Some(gpu.zeros(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc ffn_out: {e:?}"))?);
+    }
+    let ffn_out = state.ffn_out.as_ref().unwrap();
+    gpu.hip.memset(&ffn_out.buf, 0, ffn_out.byte_size())
+        .map_err(|e| format!("memset ffn_out: {e:?}"))?;
+    Ok(())
+}
+
+/// FFN block (partial — shared expert only; routed experts pending).
+///
+/// V4F has one shared expert + 256 routed experts (top-6 selected
+/// per token). The shared expert is a standard SwiGLU:
+///   gate = x @ shared_w1   [moe_intermediate=2048]
+///   up   = x @ shared_w3   [moe_intermediate]
+///   silu_gated = silu(gate) * up
+///   out  = silu_gated @ shared_w2   [hidden]
+///
+/// Then x_ffn = shared_out + routed_scaling_factor * routed_out.
+/// Routed_out is currently 0 (router/expert dispatch pending), so
+/// ffn_out = shared_out.
+fn ffn_stub(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let ffn_norm  = layer.ffn_norm.as_ref().unwrap();
+    let shared_w1 = layer.shared_w1.as_ref().unwrap();
+    let shared_w2 = layer.shared_w2.as_ref().unwrap();
+    let shared_w3 = layer.shared_w3.as_ref().unwrap();
+    let streams = state.residual_streams.as_ref().unwrap();
+
+    let im = cfg.moe_intermediate_size;
     if state.ffn_out.is_none() {
         state.ffn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc ffn_out: {e:?}"))?);
     }
-    let streams = state.residual_streams.as_ref().unwrap();
+    if state.ffn_x_rot.is_none() {
+        state.ffn_x_rot = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc ffn_x_rot: {e:?}"))?);
+    }
+    if state.ffn_gate.is_none() {
+        state.ffn_gate = Some(gpu.alloc_tensor(&[im], DType::F32)
+            .map_err(|e| format!("alloc ffn_gate: {e:?}"))?);
+    }
+    if state.ffn_up.is_none() {
+        state.ffn_up = Some(gpu.alloc_tensor(&[im], DType::F32)
+            .map_err(|e| format!("alloc ffn_up: {e:?}"))?);
+    }
+    if state.ffn_silu_rot.is_none() {
+        state.ffn_silu_rot = Some(gpu.alloc_tensor(&[im], DType::F32)
+            .map_err(|e| format!("alloc ffn_silu_rot: {e:?}"))?);
+    }
+
+    let stream0 = streams.sub_offset(0, cfg.hidden_size);
+    let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
+    let gate = state.ffn_gate.as_ref().unwrap();
+    let up   = state.ffn_up.as_ref().unwrap();
+    let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let bytes = cfg.hidden_size * 4;
-    gpu.memcpy_dtod_auto(&ffn_out.buf, &streams.buf, bytes)
-        .map_err(|e| format!("d2d stub ffn_out: {e:?}"))?;
+
+    // 1. Fused RMSNorm + FWHT rotate for the two MQ4 GEMVs.
+    gpu.fused_rmsnorm_rotate_mq(&stream0, ffn_norm, ffn_x_rot,
+        cfg.hidden_size, cfg.rms_norm_eps)
+        .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
+
+    // 2. gate = x @ shared_w1
+    gpu.gemv_mq4g256_prerotated(shared_w1, ffn_x_rot, gate, im, cfg.hidden_size)
+        .map_err(|e| format!("gemv shared_w1 layer {layer_idx}: {e:?}"))?;
+
+    // 3. up = x @ shared_w3
+    gpu.gemv_mq4g256_prerotated(shared_w3, ffn_x_rot, up, im, cfg.hidden_size)
+        .map_err(|e| format!("gemv shared_w3 layer {layer_idx}: {e:?}"))?;
+
+    // 4. silu(gate) * up — in place into gate.
+    gpu.silu_mul_f32(gate, up, gate)
+        .map_err(|e| format!("silu_mul layer {layer_idx}: {e:?}"))?;
+
+    // 5. FWHT-rotate the silu-gated vector for the down GEMV.
+    gpu.rotate_x_mq(gate, silu_rot, im)
+        .map_err(|e| format!("rotate_x_mq silu layer {layer_idx}: {e:?}"))?;
+
+    // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
+    gpu.gemv_mq4g256_prerotated(shared_w2, silu_rot, ffn_out, cfg.hidden_size, im)
+        .map_err(|e| format!("gemv shared_w2 layer {layer_idx}: {e:?}"))?;
+
     Ok(())
 }
 
@@ -256,14 +334,15 @@ fn attn_stub(
     _layer_idx: usize,
 ) -> Result<(), String> {
     if state.attn_out.is_none() {
-        state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+        state.attn_out = Some(gpu.zeros(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc attn_out: {e:?}"))?);
     }
-    let streams = state.residual_streams.as_ref().unwrap();
+    // Real attention pending — zero output means HC mix = pure
+    // Sinkhorn-driven stream rotation. Doubly-stochastic mixing
+    // preserves magnitudes (won't overflow over 43 layers).
     let attn_out = state.attn_out.as_ref().unwrap();
-    let bytes = cfg.hidden_size * 4;
-    gpu.memcpy_dtod_auto(&attn_out.buf, &streams.buf, bytes)
-        .map_err(|e| format!("d2d stub attn_out: {e:?}"))?;
+    gpu.hip.memset(&attn_out.buf, 0, attn_out.byte_size())
+        .map_err(|e| format!("memset attn_out: {e:?}"))?;
     Ok(())
 }
 
