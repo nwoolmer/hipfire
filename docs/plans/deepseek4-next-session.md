@@ -17,13 +17,40 @@ State as of 2026-05-16 (updated late-session):
   `HIPFIRE_V4F_UPLOAD_EXPERTS=1` (~38 GB VRAM; defer until
   forward consumes them).
 - Phase 1.7 (forward layout): `forward::decode_step` skeleton
-  with the complete per-layer call graph documented. Body
-  bodies are `unimplemented_step` (return Ok) until impls land.
+  with the complete per-layer call graph documented.
+- Phase 1.8 (minimum-viable forward): pipeline produces real V4F
+  logits via embed → 43 × {Q-LoRA + KV joint + tail-RoPE} →
+  final norm + lm_head. token 100 ('¤') → argmax token 65270
+  ('Kahenera'). The forward is structurally complete but
+  semantically degenerate (no real attention or FFN).
 - Phases 2-4 kernels (7 total) — all compile-clean on gfx1151,
   dispatch wrappers landed, GPU-validated against CPU references
-  within fp16 tolerance.
-- State: `DeepseekV4State` now carries `residual_streams` and
-  `embed_scratch` GpuTensor slots (Option-wrapped for lazy alloc).
+  within fp16 tolerance. ALL exercised in the forward pipeline
+  (3 used: hc_sinkhorn, hc_mix, rope_tail, fused_rmsnorm_rotate;
+  indexer trio not yet integrated).
+- State: `DeepseekV4State` now carries 15+ GpuTensor slots for
+  per-step scratch (residual_streams, embed_scratch, tmp, q_lat,
+  q_lat_rot, q, kv, pos_buf, attn_out, ffn_out, ffn_x_rot,
+  ffn_gate, ffn_up, ffn_silu_rot, final_norm, final_norm_rot,
+  logits). All lazy-allocated.
+
+**Live numerical issue:**
+
+Enabling HC mix (steps 8 and 12) produces magnitude overflow
+across 43 layers (residuals hit 4.27e37 ≈ f32 overflow). Even
+with abs() pre-processing on Sinkhorn input, even with FFN/attn
+zeroed. Root cause: V4F's training-time residual scaling +
+pre-Sinkhorn activation chain isn't replicated. Pipeline currently
+DISABLES HC mix, leaving residuals at the embedding's ~0.17
+magnitude and producing real (if simplistic) logits.
+
+To fix HC numerics: needs paper read on the activation chain.
+Candidates for the missing piece:
+- Pre-Sinkhorn activation on c_ctrl (sqrtsoftplus per config?
+  softplus? exp?)
+- Mix output scaling factor
+- Per-layer learnable residual scale that bounds compounding
+- Some combination of the above
 
 **Not done — the gap to "first token":**
 
