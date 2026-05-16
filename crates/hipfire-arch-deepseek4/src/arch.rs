@@ -242,9 +242,18 @@ impl Architecture for DeepseekV4 {
         // non-expert tensors. The 256 routed experts per layer are
         // gated behind `HIPFIRE_V4F_UPLOAD_EXPERTS=1` (most of the
         // model's bytes — defer until forward is wired so we don't
-        // spend ~38 GB of VRAM on tensors we can't yet consume).
+        // spend ~80 GB of VRAM on tensors we can't yet consume).
+        //
+        // For VRAM-constrained partial-MoE testing, set
+        //   HIPFIRE_V4F_EXPERT_LAYER_END=N
+        // to upload routed experts only for layers in [num_hash_layers,
+        // N). Layers >= N fall back to shared-only FFN. Each layer's
+        // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
+        // logical shape), so 22 layers ≈ 40 GB.
         let upload_experts = std::env::var("HIPFIRE_V4F_UPLOAD_EXPERTS")
             .ok().as_deref() == Some("1");
+        let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_V4F_EXPERT_LAYER_END")
+            .ok().and_then(|s| s.parse().ok());
 
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
 
@@ -325,7 +334,11 @@ impl Architecture for DeepseekV4 {
             // (driver overhead) → 5+ min naive. Batch as ONE upload per
             // (layer, projection): 129 uploads total. Skip unless
             // HIPFIRE_V4F_UPLOAD_EXPERTS=1 (model is ~40 GB).
-            if upload_experts {
+            // Per-layer gate: skip uploads when partial-MoE budget excludes
+            // this layer (forward gracefully falls back to shared-only).
+            let upload_this_layer = upload_experts
+                && expert_layer_end.map_or(true, |end| l < end);
+            if upload_this_layer {
                 let n_exp = cfg.n_routed_experts;
                 for (proj_idx, proj) in ["w1", "w2", "w3"].iter().enumerate() {
                     // Find per-expert byte size from expert 0 (uniform across
