@@ -208,18 +208,76 @@ pub struct DeepseekV4Weights {
     pub _scaffold: (),
 }
 
+/// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).
+///
+/// Active only on layers with `compress_ratios[l] > 0`. Each layer
+/// holds:
+/// - a sparse compressed-K cache at stride `compress_ratios[l]`
+/// - scratch for the current-step top-k position indices
+///
+/// See `docs/plans/deepseek4-phase2-indexer.md` for the full kernel
+/// design and forward sequence.
+pub struct IndexerLayerState {
+    /// `compress_ratios[layer]` — stride of the compressed cache.
+    /// `0` means this layer doesn't use the indexer (full SWA only).
+    pub compress_ratio: u32,
+    /// `[n_idx_heads, idx_head_dim, n_compressed_capacity]`
+    /// Stub: real impl is a GPU tensor.
+    pub _k_idx_compressed: (),
+    /// `[n_idx_heads, index_topk]` of i32 position indices. Filled by
+    /// `indexer_top_k`; consumed by `kv_gather`.
+    pub _top_k_indices: (),
+}
+
+/// Per-layer scratch for the main attention path's gathered K/V rows.
+///
+/// The main attention attends to `sliding_window + index_topk` total
+/// positions per step: a bounded ring of the last 128 raw KV rows
+/// (SWA window) plus 512 rows gathered from the indexer's top-k.
+pub struct MainAttentionLayerState {
+    /// SWA ring buffer for raw K (last `sliding_window = 128` positions).
+    pub _k_swa: (),
+    /// SWA ring buffer for raw V.
+    pub _v_swa: (),
+    /// K rows gathered from the indexer's top-k indices, max
+    /// `index_topk = 512` rows.
+    pub _k_gathered: (),
+    /// V rows gathered from the indexer's top-k indices.
+    pub _v_gathered: (),
+}
+
 /// V4F state — scaffold. Real impl will hold:
-/// - main-path KV cache for the SWA window (`sliding_window = 128`)
-/// - compressed-KV cache (per-layer, stride = `compress_ratios[l]`)
-/// - 4 residual streams (Hyper-Connections)
-/// - indexer top-k positions per layer
+/// - 4 residual streams (Hyper-Connections, see Phase 3)
+/// - per-layer `MainAttentionLayerState` (SWA + gathered)
+/// - per-layer `IndexerLayerState` (compressed-K cache, top-k scratch)
+/// - per-arch sampler/embedding scratch reused across decode steps
 pub struct DeepseekV4State {
+    /// One entry per layer (43 + 1 MTP = 44). Layers with
+    /// `compress_ratio == 0` skip the indexer; that variant of the
+    /// scaffold sets `compress_ratio = 0` and leaves the cache empty.
+    pub _indexer: Vec<IndexerLayerState>,
+    pub _attention: Vec<MainAttentionLayerState>,
     pub _scaffold: (),
 }
 
 impl DeepseekV4State {
-    pub fn new(_cfg: &DeepseekV4Config) -> Result<Self, String> {
-        Ok(DeepseekV4State { _scaffold: () })
+    pub fn new(cfg: &DeepseekV4Config) -> Result<Self, String> {
+        let n_layers_total = cfg.num_hidden_layers + cfg.num_nextn_predict_layers;
+        let mut indexer = Vec::with_capacity(n_layers_total);
+        let mut attention = Vec::with_capacity(n_layers_total);
+        for layer in 0..n_layers_total {
+            let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
+            indexer.push(IndexerLayerState {
+                compress_ratio: ratio,
+                _k_idx_compressed: (),
+                _top_k_indices: (),
+            });
+            attention.push(MainAttentionLayerState {
+                _k_swa: (), _v_swa: (),
+                _k_gathered: (), _v_gathered: (),
+            });
+        }
+        Ok(DeepseekV4State { _indexer: indexer, _attention: attention, _scaffold: () })
     }
 }
 

@@ -167,6 +167,135 @@ fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     }
 }
 
+// ─── FP8 E4M3 + UE8M0-scale dequant (DeepSeek V4 Flash) ─────────────────────
+//
+// V4F ships its quantized weights as paired safetensors entries:
+//   <name>.weight  : I8 raw bytes, each byte one FP8 E4M3 value
+//   <name>.scale   : F8_E8M0 raw bytes, each byte one UE8M0 exponent
+//
+// The block shape on V4F-shipped checkpoints is [1, 16] (per-row, 16-col
+// groups) — i.e. scale shape `[R, C/16]` for weight shape `[R, C]` — even
+// though the `quantization_config.weight_block_size` in `config.json`
+// reads `[128, 128]`. We verify the implied block from the actual scale
+// shape rather than the config to avoid being misled.
+//
+// E4M3 format (1 sign + 4 exp + 3 mant, bias=7):
+//   - exp=0, mant=0      → ±0
+//   - exp=0, mant!=0     → denormal: (-1)^s · 2^-6 · (mant/8)
+//   - exp=15, mant=7     → NaN (only one NaN code in E4M3)
+//   - otherwise normal:  (-1)^s · 2^(exp-7) · (1 + mant/8)
+//
+// UE8M0 format (8-bit unsigned exponent only, no sign, no mantissa):
+//   scale = 2^(byte - 127)
+//
+// Returns f32 in row-major order matching `weight_shape`.
+
+fn e4m3_to_f32(byte: u8) -> f32 {
+    let sign = if (byte & 0x80) != 0 { -1.0 } else { 1.0 };
+    let exp = ((byte >> 3) & 0xf) as i32;
+    let mant = (byte & 0x7) as f32;
+    if exp == 0xf && mant == 7.0 {
+        // E4M3's single NaN code — treat as 0 for quant purposes (clean
+        // bytes flagged elsewhere; downstream MQ-family quant has no
+        // NaN handling and would emit garbage).
+        return 0.0;
+    }
+    if exp == 0 {
+        if mant == 0.0 { return 0.0; }
+        return sign * (2.0f32.powi(-6)) * (mant / 8.0);
+    }
+    sign * (2.0f32.powi(exp - 7)) * (1.0 + mant / 8.0)
+}
+
+#[inline]
+fn ue8m0_to_scale(byte: u8) -> f32 {
+    // 2^(exp - 127). Cheap: shift into f32's exponent field directly.
+    // byte=127 → 1.0, byte=0 → 2^-127 (subnormal range — fine, we return 0
+    // implicitly through f32 rounding), byte=255 → +inf (won't appear on
+    // well-formed checkpoints; if it does we propagate inf and the
+    // downstream MQ quant will produce extreme outputs detectable in QA).
+    2.0f32.powi(byte as i32 - 127)
+}
+
+/// Helper for the main quantize loop: convert one tensor's raw bytes to
+/// f32, transparently handling V4F's FP8 E4M3 + UE8M0-scale pairs.
+///
+/// If `meta.dtype == "I8"` and a scale sibling is registered in
+/// `fp8_scale_for[weight_name]`, dequant the pair. Otherwise fall back
+/// to `to_f32(data, dtype)`.
+fn tensor_to_f32_with_optional_fp8_scale(
+    name: &str,
+    raw_data: &[u8],
+    meta: &TensorMeta,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+) -> Vec<f32> {
+    // FP8 E4M3 + UE8M0 paired storage (V4F). The dtype tag is either
+    // `I8` (older safetensors writer) or `F8_E4M3` (newer); both
+    // store identical E4M3 bytes, so the dequant math is the same.
+    if (meta.dtype == "I8" || meta.dtype == "F8_E4M3")
+        && fp8_scale_for.contains_key(name)
+    {
+        let (sfi, sname) = &fp8_scale_for[name];
+        let (smeta, sbytes) = st_files[*sfi]
+            .tensor_data(sname)
+            .unwrap_or_else(|| panic!("FP8 scale tensor missing: {sname}"));
+        assert_eq!(smeta.dtype, "F8_E8M0",
+            "expected F8_E8M0 scale for {name}, got {}", smeta.dtype);
+        return dequantize_e4m3_ue8m0_to_f32(
+            raw_data, &meta.shape, sbytes, &smeta.shape,
+        );
+    }
+    if meta.dtype == "I8" {
+        panic!("tensor {name} has dtype I8 but no .scale sibling registered \
+                — unexpected on a non-V4F checkpoint.");
+    }
+    to_f32(raw_data, &meta.dtype)
+}
+
+/// Dequantize a paired E4M3 weight + UE8M0 scale tensor to f32.
+///
+/// `weight_shape` is the LOGICAL [rows, cols] of the weight matrix.
+/// `scale_shape` is [scale_rows, scale_cols]; the implied block size is
+/// [weight_rows / scale_rows, weight_cols / scale_cols].
+///
+/// Returns row-major f32, length = rows * cols.
+fn dequantize_e4m3_ue8m0_to_f32(
+    weight_bytes: &[u8],
+    weight_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+) -> Vec<f32> {
+    assert_eq!(weight_shape.len(), 2, "expected 2D weight, got {:?}", weight_shape);
+    assert_eq!(scale_shape.len(), 2,  "expected 2D scale,  got {:?}", scale_shape);
+    let (rows, cols) = (weight_shape[0], weight_shape[1]);
+    let (sr, sc)    = (scale_shape[0], scale_shape[1]);
+    assert_eq!(weight_bytes.len(), rows * cols, "weight byte count mismatch");
+    assert_eq!(scale_bytes.len(),  sr * sc,     "scale  byte count mismatch");
+    assert!(rows % sr == 0 && cols % sc == 0,
+            "scale shape {:?} doesn't tile weight shape {:?}", scale_shape, weight_shape);
+    let block_rows = rows / sr;
+    let block_cols = cols / sc;
+
+    let mut out = vec![0.0f32; rows * cols];
+    // Each (sr_i, sc_j) scale governs the block weight[sr_i*block_rows .. (sr_i+1)*block_rows,
+    //                                                  sc_j*block_cols .. (sc_j+1)*block_cols].
+    for sr_i in 0..sr {
+        for sc_j in 0..sc {
+            let scale = ue8m0_to_scale(scale_bytes[sr_i * sc + sc_j]);
+            for di in 0..block_rows {
+                let r = sr_i * block_rows + di;
+                for dj in 0..block_cols {
+                    let c = sc_j * block_cols + dj;
+                    let b = weight_bytes[r * cols + c];
+                    out[r * cols + c] = e4m3_to_f32(b) * scale;
+                }
+            }
+        }
+    }
+    out
+}
+
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
 /// Quantize F32 weights to Q4_F16_G64 format.
@@ -3636,6 +3765,12 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
+        // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
+        // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
+        // path yet; tensor names ship in V4F's native shape (split w1/w2/w3,
+        // per-expert) and are translated when the forward bring-up lands.
+        "deepseek_v4" => 7,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
@@ -3696,15 +3831,30 @@ fn main() {
         })
         .collect();
 
-    // Collect all tensor names
+    // Collect all tensor names.
+    //
+    // V4F note: tensors come in `<name>.weight` (I8 = E4M3) + `<name>.scale`
+    // (F8_E8M0) pairs. We index the `.scale` siblings into a side map
+    // keyed by the weight tensor's full name and skip them in the main
+    // iteration. When we encounter the `.weight` half we look up the
+    // sibling and call `dequantize_e4m3_ue8m0_to_f32` to recover f32
+    // before the existing MQ-family pipeline runs.
     let mut all_tensors: Vec<(&str, usize)> = Vec::new();
+    let mut fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
     for (fi, st) in st_files.iter().enumerate() {
         for name in st.tensor_names() {
+            if let Some(stem) = name.strip_suffix(".scale") {
+                // Sibling weight name (drop `.scale`, add `.weight`).
+                let w_name = format!("{stem}.weight");
+                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                continue;
+            }
             all_tensors.push((name, fi));
         }
     }
     all_tensors.sort_by_key(|(name, _)| name.to_string());
-    eprintln!("Found {} tensors", all_tensors.len());
+    eprintln!("Found {} tensors ({} FP8 scale siblings indexed)",
+        all_tensors.len(), fp8_scale_for.len());
 
     // ── K-map pre-pass ──────────────────────────────────────────────────────
     // Build per-tensor quant level map. Gated to MoE models by default
@@ -3825,6 +3975,19 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // V4F's `tid2eid` hash-routing tables are I64 integer lookups,
+        // not weights. The forward path (when it lands) needs them, but
+        // Phase 1 ingest skips them: they don't go through quantization
+        // and the existing pass-through plumbing only handles float
+        // dtypes. Re-add as raw bytes in a follow-up when forward
+        // bring-up needs them.
+        if meta.dtype == "I64" {
+            eprintln!("  [skip-I64] {} {:?} ({} elements) — hash-routing table, restore in forward bring-up",
+                name, meta.shape, n_elements);
+            skipped_params += n_elements as u64;
+            continue;
+        }
 
         // ── MoE 3D-stacked expert tensor split ─────────────────────────────────
         // Qwen3.5-MoE stores routed experts as 3D tensors:
@@ -4050,7 +4213,9 @@ fn main() {
         }
 
         if should_quantize(name) && n_elements >= 32 {
-            let f32_data = to_f32(raw_data, &meta.dtype);
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files,
+            );
             quantized_params += n_elements as u64;
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();

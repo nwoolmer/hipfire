@@ -36,4 +36,7 @@ pub mod arch;
 pub mod deepseek4;
 
 pub use arch::DeepseekV4;
-pub use deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
+pub use deepseek4::{
+    DeepseekV4Config, DeepseekV4State, DeepseekV4Weights,
+    IndexerLayerState, MainAttentionLayerState,
+};
