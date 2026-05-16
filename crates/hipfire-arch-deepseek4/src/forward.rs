@@ -90,7 +90,7 @@ pub fn decode_step(
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
-        attn_stub(cfg, state, gpu, layer_idx)?;
+        attn_stub(cfg, weights, state, gpu, layer_idx)?;
 
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
@@ -338,6 +338,7 @@ fn final_norm_and_head(
 /// real Q·K·V over history — pending.
 fn attn_stub(
     cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -368,12 +369,11 @@ fn attn_stub(
     // pass kv as a stand-in for attn_sink (incorrect but unblocks the
     // dispatch test) — flag for paper-correctness gate.
     //
-    // Punt: use kv buffer as "attn_sink" placeholder. The kernel only
-    // reads 64 floats from it (n_heads); kv has 512 floats so the first
-    // 64 are valid. The semantics are wrong (we're using K[0..64] as
-    // sink) but the kernel runs.
-    gpu.v4f_attn_pos0(q, kv, kv,  // <-- attn_sink slot stubbed with kv
-        attn_out,
+    // Use the layer's actual attn_sink (F16→F32-converted at load).
+    let layer = &weights.layers[layer_idx];
+    let attn_sink = layer.attn_sink.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
+    gpu.v4f_attn_pos0(q, kv, attn_sink, attn_out,
         cfg.num_attention_heads as i32,
         cfg.head_dim as i32,
         cfg.o_groups as i32,

@@ -265,7 +265,7 @@ impl Architecture for DeepseekV4 {
                 &format!("layers.{l}.attn.q_norm.weight"))?);
             layer.kv_norm   = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.attn.kv_norm.weight"))?);
-            layer.attn_sink = Some(Self::upload_global_raw(hfq, gpu,
+            layer.attn_sink = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.attn.attn_sink"))?);
 
             // Attention LoRA + KV joint.
