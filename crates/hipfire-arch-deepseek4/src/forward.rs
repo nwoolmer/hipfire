@@ -344,16 +344,36 @@ fn attn_stub(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    // SWA attention with KV cache.
     if state.attn_out.is_none() {
         state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc attn_out: {e:?}"))?);
     }
+    // Choose attention path. Default to pos-0 (produces diverse
+    // multilingual words). HIPFIRE_V4F_ATTN=swa for SWA-windowed
+    // multi-position (currently repetition-prone — needs debugging).
+    let use_swa = std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() == Some("swa");
+
+    let q = state.q.as_ref().unwrap();
+    let kv = state.kv.as_ref().unwrap();
+    let attn_out = state.attn_out.as_ref().unwrap();
+    let layer = &weights.layers[layer_idx];
+    let attn_sink = layer.attn_sink.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
+
+    if !use_swa {
+        // Pos-0 attention (default). Each step independent.
+        gpu.v4f_attn_pos0(q, kv, attn_sink, attn_out,
+            cfg.num_attention_heads as i32,
+            cfg.head_dim as i32,
+            cfg.o_groups as i32,
+        ).map_err(|e| format!("v4f_attn_pos0: {e:?}"))?;
+        return Ok(());
+    }
+
+    // SWA path.
     let n_kv = cfg.num_key_value_heads;
     let hd = cfg.head_dim;
     let win = cfg.sliding_window;
-
-    // Lazy-allocate per-layer SWA K, V caches.
     {
         let attn = &mut state._attention[layer_idx];
         if attn.swa_k.is_none() {
@@ -367,36 +387,20 @@ fn attn_stub(
     }
     let pos = state.n_tokens as usize;
     let slot = pos % win;
-
-    // Write current kv into the SWA ring at slot via the dedicated kernel.
     {
-        let kv = state.kv.as_ref().unwrap();
         let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
         let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-        gpu.swa_ring_write_f32(kv, swa_k,
-            n_kv as i32, hd as i32, win as i32, slot as i32)
-            .map_err(|e| format!("swa_k ring write: {e:?}"))?;
-        gpu.swa_ring_write_f32(kv, swa_v,
-            n_kv as i32, hd as i32, win as i32, slot as i32)
-            .map_err(|e| format!("swa_v ring write: {e:?}"))?;
+        gpu.swa_ring_write_f32(kv, swa_k, n_kv as i32, hd as i32, win as i32, slot as i32)
+            .map_err(|e| format!("swa_k write: {e:?}"))?;
+        gpu.swa_ring_write_f32(kv, swa_v, n_kv as i32, hd as i32, win as i32, slot as i32)
+            .map_err(|e| format!("swa_v write: {e:?}"))?;
     }
-
     let n_valid = (pos + 1).min(win) as i32;
-
-    let q = state.q.as_ref().unwrap();
-    let attn_out = state.attn_out.as_ref().unwrap();
-    let layer = &weights.layers[layer_idx];
-    let attn_sink = layer.attn_sink.as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
     let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
     let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-
     gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out,
-        cfg.num_attention_heads as i32,
-        hd as i32,
-        cfg.o_groups as i32,
-        n_valid,
-        win as i32,
+        cfg.num_attention_heads as i32, hd as i32, cfg.o_groups as i32,
+        n_valid, win as i32,
     ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     Ok(())
 }

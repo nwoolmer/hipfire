@@ -52,15 +52,16 @@ extern "C" __global__ void v4f_attn_swa(
 
     __shared__ float shared_probs[MAX_HEADS_PER_GROUP * MAX_WINDOW];
 
+    // Scaled dot-product: divide by sqrt(head_dim) to keep softmax
+    // from saturating with high-dim head_dim values.
+    const float inv_scale = rsqrtf((float)head_dim);
+
     // Phase 1: compute probabilities for each head in this group.
-    // Done by thread d == 0 only (heads_per_g · n_valid floats fit in
-    // shared mem for V4F: 8 · 128 = 1024 floats = 4 KB).
     if (d == 0) {
         for (int h_local = 0; h_local < heads_per_g; ++h_local) {
             int h = g * heads_per_g + h_local;
 
-            // Compute scores[p] = Q[h] · K[p] for p in [0, n_valid).
-            // Single thread loops over positions + dims.
+            // Compute scores[p] = (Q[h] · K[p]) / sqrt(head_dim) for p in [0, n_valid).
             float max_score = -1e30f;
             float scores[MAX_WINDOW];
             for (int p = 0; p < n_valid; ++p) {
@@ -68,6 +69,7 @@ extern "C" __global__ void v4f_attn_swa(
                 for (int i = 0; i < head_dim; ++i) {
                     s += q[h * head_dim + i] * k_cache[i * window + p];
                 }
+                s *= inv_scale;
                 scores[p] = s;
                 if (s > max_score) max_score = s;
             }
