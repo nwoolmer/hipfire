@@ -197,10 +197,10 @@ fn ffn_stub(
     gpu.gemv_mq4g256_prerotated(shared_w3, ffn_x_rot, up, im, cfg.hidden_size)
         .map_err(|e| format!("gemv shared_w3 layer {layer_idx}: {e:?}"))?;
 
-    // 4. V4F SwiGLU with swiglu_limit clamp (config = 10.0). Same Expert
-    //    class used for shared and routed in upstream model.py — both
-    //    apply this clamp before silu_mul.
-    gpu.v4f_silu_mul_clamp_f32(gate, up, gate, 10.0)
+    // 4. V4F SwiGLU with swiglu_limit clamp (cfg.swiglu_limit = 10.0
+    //    on V4F). Same Expert class used for shared and routed in
+    //    upstream model.py — both apply this clamp before silu_mul.
+    gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
         .map_err(|e| format!("v4f_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
 
     // 5. FWHT-rotate the silu-gated vector for the down GEMV.
@@ -318,7 +318,7 @@ fn ffn_routed(
         // model.py:603-606. Clamp is part of V4F's faithful math; without
         // it, FP4 × FP32 × 4096-dim dots can drive silu(gate) into a
         // regime that feeds attractors.
-        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, 10.0)
+        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
             .map_err(|e| format!("v4f_silu_mul_clamp expert l{layer_idx} e{expert_id}: {e:?}"))?;
         // Routing-weight scale done via scaled_add at accumulate step
         // (more efficient than a separate scale_f32 pass over [im]).
@@ -427,7 +427,7 @@ fn ffn_hash_routed(
             .map_err(|e| format!("gemv hash w1 l{layer_idx} e{expert_id}: {e:?}"))?;
         gpu.gemv_mq2g256_lloyd(&w3_view, ffn_x_rot, up, im, cfg.hidden_size)
             .map_err(|e| format!("gemv hash w3 l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, 10.0)
+        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
             .map_err(|e| format!("v4f_silu_mul_clamp hash l{layer_idx} e{expert_id}: {e:?}"))?;
         gpu.rotate_x_mq(gate, silu_rot, im)
             .map_err(|e| format!("rotate hash silu l{layer_idx} e{expert_id}: {e:?}"))?;
