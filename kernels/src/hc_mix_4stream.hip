@@ -29,11 +29,11 @@
 
 __launch_bounds__(BLOCK_HIDDEN)
 extern "C" __global__ void hc_mix_4stream(
-    const __half* __restrict__ x_in,           // [HC_MULT, hidden]
-    const float*  __restrict__ A,               // [HC_MULT, HC_MULT]
-    const float*  __restrict__ scale,           // [HC_MULT]
-    const __half* __restrict__ transform_out,   // [hidden]
-    __half*       __restrict__ x_out,           // [HC_MULT, hidden]
+    const float* __restrict__ x_in,           // [HC_MULT, hidden] F32 (V4F convention)
+    const float* __restrict__ A,               // [HC_MULT, HC_MULT]
+    const float* __restrict__ scale,           // [HC_MULT]
+    const float* __restrict__ transform_out,   // [hidden] F32
+    float*       __restrict__ x_out,           // [HC_MULT, hidden] F32
     int hidden
 ) {
     const int stream_out = blockIdx.y;
@@ -46,11 +46,11 @@ extern "C" __global__ void hc_mix_4stream(
     #pragma unroll
     for (int s_in = 0; s_in < HC_MULT; ++s_in) {
         float gate = A[stream_out * HC_MULT + s_in];
-        float val  = __half2float(x_in[s_in * hidden + d]);
+        float val  = x_in[s_in * hidden + d];
         acc += gate * val;
     }
     // Add transform's output scaled by this stream's scale factor.
-    acc += scale[stream_out] * __half2float(transform_out[d]);
+    acc += scale[stream_out] * transform_out[d];
 
-    x_out[stream_out * hidden + d] = __float2half(acc);
+    x_out[stream_out * hidden + d] = acc;
 }

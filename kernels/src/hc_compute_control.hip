@@ -22,10 +22,10 @@
 
 __launch_bounds__(THREADS_PER_BLOCK)
 extern "C" __global__ void hc_compute_control(
-    const __half* __restrict__ x_flat,   // [x_dim]
-    const __half* __restrict__ w_fn,     // [n_ctrl, x_dim]
-    const __half* __restrict__ base,     // [n_ctrl]
-    float*        __restrict__ c,         // [n_ctrl]
+    const float*  __restrict__ x_flat,   // [x_dim] F32 (V4F residual convention)
+    const __half* __restrict__ w_fn,     // [n_ctrl, x_dim] F16 (HFQ-converted)
+    const __half* __restrict__ base,     // [n_ctrl] F16
+    float*        __restrict__ c,         // [n_ctrl] F32
     int n_ctrl,
     int x_dim
 ) {
@@ -35,7 +35,7 @@ extern "C" __global__ void hc_compute_control(
 
     float acc = 0.0f;
     for (int d = tid; d < x_dim; d += THREADS_PER_BLOCK) {
-        float xv = __half2float(x_flat[d]);
+        float xv = x_flat[d];
         float wv = __half2float(w_fn[ctrl * x_dim + d]);
         acc += xv * wv;
     }

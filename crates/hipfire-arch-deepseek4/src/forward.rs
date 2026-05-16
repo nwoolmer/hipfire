@@ -58,25 +58,8 @@ pub fn decode_step(
         // Wire those into hc_compute_control as `α · (X · W) + base`
         // and retry. For now: pipeline runs HC-disabled producing
         // bounded but architecturally-trivial logits.
-        // mHC DISABLED — same 4.27e37 magnitude overflow regardless
-        // of activation chain (sigmoid, exp + tight clamp, α scaling
-        // all attempted). Looks like a kernel-level issue not a math
-        // issue — possibly a parameter mismatch or uninitialized
-        // buffer read in hc_compute_control or hc_mix_4stream when
-        // chained 43 times. Needs intermediate-state logging to pin
-        // down. Reverted to stable: stream0 → hc_x_in.
-        let _ = mhc_pre;
-        {
-            let streams = state.residual_streams.as_ref().unwrap();
-            if state.hc_x_in.is_none() {
-                state.hc_x_in = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
-                    .map_err(|e| format!("alloc hc_x_in (fallback): {e:?}"))?);
-            }
-            let hc_x_in = state.hc_x_in.as_ref().unwrap();
-            let bytes = cfg.hidden_size * 4;
-            gpu.memcpy_dtod_auto(&hc_x_in.buf, &streams.buf, bytes)
-                .map_err(|e| format!("d2d stream0→hc_x_in: {e:?}"))?;
-        }
+        // Real mHC with corrected kernels (F32 throughout for residuals).
+        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/true)?;
         q_lora(cfg, weights, state, gpu, layer_idx)?;
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
@@ -109,7 +92,7 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        let _ = hc_attn_mix;
+        hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
@@ -117,9 +100,9 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        ffn_zero(cfg, state, gpu)?;
-        let _ = ffn_stub;
-        let _ = hc_ffn_mix;
+        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
+        ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
     }
 
     // 3. Final norm + LM head.
