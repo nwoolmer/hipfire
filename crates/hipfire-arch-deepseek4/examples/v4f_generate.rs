@@ -17,7 +17,9 @@ fn main() -> Result<(), String> {
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let mut state = DeepseekV4State::new(&cfg)?;
 
-    let mut tok: u32 = 100;  // input '¤'
+    // Override via first arg: cargo run --example v4f_generate -- <token_id>
+    let args: Vec<String> = std::env::args().collect();
+    let mut tok: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(45948);
     let max_steps: u32 = 20;
 
     eprintln!("Starting from token {tok}, generating {max_steps} steps");
