@@ -34,6 +34,7 @@
 
 pub mod arch;
 pub mod deepseek4;
+pub mod forward;
 
 pub use arch::DeepseekV4;
 pub use deepseek4::{
