@@ -19912,6 +19912,55 @@ impl Gpu {
         }
     }
 
+    /// V4F-faithful tail RoPE in INTERLEAVED pair convention (pairs are
+    /// (2i, 2i+1) within the tail region). Upstream V4F's RoPE goes
+    /// through `torch.view_as_complex`, which is the interleaved form.
+    /// Distinct from `rope_tail_halfsplit` which uses HF rotate_half.
+    pub fn rope_tail_interleaved(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_interleaved",
+            kernels::ROPE_TAIL_INTERLEAVED_SRC,
+            "rope_tail_interleaved_f32",
+        )?;
+        let func = &self.functions["rope_tail_interleaved_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(half + 31) / 32, 1, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// V4F inverse tail RoPE on attention output. Undoes the RoPE that V
     /// had baked in (since K=V tied and K's tail dims were RoPE'd at
     /// write time). Upstream calls `apply_rotary_emb(o[..., -rd:],

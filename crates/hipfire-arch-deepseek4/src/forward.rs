@@ -992,14 +992,17 @@ fn apply_tail_rope(
     let q  = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
 
-    gpu.rope_tail_halfsplit(
+    // V4F upstream uses `torch.view_as_complex` → INTERLEAVED pairs
+    // (2i, 2i+1) within the tail region. Half-split would give the
+    // wrong rotation against the trained K weights.
+    gpu.rope_tail_interleaved(
         q, kv, pos_buf,
         cfg.num_attention_heads as i32,
         cfg.num_key_value_heads as i32,
         cfg.head_dim as i32,
         cfg.qk_rope_head_dim as i32,
         cfg.rope_theta,
-    ).map_err(|e| format!("rope_tail_halfsplit: {e:?}"))?;
+    ).map_err(|e| format!("rope_tail_interleaved: {e:?}"))?;
 
     Ok(())
 }

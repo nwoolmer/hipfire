@@ -1607,3 +1607,8 @@ pub const ROPE_TAIL_HALFSPLIT_SRC: &str =
 /// Inverse tail RoPE for V4F attention output (sin negated).
 pub const ROPE_TAIL_INVERSE_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_inverse.hip");
+
+/// Tail-only RoPE, INTERLEAVED pair convention (V4F upstream's
+/// `torch.view_as_complex` variant, distinct from HF rotate_half).
+pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved.hip");
