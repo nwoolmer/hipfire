@@ -320,24 +320,65 @@ impl Architecture for DeepseekV4 {
             layer.shared_w3 = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.ffn.shared_experts.w3.weight"))?);
 
-            // Routed experts: 256 × 3 = 768 GPU tensors per layer ×
-            // 43 layers = ~33K total. ~38 GB of VRAM. Skip unless
-            // HIPFIRE_V4F_UPLOAD_EXPERTS=1.
+            // Routed experts: 256 × 3 = 768 tensors per layer ×
+            // 43 layers = ~33K total. Per-expert hipMalloc takes ~10ms
+            // (driver overhead) → 5+ min naive. Batch as ONE upload per
+            // (layer, projection): 129 uploads total. Skip unless
+            // HIPFIRE_V4F_UPLOAD_EXPERTS=1 (model is ~40 GB).
             if upload_experts {
-                let mut w1s = Vec::with_capacity(cfg.n_routed_experts);
-                let mut w2s = Vec::with_capacity(cfg.n_routed_experts);
-                let mut w3s = Vec::with_capacity(cfg.n_routed_experts);
-                for e in 0..cfg.n_routed_experts {
-                    w1s.push(Self::upload_global_raw(hfq, gpu,
-                        &format!("layers.{l}.ffn.experts.{e}.w1.weight"))?);
-                    w2s.push(Self::upload_global_raw(hfq, gpu,
-                        &format!("layers.{l}.ffn.experts.{e}.w2.weight"))?);
-                    w3s.push(Self::upload_global_raw(hfq, gpu,
-                        &format!("layers.{l}.ffn.experts.{e}.w3.weight"))?);
+                let n_exp = cfg.n_routed_experts;
+                for (proj_idx, proj) in ["w1", "w2", "w3"].iter().enumerate() {
+                    // Find per-expert byte size from expert 0 (uniform across
+                    // experts within a (layer, projection)).
+                    let name0 = format!("layers.{l}.ffn.experts.0.{proj}.weight");
+                    let (info0, _) = hfq.tensor_data(&name0)
+                        .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
+                    let stride = info0.data_size;
+                    let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
+
+                    // Concat all 256 expert byte slices into one host buffer.
+                    let mut blob = Vec::with_capacity(stride * n_exp);
+                    for e in 0..n_exp {
+                        let name = format!("layers.{l}.ffn.experts.{e}.{proj}.weight");
+                        let (info, bytes) = hfq.tensor_data(&name)
+                            .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+                        if info.data_size != stride {
+                            return Err(format!(
+                                "deepseek4: {name} size {} != stride {}", info.data_size, stride));
+                        }
+                        blob.extend_from_slice(bytes);
+                    }
+
+                    // One upload. Shape carries n_experts as the leading dim.
+                    let mut blob_shape = vec![n_exp];
+                    blob_shape.extend_from_slice(&shape0);
+                    let blob_tensor = gpu.upload_raw(&blob, &blob_shape)
+                        .map_err(|e| format!("deepseek4: upload blob l{l}.{proj}: {e:?}"))?;
+
+                    // Build the device-side pointer table consumed by the
+                    // indexed MoE GEMV (qwen35 convention: u64 ptr packed
+                    // into 2 F32 slots per expert).
+                    let base_ptr = blob_tensor.buf.as_ptr() as u64;
+                    let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
+                    let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+                    let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                        .map_err(|e| format!("deepseek4: alloc ptr table l{l}.{proj}: {e:?}"))?;
+                    gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                        .map_err(|e| format!("deepseek4: copy ptr table l{l}.{proj}: {e:?}"))?;
+
+                    match proj_idx {
+                        0 => { layer.expert_w1_blob = Some(blob_tensor);
+                               layer.expert_w1_ptrs = Some(ptr_tensor);
+                               layer.expert_w1_stride = stride; }
+                        1 => { layer.expert_w2_blob = Some(blob_tensor);
+                               layer.expert_w2_ptrs = Some(ptr_tensor);
+                               layer.expert_w2_stride = stride; }
+                        2 => { layer.expert_w3_blob = Some(blob_tensor);
+                               layer.expert_w3_ptrs = Some(ptr_tensor);
+                               layer.expert_w3_stride = stride; }
+                        _ => unreachable!(),
+                    }
                 }
-                layer.expert_w1 = Some(w1s);
-                layer.expert_w2 = Some(w2s);
-                layer.expert_w3 = Some(w3s);
             }
         }
 

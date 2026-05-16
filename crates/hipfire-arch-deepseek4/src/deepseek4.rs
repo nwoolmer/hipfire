@@ -254,11 +254,25 @@ pub struct DeepseekV4LayerWeights {
     pub shared_w2: Option<rdna_compute::GpuTensor>,
     pub shared_w3: Option<rdna_compute::GpuTensor>,
 
-    // Routed experts. Each Vec is length `n_routed_experts` (256 on V4F).
-    // None when not yet uploaded.
-    pub expert_w1: Option<Vec<rdna_compute::GpuTensor>>,
-    pub expert_w2: Option<Vec<rdna_compute::GpuTensor>>,
-    pub expert_w3: Option<Vec<rdna_compute::GpuTensor>>,
+    // Routed experts. To avoid 256 × 43 × 3 = 33K separate hipMalloc
+    // calls (drives load time to 3+ minutes), all 256 experts for each
+    // (layer, projection) are uploaded as ONE contiguous blob. The
+    // indexed MoE GEMV kernels consume a device-side pointer table.
+    //
+    // Layout per blob: `[n_routed_experts × bytes_per_expert]` raw bytes.
+    // Pointer table: F32 GpuTensor of length `2 * n_routed_experts`
+    //   (two F32 slots per u64 pointer, matching qwen35 convention).
+    pub expert_w1_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w2_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w3_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w1_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_w2_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_w3_ptrs: Option<rdna_compute::GpuTensor>,
+    /// Bytes per expert (uniform across all experts in a layer). Used
+    /// for sub_offset math when forward needs a per-expert view (rarely).
+    pub expert_w1_stride: usize,
+    pub expert_w2_stride: usize,
+    pub expert_w3_stride: usize,
 }
 
 impl DeepseekV4LayerWeights {
@@ -273,7 +287,9 @@ impl DeepseekV4LayerWeights {
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
             gate_weight: None, gate_bias: None,
             shared_w1: None, shared_w2: None, shared_w3: None,
-            expert_w1: None, expert_w2: None, expert_w3: None,
+            expert_w1_blob: None, expert_w2_blob: None, expert_w3_blob: None,
+            expert_w1_ptrs: None, expert_w2_ptrs: None, expert_w3_ptrs: None,
+            expert_w1_stride: 0, expert_w2_stride: 0, expert_w3_stride: 0,
         }
     }
 }
