@@ -349,12 +349,19 @@ pub struct DeepseekV4State {
     pub _attention: Vec<MainAttentionLayerState>,
 
     /// Hyper-Connections residual streams `[hc_mult = 4, hidden = 4096]`.
-    /// `None` until `new_state` allocates on first session.
+    /// Stored as F32 to match hipfire's standard residual convention
+    /// (llama / qwen35 use f32 residuals + f32 RMSNorm). Quantized
+    /// kernels handle the f32 input directly.
+    /// `None` until `decode_step` allocates on first call.
     pub residual_streams: Option<rdna_compute::GpuTensor>,
 
     /// Single-row embedding scratch `[hidden]` for the current decode
-    /// step's token lookup. `None` until allocated.
+    /// step's token lookup. F32 to match residual_streams convention.
     pub embed_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// Per-step scratch `[hidden]` F32 — used for RMSNorm output,
+    /// Q-LoRA intermediate, etc. Reused across layers.
+    pub tmp: Option<rdna_compute::GpuTensor>,
 
     pub _scaffold: (),
 }
@@ -381,6 +388,7 @@ impl DeepseekV4State {
             _attention: attention,
             residual_streams: None,  // allocated on first `decode_step` (needs Gpu).
             embed_scratch: None,
+            tmp: None,
             _scaffold: (),
         })
     }

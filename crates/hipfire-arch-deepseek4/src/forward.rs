@@ -50,10 +50,11 @@ pub fn decode_step(
 
         // ── 2a. Attention block ───────────────────────────────────────
         //
-        // i. RMSNorm against `layer.attn_norm` — input is residual
-        //    stream[0] (paper says one stream feeds the transform;
-        //    verify against reference for which index).
-        unimplemented_step("attn RMSNorm")?;
+        // i. RMSNorm against `layer.attn_norm` on residual stream[0].
+        //    Output in state.tmp [hidden] f32. (V4F paper: one stream
+        //    feeds the transform; we conservatively use stream 0 —
+        //    revisit during numerical-correctness gate.)
+        attn_rms_norm(cfg, weights, state, gpu, layer_idx)?;
 
         // ii. Q via Q-LoRA: x @ wq_a → q_lat, q_lat @ wq_b → q
         //     q has shape [n_heads = 64, head_dim = 512].
@@ -149,6 +150,30 @@ fn unimplemented_step(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Step 2 (attention block): RMSNorm of residual stream 0 against
+/// `layer.attn_norm`. Output in `state.tmp [hidden] f32`.
+fn attn_rms_norm(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let attn_norm = layer.attn_norm.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_norm not uploaded"))?;
+    let streams = state.residual_streams.as_ref()
+        .ok_or_else(|| "residual_streams not allocated".to_string())?;
+    let tmp = state.tmp.as_ref()
+        .ok_or_else(|| "tmp not allocated".to_string())?;
+
+    // Stream 0 view: first `hidden` floats of the [hc_mult, hidden] tensor.
+    let stream0 = streams.sub_offset(0, cfg.hidden_size);
+    gpu.rmsnorm_f32(&stream0, attn_norm, tmp, cfg.rms_norm_eps)
+        .map_err(|e| format!("rmsnorm_f32 layer {layer_idx}: {e:?}"))?;
+    Ok(())
+}
+
 /// Step 1 of forward: embedding lookup + 4-stream residual init.
 ///
 /// V4F's HC pattern starts with `[embed, 0, 0, 0]` — stream 0 gets
@@ -171,14 +196,23 @@ fn init_residual_streams(
 
     if state.embed_scratch.is_none() {
         state.embed_scratch = Some(
-            gpu.alloc_tensor(&[hidden], DType::F16)
+            gpu.alloc_tensor(&[hidden], DType::F32)
                 .map_err(|e| format!("alloc embed_scratch: {e:?}"))?
         );
     }
     if state.residual_streams.is_none() {
-        let t = gpu.alloc_tensor(&[hc_mult, hidden], DType::F16)
+        // Zero-init: alloc_tensor leaves memory uninitialized, but the
+        // [embed, 0, 0, 0] init pattern relies on streams 1..hc_mult
+        // being zero. `gpu.zeros` is the right primitive.
+        let t = gpu.zeros(&[hc_mult, hidden], DType::F32)
             .map_err(|e| format!("alloc residual_streams: {e:?}"))?;
         state.residual_streams = Some(t);
+    }
+    if state.tmp.is_none() {
+        state.tmp = Some(
+            gpu.alloc_tensor(&[hidden], DType::F32)
+                .map_err(|e| format!("alloc tmp: {e:?}"))?
+        );
     }
 
     // Dequant + lookup token row → embed_scratch [hidden].
@@ -188,15 +222,11 @@ fn init_residual_streams(
 
     // Copy embed_scratch → residual_streams[0, :], zero streams 1..hc_mult.
     let streams = state.residual_streams.as_ref().unwrap();
-    let bytes_per_stream = hidden * 2;  // F16 = 2 bytes
+    let bytes_per_stream = hidden * 4;  // F32 = 4 bytes
     gpu.memcpy_dtod_auto(&streams.buf, &embed_scratch.buf, bytes_per_stream)
         .map_err(|e| format!("d2d copy stream 0: {e:?}"))?;
-    // Zero streams 1..hc_mult. Use the bridge's memset over the tail.
-    let tail_off = bytes_per_stream;
-    let tail_len = bytes_per_stream * (hc_mult - 1);
-    // Build a sub-view starting after stream 0.
+    // Zero streams 1..hc_mult.
     let dst_view = streams.sub_offset(hidden, hidden * (hc_mult - 1));
-    let _ = (tail_off, tail_len);
     gpu.hip.memset(&dst_view.buf, 0, dst_view.byte_size())
         .map_err(|e| format!("memset streams 1..: {e:?}"))?;
 

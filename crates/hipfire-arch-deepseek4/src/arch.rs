@@ -33,7 +33,7 @@ impl DeepseekV4 {
     /// triggers them. Per-layer tensor inventory derived from the V4F
     /// safetensors index (see Phase 1 commit 8ccfa42).
     /// Upload one global HFQ tensor verbatim (raw bytes) to GPU.
-    /// Used for embed/norm/head where the on-disk quant format
+    /// Used for embed/quantized-weights where the on-disk quant format
     /// matches the format the kernels expect to consume.
     fn upload_global_raw(
         hfq: &HfqFile,
@@ -46,6 +46,35 @@ impl DeepseekV4 {
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         gpu.upload_raw(bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+    }
+
+    /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
+    /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
+    /// quantizer stored F16 bytes. The conversion cost is one host-side
+    /// f16→f32 pass; norms are tiny (~4 KB each) so this is negligible.
+    fn upload_global_f16_as_f32(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        let n: usize = shape.iter().product();
+        if bytes.len() != n * 2 {
+            return Err(format!(
+                "deepseek4: '{name}' expected F16 bytes ({} = 2 × {}), got {}",
+                n * 2, n, bytes.len()
+            ));
+        }
+        let f32_vals: Vec<f32> = (0..n).map(|i| {
+            let lo = bytes[i * 2];
+            let hi = bytes[i * 2 + 1];
+            hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
+        }).collect();
+        gpu.upload_f32(&f32_vals, &shape)
+            .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"))
     }
 
     pub fn load_weights_host_only_walk(
@@ -218,20 +247,21 @@ impl Architecture for DeepseekV4 {
 
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
 
-        // Globals.
+        // Globals. Norms are F16 on disk but the kernels expect F32
+        // weight; convert at upload time.
         weights.token_embd  = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
-        weights.output_norm = Some(Self::upload_global_raw(hfq, gpu, "norm.weight")?);
+        weights.output_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "norm.weight")?);
 
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {
-            // Norms (F16).
-            layer.attn_norm = Some(Self::upload_global_raw(hfq, gpu,
+            // Norms (F16 on disk → F32 on GPU).
+            layer.attn_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.attn_norm.weight"))?);
-            layer.ffn_norm  = Some(Self::upload_global_raw(hfq, gpu,
+            layer.ffn_norm  = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.ffn_norm.weight"))?);
-            layer.q_norm    = Some(Self::upload_global_raw(hfq, gpu,
+            layer.q_norm    = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.attn.q_norm.weight"))?);
-            layer.kv_norm   = Some(Self::upload_global_raw(hfq, gpu,
+            layer.kv_norm   = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                 &format!("layers.{l}.attn.kv_norm.weight"))?);
             layer.attn_sink = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.attn.attn_sink"))?);
