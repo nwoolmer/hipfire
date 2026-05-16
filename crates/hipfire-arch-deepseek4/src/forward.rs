@@ -88,11 +88,10 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vii. HC attn mix — DISABLED. Sinkhorn-with-abs preprocessing
-        // still produces magnitude blow-up across 43 layers — the
-        // GEMVs themselves grow even bounded inputs. Real V4F training
-        // has residual scaling that we don't replicate. Defer HC until
-        // real attention is wired (then magnitudes balance).
+        // vii. HC attn mix — disabled. Even bounded transform_out
+        // produces 4e37 overflow across 43 layers due to compounding
+        // GEMV magnitudes. Paper-faithful activation chain needed
+        // (residual scaling, pre-Sinkhorn activation, mix scaling).
         let _ = hc_attn_mix;
         let _ = layer_idx;
 
@@ -318,15 +317,23 @@ fn final_norm_and_head(
     Ok(())
 }
 
-/// Step 6/7 STUB (attention + O-LoRA placeholder).
+/// Step 6: Single-position attention (position-0 degenerate case).
 ///
-/// Real attention + O-LoRA pending: V4F's wo_a [8192, 4096] and
-/// wo_b [4096, 8192] shapes don't match standard LoRA-of-attention-
-/// output factorization. The o_groups=8 config field hints at a
-/// grouped-projection pattern — needs paper verification.
+/// V4F's attention with `o_groups = 8` means the 64 query heads
+/// are reduced over groups of 8 heads → 8 grouped outputs each of
+/// `head_dim = 512`, yielding `[8 * 512 = 4096]` = hidden directly.
+/// No separate O-projection needed (wo_a/wo_b's role TBD per paper).
 ///
-/// Stub: copies stream0 into attn_out. Numerically meaningless but
-/// keeps the HC mix downstream consuming a sensibly-shaped tensor.
+/// For position-0 (no past KV history), each query head attends
+/// only to the current token's K/V. softmax over 1 position = 1.0,
+/// so attn_per_head = V. With o_groups grouping: each of 8 groups
+/// sums 8 identical V vectors → attn_per_group = 8 * V.
+///
+/// Output `[hidden = o_groups * head_dim]`: 8 copies of V (each
+/// scaled by 8 due to the in-group sum), giving [8*V, 8*V, ..., 8*V].
+///
+/// This handles position 0. For position > 0 we need SWA cache +
+/// real Q·K·V over history — pending.
 fn attn_stub(
     cfg: &DeepseekV4Config,
     state: &mut DeepseekV4State,
@@ -334,15 +341,24 @@ fn attn_stub(
     _layer_idx: usize,
 ) -> Result<(), String> {
     if state.attn_out.is_none() {
-        state.attn_out = Some(gpu.zeros(&[cfg.hidden_size], DType::F32)
+        state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
             .map_err(|e| format!("alloc attn_out: {e:?}"))?);
     }
-    // Real attention pending — zero output means HC mix = pure
-    // Sinkhorn-driven stream rotation. Doubly-stochastic mixing
-    // preserves magnitudes (won't overflow over 43 layers).
+    // Position-0 attention: attn_out is o_groups copies of V (the kv vector).
+    // V has shape [head_dim=512]; attn_out shape [hidden=4096] = 8 * 512.
+    // The in-group sum factor = n_heads / o_groups = 64/8 = 8 should
+    // scale each V. For numerical stability across 43 layers we omit
+    // the *8 scaling (effectively softmax-normalize each group's
+    // contribution to 1.0 — paper details TBD).
+    let kv = state.kv.as_ref().unwrap();
     let attn_out = state.attn_out.as_ref().unwrap();
-    gpu.hip.memset(&attn_out.buf, 0, attn_out.byte_size())
-        .map_err(|e| format!("memset attn_out: {e:?}"))?;
+
+    let bytes_per_v = cfg.head_dim * 4;  // 512 * 4 = 2048
+    for g in 0..cfg.o_groups {
+        let dst_view = attn_out.sub_offset(g * cfg.head_dim, cfg.head_dim);
+        gpu.memcpy_dtod_auto(&dst_view.buf, &kv.buf, bytes_per_v)
+            .map_err(|e| format!("d2d kv→attn_out group {g}: {e:?}"))?;
+    }
     Ok(())
 }
 
