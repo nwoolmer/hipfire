@@ -21,16 +21,16 @@ fn main() -> Result<(), String> {
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let mut state = DeepseekV4State::new(&cfg)?;
 
-    // Call decode_step on token 100. The function now runs through
-    // the full pipeline (43 layers + final norm + lm_head). Returns
+    // Call decode_step on a sweep of input tokens. Each call returns
     // a Vec<f32> of vocab_size logits.
-    let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, 100, 0)?;
-    let nz = logits.iter().filter(|v| v.abs() > 1e-6).count();
-    let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let argmax = logits.iter().enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-    eprintln!("\nlogits[{}]: nonzero={nz}, max_abs={max_abs:.4}, argmax=token {} (logit={:.4})",
-        cfg.vocab_size, argmax.0, argmax.1);
+    for token_id in [100u32, 0, 1, 123, 1000, 5000, 10000, 50000] {
+        let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, token_id, 0)?;
+        let max_abs = logits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let argmax = logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        eprintln!("token {token_id:>5} → argmax token {} (logit={:.3}, max_abs={:.3})",
+            argmax.0, argmax.1, max_abs);
+    }
 
     // Read back residual_streams; verify stream 0 has nonzero values and
     // streams 1..hc_mult are all zero.
