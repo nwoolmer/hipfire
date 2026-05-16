@@ -1561,3 +1561,26 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+// ─── DeepSeek V4 Flash (arch_id=7) — stub kernels ────────────────────────────
+// All five are functional-stub implementations whose API contract is the
+// signature; bodies are placeholder reference impls until V4F forward
+// bring-up lands optimised versions. See `docs/plans/deepseek4-phase{2,3,4}-*.md`.
+//
+// Phase 2 — Compressed-KV indexer:
+pub const INDEXER_COMPRESSED_K_SCORE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_compressed_k_score.hip");
+pub const INDEXER_TOP_K_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k.hip");
+pub const INDEXER_KV_GATHER_SRC: &str =
+    include_str!("../../../kernels/src/indexer_kv_gather.hip");
+
+// Phase 3 — Hyper-Connections:
+pub const HC_SINKHORN_4X4_SRC: &str =
+    include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
+pub const HC_MIX_4STREAM_SRC: &str =
+    include_str!("../../../kernels/src/hc_mix_4stream.hip");
+
+// Phase 4 — Tail-only RoPE:
+pub const ROPE_TAIL_HALFSPLIT_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_halfsplit.hip");
