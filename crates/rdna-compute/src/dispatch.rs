@@ -19545,6 +19545,41 @@ impl Gpu {
         }
     }
 
+    /// Phase 3 — Apply α scaling to the 24-element HC control vector
+    /// after `hc_compute_control` has run (which produces α=1 output).
+    /// Rescales c[i] = α[seg(i)] · (c[i] - base[i]) + base[i] so each
+    /// of the three segments (Ã/B̃/C̃) gets its proper α^pre/res/post.
+    #[allow(dead_code)]
+    pub fn hc_apply_alpha(
+        &mut self,
+        c: &GpuTensor,
+        alpha: &GpuTensor,
+        base: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_apply_alpha",
+            kernels::HC_APPLY_ALPHA_SRC, "hc_apply_alpha")?;
+        let func = &self.functions["hc_apply_alpha"];
+        let cp = c.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [24, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]).
     /// A is sigmoid-bounded [0, 1].
     #[allow(dead_code)]

@@ -1584,6 +1584,8 @@ pub const HC_MIX_4STREAM_SRC: &str =
     include_str!("../../../kernels/src/hc_mix_4stream.hip");
 pub const HC_INPUT_MAP_SRC: &str =
     include_str!("../../../kernels/src/hc_input_map.hip");
+pub const HC_APPLY_ALPHA_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha.hip");
 
 // Phase 4 — Tail-only RoPE:
 pub const ROPE_TAIL_HALFSPLIT_SRC: &str =

@@ -58,12 +58,13 @@ pub fn decode_step(
         // Wire those into hc_compute_control as `α · (X · W) + base`
         // and retry. For now: pipeline runs HC-disabled producing
         // bounded but architecturally-trivial logits.
+        // mHC + α scaling: full paper-faithful path. Still produces
+        // overflow at runtime — likely the (8 × V) attn_out
+        // amplification per layer compounding. DISABLED until V4F
+        // attention is real (then transform_out shrinks).
         let _ = mhc_pre;
-        // mhc_pre(cfg, weights, state, gpu, layer_idx, true)?;
 
-        // Q-LoRA (currently reads hc_x_in if HC enabled, else stream0
-        // — we re-wire stream0 manually via a copy).
-        // Since HC is disabled here, copy stream0 into hc_x_in.
+        // Direct stream0 → hc_x_in for q_lora's transform input.
         {
             let streams = state.residual_streams.as_ref().unwrap();
             if state.hc_x_in.is_none() {
@@ -107,8 +108,7 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vii. mHC attn mix — DISABLED (magnitudes overflow without
-        // proper α small-init residual scaling).
+        // mHC mix disabled — uses too much amplified attn_out.
         let _ = hc_attn_mix;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
@@ -117,7 +117,7 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        // FFN: disabled with HC.
+        // FFN disabled with HC.
         ffn_zero(cfg, state, gpu)?;
         let _ = ffn_stub;
         let _ = hc_ffn_mix;
@@ -423,6 +423,17 @@ fn mhc_pre(
     gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
         n_ctrl as i32, x_dim as i32)
         .map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
+
+    // Apply α^pre/res/post scaling (paper eqs 3-5): rescales c so
+    // c[i] = α[seg(i)] · (X · W) + (1 - α[seg(i)]) · base[i].
+    // α small → static-bias-dominated (initial training behavior).
+    let hc_scale = if is_attn {
+        layer.hc_attn_scale.as_ref().unwrap()
+    } else {
+        layer.hc_ffn_scale.as_ref().unwrap()
+    };
+    gpu.hc_apply_alpha(&c_view, hc_scale, hc_base)
+        .map_err(|e| format!("hc_apply_alpha layer {layer_idx}: {e:?}"))?;
 
     // A_l = σ(c[0..4])
     let a_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
