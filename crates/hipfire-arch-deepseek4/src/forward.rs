@@ -270,32 +270,13 @@ fn ffn_routed(
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
 
-    // 3. CPU top-K with bias-shifted scores.
-    let bias_host = &layer.gate_bias_host;
-    let mut biased: Vec<f32> = scores_host.iter().take(n_exp)
-        .enumerate()
-        .map(|(i, &s)| s + bias_host.get(i).copied().unwrap_or(0.0))
-        .collect();
-    // Greedy top-K: n_exp=256, k=6 → 6 linear scans (~1.5K f32 cmps).
-    let mut topk_ids: Vec<u32> = Vec::with_capacity(k);
-    for _ in 0..k {
-        let (i, _) = biased.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
-        topk_ids.push(i as u32);
-        biased[i] = f32::NEG_INFINITY;  // mask so the next pass picks a different expert
-    }
-
-    let mut wts: Vec<f32> = topk_ids.iter().map(|&i| scores_host[i as usize]).collect();
-    let w_sum: f32 = wts.iter().sum();
-    if w_sum <= 0.0 {
-        // Degenerate router output — skip rather than NaN downstream.
-        return Ok(());
-    }
-    // Normalize weights to sum to 1 (V4F's `weights /= weights.sum()`).
-    // The route_scale (= routed_scaling_factor = 1.5) is applied at the
-    // accumulation step below, not here — avoids double-counting.
-    for w in wts.iter_mut() { *w /= w_sum; }
+    // 3. CPU top-K with bias-shifted scores → normalized weights.
+    let (topk_ids, wts) = match bias_aware_topk_weights(
+        &scores_host[..n_exp], &layer.gate_bias_host, k)
+    {
+        Some(x) => x,
+        None => return Ok(()),  // degenerate router output (sum <= 0)
+    };
 
     // 3. Per-expert SwiGLU dispatch. Reuse shared scratch (ffn_gate,
     //    ffn_up, ffn_silu_rot) — by the time we get here, the shared
@@ -412,12 +393,10 @@ fn ffn_hash_routed(
         .map(|&i| i.min((n_exp - 1) as u32))
         .collect();
 
-    let mut wts: Vec<f32> = topk_ids.iter().map(|&i| scores_host[i as usize]).collect();
-    let w_sum: f32 = wts.iter().sum();
-    if w_sum <= 0.0 {
-        return Ok(());
-    }
-    for w in wts.iter_mut() { *w /= w_sum; }
+    let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
 
     // Per-expert dispatch (identical to ffn_routed body).
     let im = cfg.moe_intermediate_size;
@@ -659,6 +638,58 @@ fn attn_stub(
 /// expert-dispatch step reads topk_indices, fetches per-expert weights
 /// from `layer.expert_w{1,2,3}` (requires `HIPFIRE_V4F_UPLOAD_EXPERTS=1`),
 /// and accumulates weighted expert outputs into ffn_out.
+/// Gather routing weights at the given indices from the (unbiased) scores,
+/// then normalize to sum to 1. Returns `None` if the sum is non-positive.
+fn gather_normalized_weights(scores: &[f32], indices: &[u32]) -> Option<Vec<f32>> {
+    let mut wts: Vec<f32> = indices.iter()
+        .map(|&i| *scores.get(i as usize).unwrap_or(&0.0))
+        .collect();
+    let s: f32 = wts.iter().sum();
+    if s <= 0.0 { return None; }
+    for w in wts.iter_mut() { *w /= s; }
+    Some(wts)
+}
+
+/// V4F bias-aware top-K routing on host. Pure function — no GPU types.
+///
+/// Per upstream `inference/model.py:Gate.forward`:
+///   biased = scores + bias                  (zero-pad bias if shorter)
+///   indices = argsort_desc(biased)[..k]     (greedy top-K)
+///   weights = scores[indices]               (UNBIASED scores)
+///   weights /= weights.sum()                (normalize)
+///
+/// Returns `Some((indices, weights))` on success, or `None` if the
+/// unbiased weight-sum is non-positive (degenerate router output).
+///
+/// The `routed_scaling_factor` multiply happens later at the per-expert
+/// accumulation step in `ffn_routed` / `ffn_hash_routed` (avoids double
+/// counting).
+fn bias_aware_topk_weights(
+    scores: &[f32],
+    bias: &[f32],
+    k: usize,
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    let n = scores.len();
+    if k == 0 || n == 0 { return None; }
+    let mut biased: Vec<f32> = (0..n)
+        .map(|i| scores[i] + bias.get(i).copied().unwrap_or(0.0))
+        .collect();
+    let k = k.min(n);
+    let mut indices: Vec<u32> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (best_i, _) = biased.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        indices.push(best_i as u32);
+        biased[best_i] = f32::NEG_INFINITY;
+    }
+    let mut wts: Vec<f32> = indices.iter().map(|&i| scores[i as usize]).collect();
+    let w_sum: f32 = wts.iter().sum();
+    if w_sum <= 0.0 { return None; }
+    for w in wts.iter_mut() { *w /= w_sum; }
+    Some((indices, wts))
+}
+
 fn moe_route(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -1093,4 +1124,94 @@ fn init_residual_streams(
         .map_err(|e| format!("memset streams 1..: {e:?}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bias_aware_topk_picks_biased_indices() {
+        // Bias steers selection. scores=[1,1,1,1,1,1], bias=[0,0,0,3,2,0]
+        // → biased=[1,1,1,4,3,1] → top-2 = [3, 4].
+        let scores = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let bias   = vec![0.0, 0.0, 0.0, 3.0, 2.0, 0.0];
+        let (idx, wts) = bias_aware_topk_weights(&scores, &bias, 2).unwrap();
+        assert_eq!(idx, vec![3, 4]);
+        // Weights come from UNBIASED scores (both 1.0), normalized.
+        assert!((wts[0] - 0.5).abs() < 1e-6);
+        assert!((wts[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bias_aware_topk_weights_use_unbiased_scores() {
+        // scores=[5, 1, 1], bias=[0, 10, 10] → biased=[5, 11, 11].
+        // Top-2 by biased = [1, 2]. Weights from unbiased = [1, 1] → [0.5, 0.5].
+        let scores = vec![5.0, 1.0, 1.0];
+        let bias   = vec![0.0, 10.0, 10.0];
+        let (idx, wts) = bias_aware_topk_weights(&scores, &bias, 2).unwrap();
+        assert!(idx == vec![1, 2] || idx == vec![2, 1]);
+        assert!((wts[0] - 0.5).abs() < 1e-6);
+        assert!((wts[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bias_aware_topk_falls_back_zero_bias() {
+        // No bias → pure top-K from scores.
+        let scores = vec![0.1, 0.9, 0.5, 0.7];
+        let bias: Vec<f32> = vec![];
+        let (idx, wts) = bias_aware_topk_weights(&scores, &bias, 2).unwrap();
+        assert_eq!(idx, vec![1, 3]);
+        let s = 0.9 + 0.7;
+        assert!((wts[0] - 0.9/s).abs() < 1e-6);
+        assert!((wts[1] - 0.7/s).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bias_aware_topk_returns_none_on_zero_sum() {
+        // All scores zero → no positive weight sum.
+        let scores = vec![0.0, 0.0, 0.0];
+        let bias   = vec![5.0, 0.0, 0.0];  // bias picks idx 0 but score is 0
+        assert!(bias_aware_topk_weights(&scores, &bias, 1).is_none());
+    }
+
+    #[test]
+    fn bias_aware_topk_handles_k_geq_n() {
+        // k=4 but only n=2 scores — caller's job to set k correctly,
+        // but we silently clamp rather than panic.
+        let scores = vec![1.0, 2.0];
+        let bias   = vec![0.0, 0.0];
+        let (idx, wts) = bias_aware_topk_weights(&scores, &bias, 4).unwrap();
+        assert_eq!(idx.len(), 2);
+        assert!(wts.iter().sum::<f32>() > 0.99 && wts.iter().sum::<f32>() < 1.01);
+    }
+
+    #[test]
+    fn gather_normalized_weights_basic() {
+        let scores = vec![0.0, 2.0, 0.0, 1.0, 0.0];
+        let idx    = vec![1u32, 3];
+        let wts = gather_normalized_weights(&scores, &idx).unwrap();
+        // scores at idx = [2, 1] → normalized [2/3, 1/3]
+        assert!((wts[0] - 2.0/3.0).abs() < 1e-6);
+        assert!((wts[1] - 1.0/3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gather_normalized_weights_zero_sum_returns_none() {
+        let scores = vec![0.0; 8];
+        let idx    = vec![0u32, 1, 2];
+        assert!(gather_normalized_weights(&scores, &idx).is_none());
+    }
+
+    #[test]
+    fn gather_normalized_weights_out_of_range_idx_is_zero() {
+        // Hash table can in theory point past scores; we treat OOR as 0
+        // (better than panicking — tid2eid is supposed to be in range).
+        let scores = vec![1.0, 2.0, 3.0];
+        let idx    = vec![1u32, 999];
+        let wts = gather_normalized_weights(&scores, &idx).unwrap();
+        // sum = 2 + 0 = 2 → normalized [1.0, 0.0]
+        assert!((wts[0] - 1.0).abs() < 1e-6);
+        assert!((wts[1] - 0.0).abs() < 1e-6);
+    }
 }
