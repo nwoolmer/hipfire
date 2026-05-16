@@ -19545,6 +19545,51 @@ impl Gpu {
         }
     }
 
+    /// V4F position-0 attention: per-head sigmoid-of-(Q·K + attn_sink),
+    /// times V, reduced over o_groups.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_pos0(
+        &mut self,
+        q: &GpuTensor,
+        kv: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_pos0",
+            kernels::V4F_ATTN_POS0_SRC, "v4f_attn_pos0")?;
+        let func = &self.functions["v4f_attn_pos0"];
+        let qp = q.buf.as_ptr();
+        let kp = kv.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [o_groups as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F MoE routing affinity: sqrt(softplus(x)) elementwise in-place.
     #[allow(dead_code)]
     pub fn sqrt_softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
