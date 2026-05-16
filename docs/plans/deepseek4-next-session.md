@@ -1,156 +1,107 @@
-# V4F bring-up — handoff for next session
+# DeepSeek V4 Flash — next session
 
-**FULL mHC FORWARD LIVE as of commit dbed40b.** The 4.27e37 overflow
-was a bug — `hc_compute_control` and `hc_mix_4stream` declared
-residual inputs as `const __half*` but V4F's F32 residuals were being
-read as F16 pairs. Fixed → bounded magnitudes, real input-varying
-output. See newer "FULL V4F mHC FORWARD LIVE" section in
-project_deepseek4_arch_scaffold.md (memory) for sample outputs.
+Current state: V4F is mechanically chat-testable (`v4f_chat` binary)
+and the full MoE / hash-routing dispatch pipeline is shipped + unit-
+tested, gated behind env vars. Awaiting a VRAM-permitting test run +
+one more re-quant to fully exercise.
 
-State as of 2026-05-16 (updated late-session):
+## Shipped this session
 
-**Done:**
-- Phase 0 (scaffold): arch crate, Config parser, schema-drift gate
-- Phase 1 (FP8 ingest): byte-exact dequant verified, 40.2 GiB HFQ
-  ships under `~/.hipfire/models/v4f.mq2lloyd-gptq-all`
-- Phase 1.5 (load_weights walk): all 43 layers' expected tensors
-  present in HFQ index, hash-routing on layers 0-2 correctly
-  handled
-- Phase 1.6 (GPU upload): `load_weights` now uploads every non-
-  expert tensor — embeddings, norms, Q/O-LoRAs, KV joint, all 6
-  HC tensors/layer, router gate.weight (and gate.bias for non-
-  hash layers), shared expert × {w1,w2,w3}, compressor (when
-  ratio > 0). ~5s wall on gfx1151. Routed experts gated behind
-  `HIPFIRE_V4F_UPLOAD_EXPERTS=1` (~38 GB VRAM; defer until
-  forward consumes them).
-- Phase 1.7 (forward layout): `forward::decode_step` skeleton
-  with the complete per-layer call graph documented.
-- Phase 1.8 (minimum-viable forward): pipeline produces real V4F
-  logits via embed → 43 × {Q-LoRA + KV joint + tail-RoPE} →
-  final norm + lm_head. token 100 ('¤') → argmax token 65270
-  ('Kahenera'). The forward is structurally complete but
-  semantically degenerate (no real attention or FFN).
-- Phases 2-4 kernels (7 total) — all compile-clean on gfx1151,
-  dispatch wrappers landed, GPU-validated against CPU references
-  within fp16 tolerance. ALL exercised in the forward pipeline
-  (3 used: hc_sinkhorn, hc_mix, rope_tail, fused_rmsnorm_rotate;
-  indexer trio not yet integrated).
-- State: `DeepseekV4State` now carries 15+ GpuTensor slots for
-  per-step scratch (residual_streams, embed_scratch, tmp, q_lat,
-  q_lat_rot, q, kv, pos_buf, attn_out, ffn_out, ffn_x_rot,
-  ffn_gate, ffn_up, ffn_silu_rot, final_norm, final_norm_rot,
-  logits). All lazy-allocated.
+Commits c39ae3a..4596559 on branch `feat/mq-lloyd-asymmetric-moe`:
 
-**Live numerical issue (RESOLVED 2026-05-16, see commit dbed40b):**
+| Commit  | Subject |
+|---------|---------|
+| c39ae3a | batched expert upload (33K mallocs → 129 per-(layer,proj)) |
+| abb28a4 | FP4 (E2M1) dequant in V4F quantizer path |
+| fbb6afe | V4F routed-expert branch — unconditional FP4 unpack |
+| f66bd69 | routed-expert MoE dispatch (`HIPFIRE_V4F_MOE=1`) |
+| 9da44a8 | topk_indices bit-reinterpret as i32 in routed dispatch |
+| b32f8b9 | partial-MoE upload (`HIPFIRE_V4F_EXPERT_LAYER_END`) |
+| 2f55215 | swiglu_limit=10.0 clamp in shared + routed |
+| b1e1393 | bias-aware routing (selection uses biased scores) |
+| 936520d | remove duplicate route_scale multiply |
+| 2730224 | hash routing for layers 0-2 (tid2eid lookup) |
+| 536e54f | remove dead stubs |
+| 4596559 | extract pure functions + 8 unit tests |
 
-OLD: Enabling HC mix produces 4.27e37 magnitude overflow.
+## To activate MoE on the current HFQ (no re-quant needed)
 
-ROOT CAUSE: `hc_compute_control` and `hc_mix_4stream` declared
-residual-side inputs as `const __half*`, but V4F residuals are
-F32 (hipfire convention). Kernels read F32 bytes as F16 pairs →
-fixed-pattern garbage saturating across 43 layers.
+`/home/nick/.hipfire/models/v4f.mq2lloyd-fp4fix` (82 GB) has the FP4
+fix. Hash-routing tid2eid was NOT yet in the quantizer when this was
+built, so layers 0-2 will fall back to shared-only (`ffn_hash_routed`
+sees empty tid2eid_host, returns early).
 
-FIX: F32 declarations + remove __half2float conversions on residual
-side. Weights (W_fn, base) stay F16 since stored as F16 in HFQ.
+**Full MoE (~85 GB VRAM):**
+```bash
+HIPFIRE_V4F_MODEL=~/.hipfire/models/v4f.mq2lloyd-fp4fix \
+HIPFIRE_V4F_UPLOAD_EXPERTS=1 \
+HIPFIRE_V4F_MOE=1 \
+echo "Hello world" | ./target/release/examples/v4f_chat
+```
 
-**RESULT:**
-- All 4 residual streams have signal (4096/4096 nonzero each)
-- Stream magnitudes bounded (~9 for stream 0, ~25 for streams 1-3)
-- Logits in [13-18] range, max_abs ~30
-- Input-varying output (8 inputs → 6 distinct argmaxes)
-- Rudimentary script/topic awareness ('stick' → Chinese chars;
-  'Ġв' → 'Ġdekameters'; 'à¨' → 'Ġincrease')
+**Partial MoE (~3 + 1.84 * N GB; N=22 ≈ 43 GB):**
+```bash
+HIPFIRE_V4F_EXPERT_LAYER_END=22 \
+HIPFIRE_V4F_UPLOAD_EXPERTS=1 \
+HIPFIRE_V4F_MOE=1 \
+HIPFIRE_V4F_MODEL=~/.hipfire/models/v4f.mq2lloyd-fp4fix \
+echo "Hello world" | ./target/release/examples/v4f_chat
+```
 
-Sinkhorn now uses paper-faithful exp() pre-processing (commit
-103ca35) + col-then-row normalisation. α scaling kernel
-hc_apply_alpha (commit b815e4c) wires the per-segment α^pre/α^res/
-α^post into the control vector before Sinkhorn fires. Input
-mapping hc_input_map_4stream produces A·X as the transform input.
-- Mix output scaling factor
-- Per-layer learnable residual scale that bounds compounding
-- Some combination of the above
+## To get tid2eid into the HFQ (~35 min re-quant)
 
-**Not done — the gap to "first token":**
+Run the quantizer with the current code. Adds ~9 MB for the three
+hash-routed layers' tid2eid tables. The output is otherwise the
+same as `v4f.mq2lloyd-fp4fix`.
 
-The forward bodies are stubs. To get a token out of V4F, the next
-session needs:
+```bash
+./target/release/hipfire-quantize \
+  --input ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/*/ \
+  --output ~/.hipfire/models/v4f.mq2lloyd-fp4fix-v2 \
+  --format mq4-mq2lloyd-native \
+  --allow-mq2-lloyd
+```
 
-### 1. Forward bodies (estimated: 5-7 days)
-Replace each `unimplemented_step(...)` in
-`crates/hipfire-arch-deepseek4/src/forward.rs` with the real
-kernel sequence. Order of difficulty (start with easiest):
-- **Easiest**: embed → streams init (allocate 4 streams, copy
-  embed row into stream 0 via `embedding_lookup_q8`, memset
-  streams 1-3).
-- **Medium**: RMSNorm + Q/O-LoRA / KV joint GEMVs — existing
-  hipfire-runtime kernels.
-- **Medium**: HC compute_control → sinkhorn → mix sequence — all
-  three kernels are GPU-validated already; just chain the calls.
-- **Medium-hard**: Tail-only RoPE — kernel works; need to ensure
-  position counter passed correctly.
-- **Hard**: Indexer score → top-k → gather + SWA cache update +
-  main attention over union — the main attention kernel needs
-  the wrap-aware `start_pos` parameter added (Phase 4 doc).
-- **Hard**: MoE router (noaux_tc with sqrtsoftplus + topk=6 of
-  256) and the hash-routing path for first 3 layers.
-- **Hard**: Routed expert dispatch — V4F's per-expert tensor
-  layout (gated behind `HIPFIRE_V4F_UPLOAD_EXPERTS=1` for VRAM
-  reasons until forward can consume them).
+Requires ~165 GB free disk during write (output 82 GB + working
+copy). Delete the old `.fp4fix` file first if disk-tight.
 
-### 2. Numerical correctness gate (estimated: 1-2 days)
-Add `dev/bench/data/v4f_first_token_oracle.txt` — a prompt + the
-exact first token V4F should emit at temp=0. Once forward is wired,
-this is the single gate: do we produce the expected token? If yes,
-V4F works.
+After the re-quant, layers 0-2 join the routed-expert dispatch via
+`ffn_hash_routed`, giving full 43/43 layer coverage.
 
-### 3. Quality validation (estimated: 1 day)
-Run `mq2lloyd_coherence_harness.py` against V4F at all-MQ2-GPTQ.
-Expected: similar or better numbers than Qwen3.6-35B-A3B (9/10 ok,
-0 attractors per the Lever 2 result). If significantly worse,
-the recipe didn't generalise off Qwen3.6 → revisit damping sweep
-on V4F-class precision before declaring success.
+## Known limitations (low-priority)
 
-### 4. Phase 5 (MTP, optional, ~1 day)
-Drop the `mtp.` prefix-skip in `hipfire-quantize`, treat MTP layer
-as layer 43, wire as DFlash drafter.
+1. **SWA attractor without MoE** — confirmed structural. Shared-only
+   FFN doesn't introduce enough per-step variation; SWA attention
+   feedback loop converges on attractors (e.g. `kong konstru konstru
+   勾 ... stedt`). Without `HIPFIRE_V4F_MOE=1`, default to
+   `HIPFIRE_V4F_ATTN=pos0` for sensible (though context-free) output.
 
-## Total estimated time to first COHERENT token: ~3-5 days focused
+2. **Indexer (#56) not implemented** — V4F's compressed-KV indexer
+   provides sparse attention over long context (top-512 from past
+   tokens, dedup across heads, gather + main attention). Dormant for
+   prompts < SWA window (128 tokens), so doesn't affect short chat.
+   Architecture is more nuanced than expected: separate `attn.indexer.*`
+   sub-module on alternating layers (ratio=4), with its own wq_b
+   [8192, 1024], weights_proj [64, 4096], and a SECOND compressor
+   distinct from the main attention's. Tensors verified present in
+   HFQ for layers 2, 4, 6, ... See `inference/model.py:Indexer` for
+   the algorithm. Estimated 4-8 hours including re-quant + test.
 
-(Revised down again: load_weights done, full mHC forward live, MoE
-router code written. Remaining: real SWA attention with KV cache
-(~2 days), MoE expert dispatch loop with d2h-sync handling (~1
-day), positional RoPE YaRN scaling for long contexts (~half day).)
+3. **YaRN (#55) not implemented** — RoPE scaling activates at
+   positions ≥ original_max_position / factor = 65536/16 = 4096
+   tokens. Dormant for short chat. Estimated 1-2 hours.
 
-**Current state: produces non-coherent input-varying logits.**
-For coherent text generation we need (in order of impact):
-  1. Real SWA attention + KV cache plumbing
-  2. MoE expert dispatch (top-K=6 from routed_experts)
-  3. Tighter HC numerics (currently sigmoid + 2σ + abs/exp Sinkhorn
-     work but don't match training residual-stream balance exactly)
+4. **MTP head** — quantizer skips `mtp.` prefix tensors. Phase 5 work.
 
-## Risks
+## Test inventory
 
-- **Indexer top-k correctness at long context.** The stub O(N·K)
-  top-k works up to N~16K. At 1M ctx with compress_ratio=4, N
-  could exceed 250K positions — stub goes O(250K · 512) per head ×
-  64 heads × 40 layers ≈ 3e12 ops per step. Replace stub with
-  bitonic / radix select before benchmarking at long context.
+All passing as of 4596559:
+- 8/8 V4F kernel tests (`./scripts/v4f_kernel_tests.sh`)
+- 11/11 hipfire-arch-deepseek4 lib tests (including 8 new routing unit tests)
+- 5/5 hipfire-quantize FP4 E2M1 tests
 
-- **Hyper-Connections decomposition.** The `[24]` control vector
-  reshape into Sinkhorn input isn't certain — see open question
-  in `docs/plans/deepseek4-phase3-hyper-connections.md`. Cross-
-  check against the V4F paper before forward integration.
+## Memory entries
 
-- **MoE expert dispatch.** V4F's per-expert separate-tensor layout
-  means we have 256 expert handles per layer (instead of one
-  stacked-3D). Our existing routed-MoE GEMV kernels expect the
-  3D layout. Choice: (a) emit re-stacked tensors at quantize
-  time, OR (b) extend kernels to take per-expert handles. (a) is
-  cheaper.
-
-## Bottom line
-
-V4F at 40.2 GiB is ready to load. The 7 GPU-validated kernels are
-the foundation. From here, forward integration is straight Rust
-work — no new HIP kernels required (other than possibly an
-optimised top-k for long context).
+See `~/.claude/projects/-home-nick--hipfire-src/memory/project_v4f_expert_shapes.md`
+for the full V4F MoE dispatch status, FP4 bug discovery, and
+activation paths.
