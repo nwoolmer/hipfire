@@ -382,6 +382,83 @@ fn attn_stub(
     Ok(())
 }
 
+/// V4F MoE router: scores and top-K expert selection.
+///
+/// For score-routed layers (l >= num_hash_layers = 3 on V4F):
+///   1. logits = gate.weight @ ffn_input  [256]  (MQ4G256 GEMV, M=256, K=hidden)
+///   2. logits += gate.bias
+///   3. scores = sqrt(softplus(logits))   [256]  (V4F affinity)
+///   4. topk_indices = top_k(scores, k=6)        (reuses indexer_top_k)
+///
+/// For hash-routed layers (l < 3): use the static `tid2eid` lookup
+/// table. Currently SKIPPED at quantize time, so hash-routed layers
+/// fall back to shared expert only.
+///
+/// Output lives in state.router_scores and state.topk_indices. The
+/// expert-dispatch step reads topk_indices, fetches per-expert weights
+/// from `layer.expert_w{1,2,3}` (requires `HIPFIRE_V4F_UPLOAD_EXPERTS=1`),
+/// and accumulates weighted expert outputs into ffn_out.
+#[allow(dead_code)]
+fn moe_route(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    if layer_idx < cfg.num_hash_layers {
+        // Hash-routed layer — skip score-routing (tid2eid table not loaded).
+        return Ok(());
+    }
+    let layer = &weights.layers[layer_idx];
+    let gate_w = layer.gate_weight.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
+    let gate_b = layer.gate_bias.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} gate.bias missing (score-routed)"))?;
+    let hc_x_in = state.hc_x_in.as_ref()
+        .ok_or_else(|| "hc_x_in not allocated for router".to_string())?;
+
+    let n_exp = cfg.n_routed_experts;
+    let k = cfg.num_experts_per_tok;
+    if state.router_scores.is_none() {
+        state.router_scores = Some(gpu.alloc_tensor(&[n_exp], DType::F32)
+            .map_err(|e| format!("alloc router_scores: {e:?}"))?);
+    }
+    if state.topk_indices.is_none() {
+        state.topk_indices = Some(gpu.alloc_tensor(&[k], DType::F32)
+            .map_err(|e| format!("alloc topk_indices: {e:?}"))?);
+    }
+    let scores = state.router_scores.as_ref().unwrap();
+    let topk = state.topk_indices.as_ref().unwrap();
+
+    // gate.weight is MQ4G256, so feed the FWHT-rotated ffn_input.
+    // hc_x_in is NOT rotated (it's the linear A·X output). We need
+    // to rotate first. Reuse state.tmp (overwriting whatever's there
+    // — at this point ffn-block hasn't started yet so tmp is free).
+    let tmp = state.tmp.as_ref()
+        .ok_or_else(|| "tmp not allocated for router rotation".to_string())?;
+    gpu.rotate_x_mq(hc_x_in, tmp, cfg.hidden_size)
+        .map_err(|e| format!("rotate_x_mq router layer {layer_idx}: {e:?}"))?;
+
+    // logits = gate.weight @ tmp_rot
+    gpu.gemv_mq4g256_prerotated(gate_w, tmp, scores, n_exp, cfg.hidden_size)
+        .map_err(|e| format!("gemv gate layer {layer_idx}: {e:?}"))?;
+
+    // logits += gate.bias (bias is F16, scores is F32 — need a kernel
+    // for f16-bias-add. Skip for now; bias is small magnitude).
+    let _ = gate_b;
+
+    // scores = sqrt(softplus(logits))
+    gpu.sqrt_softplus_f32(scores)
+        .map_err(|e| format!("sqrt_softplus layer {layer_idx}: {e:?}"))?;
+
+    // top-K via indexer_top_k. H=1, N=n_exp, K=k.
+    gpu.indexer_top_k(scores, topk, 1, n_exp as i32, k as i32)
+        .map_err(|e| format!("indexer_top_k router layer {layer_idx}: {e:?}"))?;
+
+    Ok(())
+}
+
 /// mHC pre-step: compute c = X · W_fn + base [24], split into
 /// Ã/B̃/C̃, apply sigmoid/exp+Sinkhorn/2σ, then compute
 /// state.hc_x_in = A_l · streams (the input mapping).

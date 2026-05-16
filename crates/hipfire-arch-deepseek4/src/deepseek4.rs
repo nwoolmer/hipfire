@@ -430,6 +430,13 @@ pub struct DeepseekV4State {
     /// Layout: c[0..4]=Ã, c[4..20]=B̃, c[20..24]=C̃.
     pub hc_c: Option<rdna_compute::GpuTensor>,
 
+    /// MoE router scores `[n_routed_experts = 256]` F32, set by the
+    /// router step (gate.weight @ ffn_input + bias → sqrt_softplus).
+    pub router_scores: Option<rdna_compute::GpuTensor>,
+    /// Top-K expert indices, allocated as F32 view but interpreted
+    /// as i32. Shape `[num_experts_per_tok = 6]`.
+    pub topk_indices: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -472,6 +479,8 @@ impl DeepseekV4State {
             final_norm_rot: None,
             hc_x_in: None,
             hc_c: None,
+            router_scores: None,
+            topk_indices: None,
             _scaffold: (),
         })
     }
