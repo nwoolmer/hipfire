@@ -63,6 +63,23 @@ fn main() {
     // Skip — `new_state` takes &mut Gpu which we don't have here.
     // Validates only that Config parses; state allocation deferred.
 
+    // Phase 1.5 walk: invoke the host-only walk to verify every expected
+    // V4F tensor (per-layer attention LoRAs, KV joint, norms, HC, router,
+    // 256 routed experts × 3 projections, shared expert, indexer if
+    // compress_ratio > 0) is present in the index. Returns Err on any
+    // missing tensor.
+    match DeepseekV4::load_weights_host_only_walk(&hfq, &cfg) {
+        Ok(w) => eprintln!(
+            "\nload_weights walk OK: {} layer bundles, mtp_layer={}",
+            w.layers.len(),
+            if w.mtp_layer.is_some() { "Some" } else { "None" }
+        ),
+        Err(e) => {
+            eprintln!("\nload_weights walk FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // Spot-check a few known V4F tensor names through the public API.
     for name in &[
         "embed.weight",
