@@ -199,12 +199,35 @@ impl DeepseekV4Config {
     }
 }
 
-/// V4F weights — scaffold-stage placeholder. Real impl will hold per-
-/// layer `WeightTensor` arrays for: Q-LoRA (`q_a`, `q_b`), KV joint
-/// (`kv_a`, `kv_b`), O-LoRA (`o_a`, `o_b`), indexer (`idx_q`, `idx_k`,
-/// `idx_v` over compressed positions), Hyper-Connection gating, routed
-/// experts (gate / up / down), shared expert, MTP head.
+/// Per-layer weight bundle. Real impl will replace `()` with
+/// `WeightTensor` handles (GPU-resident, quantized). Slots match the
+/// V4F shipped tensor inventory (see `inventoryV4F` in this module's
+/// tests and `docs/plans/deepseek4-phase2-indexer.md`):
+///
+/// - Q-LoRA: `q_a` (hidden → q_lora_rank), `q_b` (q_lora_rank → n_heads * head_dim)
+/// - Joint KV: `wkv` (hidden → 2 * n_kv_heads * head_dim)
+/// - O-LoRA: `o_a` (n_heads * head_dim → o_lora_rank), `o_b` (o_lora_rank → hidden)
+/// - Indexer: `idx_q`, `idx_k`, `idx_v` (Phase 2)
+/// - Hyper-Connections: `hc_attn_*`, `hc_ffn_*` triples (Phase 3)
+/// - FFN MoE: 256 routed experts × `{w1, w2, w3}` + 1 shared expert
+/// - Router: `ffn.gate.weight` (and the I64 `tid2eid` hash-routing tables)
+pub struct DeepseekV4LayerWeights {
+    pub compress_ratio: u32,  // 0 = no indexer; otherwise stride
+    pub _scaffold: (),
+}
+
+/// V4F weights — scaffold-stage placeholder.
+///
+/// `mtp_layer` is `Some` after Phase 5 lands (when the
+/// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
+/// tensors are quantized alongside main layers).
 pub struct DeepseekV4Weights {
+    /// One bundle per `num_hidden_layers` (43 on V4F).
+    pub layers: Vec<DeepseekV4LayerWeights>,
+    /// MTP head — structurally identical to a main layer, plus an
+    /// `input_proj` conditioning on the base model's hidden state.
+    /// `None` at scaffold stage; populated when Phase 5 ships.
+    pub mtp_layer: Option<DeepseekV4LayerWeights>,
     pub _scaffold: (),
 }
 
