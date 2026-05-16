@@ -209,21 +209,73 @@ impl DeepseekV4Config {
     }
 }
 
-/// Per-layer weight bundle. Real impl will replace `()` with
-/// `WeightTensor` handles (GPU-resident, quantized). Slots match the
-/// V4F shipped tensor inventory (see `inventoryV4F` in this module's
-/// tests and `docs/plans/deepseek4-phase2-indexer.md`):
-///
-/// - Q-LoRA: `q_a` (hidden → q_lora_rank), `q_b` (q_lora_rank → n_heads * head_dim)
-/// - Joint KV: `wkv` (hidden → 2 * n_kv_heads * head_dim)
-/// - O-LoRA: `o_a` (n_heads * head_dim → o_lora_rank), `o_b` (o_lora_rank → hidden)
-/// - Indexer: `idx_q`, `idx_k`, `idx_v` (Phase 2)
-/// - Hyper-Connections: `hc_attn_*`, `hc_ffn_*` triples (Phase 3)
-/// - FFN MoE: 256 routed experts × `{w1, w2, w3}` + 1 shared expert
-/// - Router: `ffn.gate.weight` (and the I64 `tid2eid` hash-routing tables)
+/// Per-layer GPU-resident weights. Slots match V4F shipped tensor
+/// inventory; each is `Option<GpuTensor>` so partial-upload paths
+/// (host walk only / minimal upload / full upload) can populate
+/// progressively. Forward bring-up asserts all relevant slots are
+/// Some before dispatching.
 pub struct DeepseekV4LayerWeights {
     pub compress_ratio: u32,  // 0 = no indexer; otherwise stride
-    pub _scaffold: (),
+
+    // Norms (F16 vectors).
+    pub attn_norm: Option<rdna_compute::GpuTensor>,
+    pub ffn_norm:  Option<rdna_compute::GpuTensor>,
+    pub q_norm:    Option<rdna_compute::GpuTensor>,
+    pub kv_norm:   Option<rdna_compute::GpuTensor>,
+    pub attn_sink: Option<rdna_compute::GpuTensor>,  // [n_heads]
+
+    // Attention LoRA + KV joint (MQ-family quantized).
+    pub wq_a:   Option<rdna_compute::GpuTensor>,
+    pub wq_b:   Option<rdna_compute::GpuTensor>,
+    pub wkv:    Option<rdna_compute::GpuTensor>,
+    pub wo_a:   Option<rdna_compute::GpuTensor>,
+    pub wo_b:   Option<rdna_compute::GpuTensor>,
+
+    // Indexer (compressor) — present only when compress_ratio > 0.
+    pub compressor_wkv:   Option<rdna_compute::GpuTensor>,
+    pub compressor_wgate: Option<rdna_compute::GpuTensor>,
+    pub compressor_norm:  Option<rdna_compute::GpuTensor>,
+
+    // Hyper-Connections (F16 small matrices).
+    pub hc_attn_base:  Option<rdna_compute::GpuTensor>,
+    pub hc_attn_fn:    Option<rdna_compute::GpuTensor>,
+    pub hc_attn_scale: Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_base:   Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_fn:     Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_scale:  Option<rdna_compute::GpuTensor>,
+
+    // FFN router. `gate.bias` is None for hash-routed layers (first
+    // `num_hash_layers`).
+    pub gate_weight: Option<rdna_compute::GpuTensor>,
+    pub gate_bias:   Option<rdna_compute::GpuTensor>,
+
+    // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
+    pub shared_w1: Option<rdna_compute::GpuTensor>,
+    pub shared_w2: Option<rdna_compute::GpuTensor>,
+    pub shared_w3: Option<rdna_compute::GpuTensor>,
+
+    // Routed experts. Each Vec is length `n_routed_experts` (256 on V4F).
+    // None when not yet uploaded.
+    pub expert_w1: Option<Vec<rdna_compute::GpuTensor>>,
+    pub expert_w2: Option<Vec<rdna_compute::GpuTensor>>,
+    pub expert_w3: Option<Vec<rdna_compute::GpuTensor>>,
+}
+
+impl DeepseekV4LayerWeights {
+    pub fn new_empty(compress_ratio: u32) -> Self {
+        DeepseekV4LayerWeights {
+            compress_ratio,
+            attn_norm: None, ffn_norm: None, q_norm: None, kv_norm: None,
+            attn_sink: None,
+            wq_a: None, wq_b: None, wkv: None, wo_a: None, wo_b: None,
+            compressor_wkv: None, compressor_wgate: None, compressor_norm: None,
+            hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
+            hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
+            gate_weight: None, gate_bias: None,
+            shared_w1: None, shared_w2: None, shared_w3: None,
+            expert_w1: None, expert_w2: None, expert_w3: None,
+        }
+    }
 }
 
 /// V4F weights — scaffold-stage placeholder with two GPU-resident

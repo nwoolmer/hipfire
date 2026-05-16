@@ -170,10 +170,7 @@ impl DeepseekV4 {
                 }
             }
 
-            layers.push(DeepseekV4LayerWeights {
-                compress_ratio: ratio,
-                _scaffold: (),
-            });
+            layers.push(DeepseekV4LayerWeights::new_empty(ratio));
         }
 
         Ok(DeepseekV4Weights {
@@ -211,13 +208,107 @@ impl Architecture for DeepseekV4 {
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
         // Phase 1.5 host walk verifies every expected tensor is in the
-        // HFQ index. After it returns we upload the two cheapest
-        // globals — `embed.weight` and `norm.weight` — as the minimum
-        // viable end-to-end test of the GPU upload pipeline. Per-layer
-        // uploads (LoRAs, KV, HC, experts) land in forward bring-up.
+        // HFQ index. We then upload all globals and per-layer
+        // non-expert tensors. The 256 routed experts per layer are
+        // gated behind `HIPFIRE_V4F_UPLOAD_EXPERTS=1` (most of the
+        // model's bytes — defer until forward is wired so we don't
+        // spend ~38 GB of VRAM on tensors we can't yet consume).
+        let upload_experts = std::env::var("HIPFIRE_V4F_UPLOAD_EXPERTS")
+            .ok().as_deref() == Some("1");
+
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
-        weights.token_embd = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
+
+        // Globals.
+        weights.token_embd  = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
         weights.output_norm = Some(Self::upload_global_raw(hfq, gpu, "norm.weight")?);
+
+        // Per-layer.
+        for (l, layer) in weights.layers.iter_mut().enumerate() {
+            // Norms (F16).
+            layer.attn_norm = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn_norm.weight"))?);
+            layer.ffn_norm  = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.ffn_norm.weight"))?);
+            layer.q_norm    = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.q_norm.weight"))?);
+            layer.kv_norm   = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.kv_norm.weight"))?);
+            layer.attn_sink = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.attn_sink"))?);
+
+            // Attention LoRA + KV joint.
+            layer.wq_a = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.wq_a.weight"))?);
+            layer.wq_b = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.wq_b.weight"))?);
+            layer.wkv  = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.wkv.weight"))?);
+            layer.wo_a = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.wo_a.weight"))?);
+            layer.wo_b = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.attn.wo_b.weight"))?);
+
+            // Indexer (compressor) — only when ratio > 0.
+            if layer.compress_ratio > 0 {
+                layer.compressor_wkv   = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.compressor.wkv.weight"))?);
+                layer.compressor_wgate = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.compressor.wgate.weight"))?);
+                layer.compressor_norm  = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.compressor.norm.weight"))?);
+            }
+
+            // Hyper-Connections (F16 small matrices).
+            layer.hc_attn_base  = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_attn_base"))?);
+            layer.hc_attn_fn    = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_attn_fn"))?);
+            layer.hc_attn_scale = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_attn_scale"))?);
+            layer.hc_ffn_base   = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_ffn_base"))?);
+            layer.hc_ffn_fn     = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_ffn_fn"))?);
+            layer.hc_ffn_scale  = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.hc_ffn_scale"))?);
+
+            // FFN router.
+            layer.gate_weight = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.ffn.gate.weight"))?);
+            if l >= cfg.num_hash_layers {
+                layer.gate_bias = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.ffn.gate.bias"))?);
+            }
+
+            // Shared expert.
+            layer.shared_w1 = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.ffn.shared_experts.w1.weight"))?);
+            layer.shared_w2 = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.ffn.shared_experts.w2.weight"))?);
+            layer.shared_w3 = Some(Self::upload_global_raw(hfq, gpu,
+                &format!("layers.{l}.ffn.shared_experts.w3.weight"))?);
+
+            // Routed experts: 256 × 3 = 768 GPU tensors per layer ×
+            // 43 layers = ~33K total. ~38 GB of VRAM. Skip unless
+            // HIPFIRE_V4F_UPLOAD_EXPERTS=1.
+            if upload_experts {
+                let mut w1s = Vec::with_capacity(cfg.n_routed_experts);
+                let mut w2s = Vec::with_capacity(cfg.n_routed_experts);
+                let mut w3s = Vec::with_capacity(cfg.n_routed_experts);
+                for e in 0..cfg.n_routed_experts {
+                    w1s.push(Self::upload_global_raw(hfq, gpu,
+                        &format!("layers.{l}.ffn.experts.{e}.w1.weight"))?);
+                    w2s.push(Self::upload_global_raw(hfq, gpu,
+                        &format!("layers.{l}.ffn.experts.{e}.w2.weight"))?);
+                    w3s.push(Self::upload_global_raw(hfq, gpu,
+                        &format!("layers.{l}.ffn.experts.{e}.w3.weight"))?);
+                }
+                layer.expert_w1 = Some(w1s);
+                layer.expert_w2 = Some(w2s);
+                layer.expert_w3 = Some(w3s);
+            }
+        }
+
         Ok(weights)
     }
 
