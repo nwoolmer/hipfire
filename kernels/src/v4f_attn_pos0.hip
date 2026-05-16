@@ -56,8 +56,11 @@ extern "C" __global__ void v4f_attn_pos0(
             for (int i = 0; i < head_dim; ++i) {
                 dot += q[h * head_dim + i] * kv[i];
             }
-            // Numerically-stable sigmoid: sigmoid(x) = 1 / (1 + exp(-x)).
-            float score = dot + attn_sink[h];
+            // Attention sink: softmax([Q·K, sink]) → V's prob is
+            // sigmoid(Q·K - sink). Sink dampens (not amplifies).
+            // Scale by 1/sqrt(head_dim) per standard SDPA.
+            float inv_scale = rsqrtf((float)head_dim);
+            float score = dot * inv_scale - attn_sink[h];
             shared_prob[h_local] = 1.0f / (1.0f + __expf(-score));
         }
         __syncthreads();
