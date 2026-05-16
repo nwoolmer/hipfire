@@ -1,14 +1,12 @@
-// Inverse tail-only partial RoPE on attention output (V4F).
+// Inverse tail RoPE on attention output (V4F, INTERLEAVED).
 //
 // Upstream V4F applies `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`
-// — the `True` flag is the inverse rotation. This undoes the RoPE that
-// V (tied to K) had baked in when written to the KV cache, so the
-// downstream wo_a/wo_b projection sees attention output in a
-// position-agnostic phase.
+// — the `True` flag uses conjugate frequencies (inverse rotation).
+// Pair convention: INTERLEAVED (2i, 2i+1), matching torch.view_as_complex.
 //
 // Inverse is forward with negated sin:
-//   forward: q' = q*cos - rot_half(q)*sin   →  cos,  sin
-//   inverse: q' = q*cos - rot_half(q)*(-sin) →  cos, -sin
+//   forward: x_e' = x_e*cos - x_o*sin;  x_o' = x_e*sin + x_o*cos
+//   inverse: x_e' = x_e*cos + x_o*sin;  x_o' = -x_e*sin + x_o*cos
 
 #include <hip/hip_runtime.h>
 
@@ -17,8 +15,8 @@ extern "C" __global__ void rope_tail_inverse_f32(
     const int* __restrict__ pos_buf, // [1]
     int n_heads,
     int head_dim,
-    int n_rot,                       // tail rotation dim (= qk_rope_head_dim)
-    float freq_base                  // 10000 on V4F main attention
+    int n_rot,
+    float freq_base
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = n_rot / 2;
@@ -31,11 +29,14 @@ extern "C" __global__ void rope_tail_inverse_f32(
     float sin_a = -sinf(angle);  // INVERSE: negate sin
 
     int tail_off = head_dim - n_rot;
+    int d_even = tail_off + 2 * i;
+    int d_odd  = d_even + 1;
+
     for (int h = 0; h < n_heads; ++h) {
-        int base = h * head_dim + tail_off;
-        float x0 = x[base + i];
-        float x1 = x[base + i + half];
-        x[base + i]        = x0 * cos_a - x1 * sin_a;
-        x[base + i + half] = x0 * sin_a + x1 * cos_a;
+        int base = h * head_dim;
+        float x0 = x[base + d_even];
+        float x1 = x[base + d_odd];
+        x[base + d_even] = x0 * cos_a - x1 * sin_a;
+        x[base + d_odd]  = x0 * sin_a + x1 * cos_a;
     }
 }
