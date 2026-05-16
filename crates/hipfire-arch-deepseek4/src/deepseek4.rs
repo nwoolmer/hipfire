@@ -382,6 +382,11 @@ pub struct DeepseekV4State {
     /// Tail-only RoPE applied to last `qk_rope_head_dim = 64` dims.
     pub kv: Option<rdna_compute::GpuTensor>,
 
+    /// Position counter for RoPE. Stored as a 1-element F32 GpuTensor
+    /// where we write the i32 position bits via memcpy_htod (the
+    /// rope_tail kernel reinterprets the bytes as int via cast).
+    pub pos_buf: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -412,6 +417,7 @@ impl DeepseekV4State {
             q_lat_rot: None,
             q: None,
             kv: None,
+            pos_buf: None,
             _scaffold: (),
         })
     }

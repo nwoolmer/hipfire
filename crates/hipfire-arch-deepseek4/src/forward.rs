@@ -61,10 +61,13 @@ pub fn decode_step(
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
 
         // iii. Joint KV: wkv @ tmp → kv [head_dim = 512] (tied K=V).
-        //      Apply tail RoPE on the last 64 of 512 dims.
-        //      SWA ring write deferred (needs swa_k state alloc per
-        //      layer; lands in step 5).
         kv_joint(cfg, weights, state, gpu, layer_idx)?;
+
+        // iv. Tail-only RoPE on Q and KV.
+        //     Apply rotation on last `qk_rope_head_dim = 64` of each
+        //     head's 512 dims.
+        //     SWA ring write deferred (needs swa state alloc per layer).
+        apply_tail_rope(cfg, state, gpu, position)?;
 
         // iv. Indexer path (only when compress_ratio > 0):
         //     a. Compressor: x @ compressor.wkv → idx_qk
@@ -146,6 +149,46 @@ pub fn decode_step(
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// Step 5 (attention block): Tail-only RoPE on Q and KV.
+///
+/// V4F's `qk_rope_head_dim = 64` of `head_dim = 512`. Only the last
+/// 64 dims of each head's 512-dim vector get rotated; the first 448
+/// are pass-through. Same rotation applies to KV's 512-dim vector
+/// (treated as 1 head).
+///
+/// Uses `rope_tail_halfsplit_f32` with V4F's `rope_theta = 10000`.
+fn apply_tail_rope(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    position: u32,
+) -> Result<(), String> {
+    // Lazy-alloc pos_buf and write current position. Use F32 alloc;
+    // the kernel reinterprets the 4-byte slot as int.
+    if state.pos_buf.is_none() {
+        state.pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
+            .map_err(|e| format!("alloc pos_buf: {e:?}"))?);
+    }
+    let pos_buf = state.pos_buf.as_ref().unwrap();
+    let pos_bytes = (position as i32).to_le_bytes();
+    gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
+        .map_err(|e| format!("htod pos_buf: {e:?}"))?;
+
+    let q  = state.q.as_ref().unwrap();
+    let kv = state.kv.as_ref().unwrap();
+
+    gpu.rope_tail_halfsplit(
+        q, kv, pos_buf,
+        cfg.num_attention_heads as i32,
+        cfg.num_key_value_heads as i32,
+        cfg.head_dim as i32,
+        cfg.qk_rope_head_dim as i32,
+        cfg.rope_theta,
+    ).map_err(|e| format!("rope_tail_halfsplit: {e:?}"))?;
+
     Ok(())
 }
 
