@@ -19545,6 +19545,42 @@ impl Gpu {
         }
     }
 
+    /// Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]).
+    /// A is sigmoid-bounded [0, 1].
+    #[allow(dead_code)]
+    pub fn hc_input_map_4stream(
+        &mut self,
+        a_vec: &GpuTensor,
+        streams: &GpuTensor,
+        x_out: &GpuTensor,
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_input_map_4stream",
+            kernels::HC_INPUT_MAP_SRC, "hc_input_map_4stream")?;
+        let func = &self.functions["hc_input_map_4stream"];
+        let ap = a_vec.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let op = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Mix 4 residual streams via gating matrix + transform output.
     /// `x_out[s, d] = sum_t(A[s, t] * x_in[t, d]) + scale[s] * transform_out[d]`.
     #[allow(dead_code, clippy::too_many_arguments)]

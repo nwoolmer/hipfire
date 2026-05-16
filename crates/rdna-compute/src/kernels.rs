@@ -1582,6 +1582,8 @@ pub const HC_SINKHORN_4X4_SRC: &str =
     include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
 pub const HC_MIX_4STREAM_SRC: &str =
     include_str!("../../../kernels/src/hc_mix_4stream.hip");
+pub const HC_INPUT_MAP_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map.hip");
 
 // Phase 4 — Tail-only RoPE:
 pub const ROPE_TAIL_HALFSPLIT_SRC: &str =

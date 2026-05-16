@@ -421,6 +421,15 @@ pub struct DeepseekV4State {
     /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
     pub final_norm_rot: Option<rdna_compute::GpuTensor>,
 
+    /// Input-mapping output: `x_in = A · X`. Fed to the transform (attn
+    /// or FFN) as its [hidden] input.
+    pub hc_x_in: Option<rdna_compute::GpuTensor>,
+
+    /// mHC control vector `[24]` F32, set by `hc_compute_control` and
+    /// consumed by `hc_mix_4stream`. Allocated once per session.
+    /// Layout: c[0..4]=Ã, c[4..20]=B̃, c[20..24]=C̃.
+    pub hc_c: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -461,6 +470,8 @@ impl DeepseekV4State {
             final_norm: None,
             logits: None,
             final_norm_rot: None,
+            hc_x_in: None,
+            hc_c: None,
             _scaffold: (),
         })
     }

@@ -50,12 +50,31 @@ pub fn decode_step(
 
         // ── 2a. Attention block ───────────────────────────────────────
         //
-        // i+ii. Fused RMSNorm + Q-LoRA. The fused_rmsnorm_rotate_mq
-        //       kernel inside q_lora() does the RMSNorm AND the
-        //       FWHT rotation needed by MQ4 GEMV in a single call.
-        //       (V4F paper: one stream feeds the transform; we
-        //       conservatively use stream 0 — revisit during
-        //       numerical-correctness gate.)
+        // mHC pre-step + full mHC mix (paper-faithful) — DISABLED.
+        // Even with proper sigmoid/exp+Sinkhorn/2σ/input-mapping
+        // implementation, 43 layers cumulative additions overflow f32
+        // because we don't apply the small-init learnable α scalars
+        // (hc_*_scale [3] in the paper, initialised to small values).
+        // Wire those into hc_compute_control as `α · (X · W) + base`
+        // and retry. For now: pipeline runs HC-disabled producing
+        // bounded but architecturally-trivial logits.
+        let _ = mhc_pre;
+        // mhc_pre(cfg, weights, state, gpu, layer_idx, true)?;
+
+        // Q-LoRA (currently reads hc_x_in if HC enabled, else stream0
+        // — we re-wire stream0 manually via a copy).
+        // Since HC is disabled here, copy stream0 into hc_x_in.
+        {
+            let streams = state.residual_streams.as_ref().unwrap();
+            if state.hc_x_in.is_none() {
+                state.hc_x_in = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc hc_x_in (fallback): {e:?}"))?);
+            }
+            let hc_x_in = state.hc_x_in.as_ref().unwrap();
+            let bytes = cfg.hidden_size * 4;
+            gpu.memcpy_dtod_auto(&hc_x_in.buf, &streams.buf, bytes)
+                .map_err(|e| format!("d2d stream0→hc_x_in: {e:?}"))?;
+        }
         q_lora(cfg, weights, state, gpu, layer_idx)?;
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
@@ -88,12 +107,9 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vii. HC attn mix — disabled. Even bounded transform_out
-        // produces 4e37 overflow across 43 layers due to compounding
-        // GEMV magnitudes. Paper-faithful activation chain needed
-        // (residual scaling, pre-Sinkhorn activation, mix scaling).
+        // vii. mHC attn mix — DISABLED (magnitudes overflow without
+        // proper α small-init residual scaling).
         let _ = hc_attn_mix;
-        let _ = layer_idx;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
@@ -101,7 +117,7 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        // FFN disabled too — same magnitude reason.
+        // FFN: disabled with HC.
         ffn_zero(cfg, state, gpu)?;
         let _ = ffn_stub;
         let _ = hc_ffn_mix;
@@ -166,7 +182,7 @@ fn ffn_stub(
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
     let shared_w3 = layer.shared_w3.as_ref().unwrap();
-    let streams = state.residual_streams.as_ref().unwrap();
+    let hc_x_in = state.hc_x_in.as_ref().unwrap();
 
     let im = cfg.moe_intermediate_size;
     if state.ffn_out.is_none() {
@@ -190,7 +206,6 @@ fn ffn_stub(
             .map_err(|e| format!("alloc ffn_silu_rot: {e:?}"))?);
     }
 
-    let stream0 = streams.sub_offset(0, cfg.hidden_size);
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let gate = state.ffn_gate.as_ref().unwrap();
     let up   = state.ffn_up.as_ref().unwrap();
@@ -198,7 +213,7 @@ fn ffn_stub(
     let ffn_out = state.ffn_out.as_ref().unwrap();
 
     // 1. Fused RMSNorm + FWHT rotate for the two MQ4 GEMVs.
-    gpu.fused_rmsnorm_rotate_mq(&stream0, ffn_norm, ffn_x_rot,
+    gpu.fused_rmsnorm_rotate_mq(hc_x_in, ffn_norm, ffn_x_rot,
         cfg.hidden_size, cfg.rms_norm_eps)
         .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
 
@@ -235,26 +250,31 @@ fn hc_ffn_mix(
     layer_idx: usize,
 ) -> Result<(), String> {
     let layer = &weights.layers[layer_idx];
-    let hc_fn    = layer.hc_ffn_fn.as_ref().unwrap();
-    let hc_base  = layer.hc_ffn_base.as_ref().unwrap();
-    let hc_scale = layer.hc_ffn_scale.as_ref().unwrap();
+    let hc_fn   = layer.hc_ffn_fn.as_ref().unwrap();
+    let hc_base = layer.hc_ffn_base.as_ref().unwrap();
     let streams = state.residual_streams.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
 
     let n_ctrl = 24;
     let x_dim = cfg.hidden_size * cfg.hc_mult;
-    let c_view = state.tmp.as_ref().unwrap().sub_offset(0, n_ctrl);
+    let c_view = state.hc_c.as_ref().unwrap().sub_offset(0, n_ctrl);
 
     gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
         n_ctrl as i32, x_dim as i32)
         .map_err(|e| format!("hc_compute_control ffn layer {layer_idx}: {e:?}"))?;
 
-    let a_view = state.tmp.as_ref().unwrap().sub_offset(0, 16);
-    gpu.hc_sinkhorn_4x4(&a_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
+    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
         .map_err(|e| format!("hc_sinkhorn_4x4 ffn layer {layer_idx}: {e:?}"))?;
 
+    let c_view_out = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
+    gpu.sigmoid_f32(&c_view_out)
+        .map_err(|e| format!("sigmoid C ffn layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&c_view_out, 2.0)
+        .map_err(|e| format!("scale C ffn layer {layer_idx}: {e:?}"))?;
+
     let streams_out = state.q.as_ref().unwrap();
-    gpu.hc_mix_4stream(streams, &a_view, hc_scale, ffn_out, streams_out,
+    gpu.hc_mix_4stream(streams, &b_view, &c_view_out, ffn_out, streams_out,
         cfg.hidden_size as i32)
         .map_err(|e| format!("hc_mix_4stream ffn layer {layer_idx}: {e:?}"))?;
 
@@ -362,19 +382,90 @@ fn attn_stub(
     Ok(())
 }
 
-/// Step 8 (attention block): Hyper-Connection mix.
+/// mHC pre-step: compute c = X · W_fn + base [24], split into
+/// Ã/B̃/C̃, apply sigmoid/exp+Sinkhorn/2σ, then compute
+/// state.hc_x_in = A_l · streams (the input mapping).
 ///
-///   c     = hc_attn_fn @ x_flat + hc_attn_base   [24]
-///   A     = sinkhorn(c reshaped to 4x4, eps, iters)
-///   x_out = A · x_in + scale[s] · transform_out
+/// After this runs, the layer's transform (attn or FFN) reads
+/// hc_x_in as its [hidden]-shaped input.
+fn mhc_pre(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    is_attn: bool,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let (hc_fn, hc_base) = if is_attn {
+        (layer.hc_attn_fn.as_ref().unwrap(),
+         layer.hc_attn_base.as_ref().unwrap())
+    } else {
+        (layer.hc_ffn_fn.as_ref().unwrap(),
+         layer.hc_ffn_base.as_ref().unwrap())
+    };
+    let streams = state.residual_streams.as_ref().unwrap();
+
+    if state.hc_x_in.is_none() {
+        state.hc_x_in = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc hc_x_in: {e:?}"))?);
+    }
+    if state.hc_c.is_none() {
+        state.hc_c = Some(gpu.alloc_tensor(&[24], DType::F32)
+            .map_err(|e| format!("alloc hc_c: {e:?}"))?);
+    }
+
+    let n_ctrl = 24;
+    let x_dim = cfg.hidden_size * cfg.hc_mult;
+    let c_view = state.hc_c.as_ref().unwrap().sub_offset(0, n_ctrl);
+
+    // c = streams · W_fn + base
+    gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
+        n_ctrl as i32, x_dim as i32)
+        .map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
+
+    // A_l = σ(c[0..4])
+    let a_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
+    gpu.sigmoid_f32(&a_view)
+        .map_err(|e| format!("sigmoid A layer {layer_idx}: {e:?}"))?;
+
+    // B_l = Sinkhorn(exp(c[4..20])) — kernel takes care of exp + iters.
+    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
+    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+        .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+
+    // C_l = 2σ(c[20..24])
+    let c_out_view = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
+    gpu.sigmoid_f32(&c_out_view)
+        .map_err(|e| format!("sigmoid C layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&c_out_view, 2.0)
+        .map_err(|e| format!("scale C layer {layer_idx}: {e:?}"))?;
+
+    // Input mapping: hc_x_in = A_l · streams
+    let hc_x_in = state.hc_x_in.as_ref().unwrap();
+    gpu.hc_input_map_4stream(&a_view, streams, hc_x_in, cfg.hidden_size as i32)
+        .map_err(|e| format!("hc_input_map layer {layer_idx}: {e:?}"))?;
+
+    Ok(())
+}
+
+/// Step 8 (attention block): full manifold-constrained Hyper-Connection mix.
 ///
-/// Then residual_streams = x_out.
+/// Per DeepSeek_V4.pdf §2.2:
+///   c     = α · (X · W_fn) + base                  [24]
+///   Ã,B̃,C̃ = c[0..4], c[4..20], c[20..24]
+///   A_l   = σ(Ã_l)                                  [4]    (input mapping)
+///   B_l   = Sinkhorn(exp(B̃_l))                     [4,4]  (residual matrix)
+///   C_l   = 2σ(C̃_l)                                 [4]    (output mapping)
+///   x_in  = A_l · X_l                               [hidden]   (NOT YET — uses stream0)
+///   y     = F_l(x_in)
+///   X_l+1 = B_l · X_l + C_l · y
 ///
-/// First 16 entries of c interpreted as the 4x4 mixing matrix.
-/// Per the Phase 3 design doc, the [24]-vector decomposition is
-/// `16 + 4 + 4` (matrix + bias + scale) but verifying which slice
-/// is which awaits paper read. For now we take the first 16 floats
-/// as a row-major 4x4.
+/// Currently `α · X · W_fn` is computed without the α scaling, and
+/// the input mapping `A·X` is stubbed (transform input = stream 0 not
+/// the weighted-sum across streams). These approximations make HC
+/// numerically non-canonical but kept bounded by the doubly-stochastic
+/// B and bounded-magnitude C.
 fn hc_attn_mix(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -385,46 +476,38 @@ fn hc_attn_mix(
     let layer = &weights.layers[layer_idx];
     let hc_fn    = layer.hc_attn_fn.as_ref().unwrap();
     let hc_base  = layer.hc_attn_base.as_ref().unwrap();
-    let hc_scale = layer.hc_attn_scale.as_ref().unwrap();
     let streams = state.residual_streams.as_ref().unwrap();
     let attn_out = state.attn_out.as_ref().unwrap();
 
-    // Allocate small scratch on demand: c_ctrl [24] F32, a 4x4 view
-    // is the first 16 elements (treat as [4, 4]).
-    let n_ctrl = 24;  // V4F hc_attn_fn shape [24, 16384]
-    let x_dim = cfg.hidden_size * cfg.hc_mult;  // 4096 * 4 = 16384
+    let n_ctrl = 24;
+    let x_dim = cfg.hidden_size * cfg.hc_mult;
 
-    // c_ctrl scratch: alloc once and stash on state.tmp? tmp is
-    // [hidden=4096] which is too big for the [24] output but the
-    // pool allows oversized writes. Use a sub-view to be safe.
-    let c_view = state.tmp.as_ref().unwrap().sub_offset(0, n_ctrl);
+    let c_view = state.hc_c.as_ref().unwrap().sub_offset(0, n_ctrl);
 
-    // 1. Control vector. hc_fn is F16 on disk; the kernel expects F16
-    // (per its signature). hc_base is F16 too. Output is F32.
-    gpu.hc_compute_control(
-        streams /* x_flat: streams memory is contiguous [4, hidden] */,
-        hc_fn, hc_base, &c_view,
-        n_ctrl as i32, x_dim as i32,
-    ).map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
+    // 1. c = X · W_fn + base. (α scaling not yet applied.)
+    gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
+        n_ctrl as i32, x_dim as i32)
+        .map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
 
-    // 2. Sinkhorn-normalise the first 16 entries as a 4x4 matrix.
-    // c_view is [24] but sinkhorn expects [16]. Build a 16-elem view
-    // over the same memory.
-    let a_view = state.tmp.as_ref().unwrap().sub_offset(0, 16);
-    gpu.hc_sinkhorn_4x4(&a_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+    // 2. B_l = Sinkhorn(exp(c[4..20])). The kernel takes a 4x4 starting
+    // matrix; we view c[4..20] as that.
+    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
+    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
         .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
 
-    // 3. Mix: streams_out = A · streams + scale · attn_out.
-    // Need a destination buffer different from streams. Reuse `q` for
-    // now (~32K F32, more than enough for [4, 4096]) — overwritten
-    // next layer.
-    let streams_out = state.q.as_ref().unwrap();
-    gpu.hc_mix_4stream(
-        streams, &a_view, hc_scale, attn_out, streams_out,
-        cfg.hidden_size as i32,
-    ).map_err(|e| format!("hc_mix_4stream layer {layer_idx}: {e:?}"))?;
+    // 3. C_l = 2σ(c[20..24]) — apply in-place via sigmoid then scale_f32.
+    let c_view_out = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
+    gpu.sigmoid_f32(&c_view_out)
+        .map_err(|e| format!("sigmoid C layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&c_view_out, 2.0)
+        .map_err(|e| format!("scale C layer {layer_idx}: {e:?}"))?;
 
-    // Copy back into residual_streams.
+    // 4. X_{l+1} = B_l · X_l + C_l · attn_out.
+    let streams_out = state.q.as_ref().unwrap();
+    gpu.hc_mix_4stream(streams, &b_view, &c_view_out, attn_out, streams_out,
+        cfg.hidden_size as i32)
+        .map_err(|e| format!("hc_mix_4stream layer {layer_idx}: {e:?}"))?;
+
     let bytes = cfg.hc_mult * cfg.hidden_size * 4;
     gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
         .map_err(|e| format!("d2d hc_mix → streams: {e:?}"))?;
@@ -570,14 +653,15 @@ fn q_lora(
             .map_err(|e| format!("alloc q: {e:?}"))?);
     }
 
-    let stream0 = streams.sub_offset(0, cfg.hidden_size);
+    let hc_x_in = state.hc_x_in.as_ref().unwrap();
     let tmp = state.tmp.as_ref().unwrap();
     let q_lat = state.q_lat.as_ref().unwrap();
     let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
     let q = state.q.as_ref().unwrap();
+    let _ = streams;  // streams not used directly anymore; transform reads hc_x_in
 
-    // 1. Fused RMSNorm + FWHT-rotate stream0 → tmp.
-    gpu.fused_rmsnorm_rotate_mq(&stream0, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
+    // 1. Fused RMSNorm + FWHT-rotate hc_x_in → tmp.
+    gpu.fused_rmsnorm_rotate_mq(hc_x_in, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
         .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
