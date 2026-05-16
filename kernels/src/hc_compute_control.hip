@@ -1,19 +1,18 @@
 // Hyper-Connections control-vector computation (V4F Phase 3).
 //
-//   c = W_fn · x_flat + base
+// Upstream V4F (model.py:Block.hc_pre):
+//   x = x.flatten(2).float()                                    # [hidden * hc_mult]
+//   rsqrt = torch.rsqrt(x.square().mean(-1) + norm_eps)         # SCALAR
+//   mixes = F.linear(x, hc_fn) * rsqrt                          # then + base in sinkhorn
 //
-// Shapes:
-//   x_flat : [hidden · hc_mult]  (4096 · 4 = 16384 on V4F)  fp16
-//   W_fn   : [n_ctrl, hidden · hc_mult]                     fp16
-//   base   : [n_ctrl]                                        fp16
-//   c      : [n_ctrl]                                        fp32 output
+// We fuse the (X·W) GEMV with the rsqrt + base-add into one launch:
+//   1. Each block computes one output entry's dot product (X·W)_ctrl
+//      AND accumulates sum-of-squares for the rsqrt in the same pass.
+//   2. Reduce both, compute rsqrt = 1/sqrt(mean(x^2) + eps).
+//   3. c[ctrl] = acc_dot * rsqrt + base[ctrl].
 //
-// V4F per-layer `hc_attn_fn` / `hc_ffn_fn` are shaped [24, 16384]
-// → n_ctrl = 24, x_dim = 16384. The output `c` feeds the
-// `sinkhorn_4x4` (after reshape interpretation per V4F paper).
-//
-// Strategy: one block per output entry (n_ctrl blocks).
-// THREADS_PER_BLOCK threads each accumulate a slab of x_dim.
+// V4F per-layer `hc_attn_fn` / `hc_ffn_fn` are [24, 16384] (n_ctrl=24,
+// x_dim=hidden*hc_mult=16384). hc_base is [24] F16; output c is F32.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -33,24 +32,38 @@ extern "C" __global__ void hc_compute_control(
     if (ctrl >= n_ctrl) return;
     const int tid = threadIdx.x;
 
-    float acc = 0.0f;
+    // Compute BOTH dot product AND sum-of-squares in one pass.
+    float acc_dot = 0.0f;
+    float acc_sq  = 0.0f;
     for (int d = tid; d < x_dim; d += THREADS_PER_BLOCK) {
         float xv = x_flat[d];
         float wv = __half2float(w_fn[ctrl * x_dim + d]);
-        acc += xv * wv;
+        acc_dot += xv * wv;
+        acc_sq  += xv * xv;
     }
 
     // Wave-shuffle reduction (wave32 on gfx11xx).
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_down(acc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc_dot += __shfl_down(acc_dot, offset);
+        acc_sq  += __shfl_down(acc_sq,  offset);
+    }
 
-    // Cross-wave reduction via shared memory.
-    __shared__ float partial[THREADS_PER_BLOCK / 32];
-    if (tid % 32 == 0) partial[tid / 32] = acc;
+    __shared__ float partial_dot[THREADS_PER_BLOCK / 32];
+    __shared__ float partial_sq [THREADS_PER_BLOCK / 32];
+    if (tid % 32 == 0) {
+        partial_dot[tid / 32] = acc_dot;
+        partial_sq [tid / 32] = acc_sq;
+    }
     __syncthreads();
     if (tid == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < THREADS_PER_BLOCK / 32; ++i) total += partial[i];
-        c[ctrl] = total + __half2float(base[ctrl]);
+        float total_dot = 0.0f;
+        float total_sq  = 0.0f;
+        for (int i = 0; i < THREADS_PER_BLOCK / 32; ++i) {
+            total_dot += partial_dot[i];
+            total_sq  += partial_sq [i];
+        }
+        // V4F upstream: mixes = F.linear(x, hc_fn) * rsqrt(mean(x^2) + eps)
+        float rsqrt = rsqrtf(total_sq / (float)x_dim + 1e-6f);
+        c[ctrl] = total_dot * rsqrt + __half2float(base[ctrl]);
     }
 }
