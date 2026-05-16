@@ -1576,6 +1576,8 @@ pub const INDEXER_KV_GATHER_SRC: &str =
     include_str!("../../../kernels/src/indexer_kv_gather.hip");
 
 // Phase 3 — Hyper-Connections:
+pub const HC_COMPUTE_CONTROL_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control.hip");
 pub const HC_SINKHORN_4X4_SRC: &str =
     include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
 pub const HC_MIX_4STREAM_SRC: &str =

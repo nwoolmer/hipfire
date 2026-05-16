@@ -19465,6 +19465,48 @@ impl Gpu {
     // forward bring-up lands. Replace `unimplemented!` once the underlying
     // arch crate is wired.
 
+    /// Phase 3 — `c = W_fn · x_flat + base`. Small GEMV producing the
+    /// control vector that feeds Sinkhorn normalisation.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hc_compute_control(
+        &mut self,
+        x_flat: &GpuTensor,    // [x_dim] fp16
+        w_fn: &GpuTensor,      // [n_ctrl, x_dim] fp16
+        base: &GpuTensor,      // [n_ctrl] fp16
+        c_out: &GpuTensor,     // [n_ctrl] fp32
+        n_ctrl: i32,
+        x_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_compute_control",
+            kernels::HC_COMPUTE_CONTROL_SRC, "hc_compute_control")?;
+        let func = &self.functions["hc_compute_control"];
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut xd = x_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_ctrl as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Sinkhorn-normalise a 4×4 gating matrix (in place).
     /// `matrix` is row-major 16 floats; `iters` = `hc_sinkhorn_iters`
     /// from V4F config (= 20). `eps` = `hc_eps` (= 1e-6).
