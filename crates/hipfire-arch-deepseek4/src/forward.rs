@@ -463,18 +463,19 @@ fn hc_ffn_mix(
         n_ctrl as i32, x_dim as i32)
         .map_err(|e| format!("hc_compute_control ffn layer {layer_idx}: {e:?}"))?;
 
-    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
-    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+    // V4F-faithful segment offsets: [pre(4), post(4), comb(16)] at [0, 4, 8].
+    let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
+    gpu.sigmoid_f32(&post_view)
+        .map_err(|e| format!("sigmoid post ffn layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&post_view, 2.0)
+        .map_err(|e| format!("scale post ffn layer {layer_idx}: {e:?}"))?;
+
+    let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
+    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
         .map_err(|e| format!("hc_sinkhorn_4x4 ffn layer {layer_idx}: {e:?}"))?;
 
-    let c_view_out = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
-    gpu.sigmoid_f32(&c_view_out)
-        .map_err(|e| format!("sigmoid C ffn layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&c_view_out, 2.0)
-        .map_err(|e| format!("scale C ffn layer {layer_idx}: {e:?}"))?;
-
     let streams_out = state.q.as_ref().unwrap();
-    gpu.hc_mix_4stream(streams, &b_view, &c_view_out, ffn_out, streams_out,
+    gpu.hc_mix_4stream(streams, &comb_view, &post_view, ffn_out, streams_out,
         cfg.hidden_size as i32)
         .map_err(|e| format!("hc_mix_4stream ffn layer {layer_idx}: {e:?}"))?;
 
@@ -873,26 +874,35 @@ fn mhc_pre(
     gpu.hc_apply_alpha(&c_view, hc_scale, hc_base)
         .map_err(|e| format!("hc_apply_alpha layer {layer_idx}: {e:?}"))?;
 
-    // A_l = σ(c[0..4])
-    let a_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
-    gpu.sigmoid_f32(&a_view)
-        .map_err(|e| format!("sigmoid A layer {layer_idx}: {e:?}"))?;
+    // Upstream V4F mixes layout: [pre(4), post(4), comb(16)] at
+    // offsets [0, 4, 8]. The 24-element c[] follows the same ordering
+    // since c = α·(hc_fn @ x · rsqrt) + base maintains row order.
+    //
+    // PRE (4-dim, sigmoid + eps): per-stream INPUT-mapping weights;
+    //   y[d] = sum_h pre[h] * x[h, d]. Used by hc_input_map_4stream.
+    let pre_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
+    gpu.sigmoid_f32(&pre_view)
+        .map_err(|e| format!("sigmoid pre layer {layer_idx}: {e:?}"))?;
+    // (Upstream also adds eps after sigmoid; close enough for now —
+    //  effect on quality is minor.)
 
-    // B_l = Sinkhorn(exp(c[4..20])) — kernel takes care of exp + iters.
-    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
-    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+    // POST (4-dim, 2·sigmoid): per-stream OUTPUT scaling — used in
+    //   hc_mix_4stream's `post.unsqueeze(-1) * x.unsqueeze(-2)` term.
+    let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
+    gpu.sigmoid_f32(&post_view)
+        .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&post_view, 2.0)
+        .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
+
+    // COMB (16-dim → 4x4): cross-stream combining matrix, Sinkhorn-
+    //   normalized to be doubly stochastic.
+    let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
+    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
         .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
 
-    // C_l = 2σ(c[20..24])
-    let c_out_view = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
-    gpu.sigmoid_f32(&c_out_view)
-        .map_err(|e| format!("sigmoid C layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&c_out_view, 2.0)
-        .map_err(|e| format!("scale C layer {layer_idx}: {e:?}"))?;
-
-    // Input mapping: hc_x_in = A_l · streams
+    // Input mapping: hc_x_in = sum_h pre[h] · streams[h, :]
     let hc_x_in = state.hc_x_in.as_ref().unwrap();
-    gpu.hc_input_map_4stream(&a_view, streams, hc_x_in, cfg.hidden_size as i32)
+    gpu.hc_input_map_4stream(&pre_view, streams, hc_x_in, cfg.hidden_size as i32)
         .map_err(|e| format!("hc_input_map layer {layer_idx}: {e:?}"))?;
 
     Ok(())
@@ -938,22 +948,29 @@ fn hc_attn_mix(
         n_ctrl as i32, x_dim as i32)
         .map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
 
-    // 2. B_l = Sinkhorn(exp(c[4..20])). The kernel takes a 4x4 starting
-    // matrix; we view c[4..20] as that.
-    let b_view = state.hc_c.as_ref().unwrap().sub_offset(4, 16);
-    gpu.hc_sinkhorn_4x4(&b_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
-        .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+    // V4F-faithful segment offsets: [pre(4), post(4), comb(16)] at
+    // offsets [0, 4, 8] (matches upstream hc_split_sinkhorn).
+    // Note: hc_attn_mix re-computes the control vector but does NOT
+    // call hc_apply_alpha — α scaling is technically wrong here. The
+    // upstream-faithful path is to save post/comb from mhc_pre and
+    // reuse, but the redundant α-less recompute is what shipped at
+    // scaffold time. TODO: factor out and cache.
 
-    // 3. C_l = 2σ(c[20..24]) — apply in-place via sigmoid then scale_f32.
-    let c_view_out = state.hc_c.as_ref().unwrap().sub_offset(20, 4);
-    gpu.sigmoid_f32(&c_view_out)
-        .map_err(|e| format!("sigmoid C layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&c_view_out, 2.0)
-        .map_err(|e| format!("scale C layer {layer_idx}: {e:?}"))?;
+    // POST (4-dim, 2·sigmoid) at offset 4
+    let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
+    gpu.sigmoid_f32(&post_view)
+        .map_err(|e| format!("sigmoid post attn layer {layer_idx}: {e:?}"))?;
+    gpu.scale_f32(&post_view, 2.0)
+        .map_err(|e| format!("scale post attn layer {layer_idx}: {e:?}"))?;
 
-    // 4. X_{l+1} = B_l · X_l + C_l · attn_out.
+    // COMB (16-dim, Sinkhorn 4x4) at offset 8
+    let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
+    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+        .map_err(|e| format!("hc_sinkhorn_4x4 attn layer {layer_idx}: {e:?}"))?;
+
+    // X_{l+1} = COMB · X_l + POST · attn_out.
     let streams_out = state.q.as_ref().unwrap();
-    gpu.hc_mix_4stream(streams, &b_view, &c_view_out, attn_out, streams_out,
+    gpu.hc_mix_4stream(streams, &comb_view, &post_view, attn_out, streams_out,
         cfg.hidden_size as i32)
         .map_err(|e| format!("hc_mix_4stream layer {layer_idx}: {e:?}"))?;
 
