@@ -638,13 +638,16 @@ fn attn_stub(
         ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     }
 
-    // TODO: inverse tail RoPE on attn_out_raw's last qk_rope_head_dim
-    // dims per head. Upstream applies `apply_rotary_emb(o[..., -rd:],
-    // freqs_cis, True)` to undo the RoPE that V (=K, tied) had when
-    // it was written. Without this, the rotated tail dims are summed
-    // across positions with different phases and the result has
-    // incorrect angular state. Add when we have a rope_tail_inverse
-    // kernel.
+    // Inverse tail RoPE on attn_out_raw's last qk_rope_head_dim dims
+    // per head. Undoes the RoPE that V (=K, tied) had baked in when
+    // written to the KV cache, so wo_a/wo_b sees position-agnostic
+    // angular state. Uses the pos_buf set up by apply_tail_rope earlier.
+    let pos_buf = state.pos_buf.as_ref()
+        .ok_or_else(|| "pos_buf not allocated (apply_tail_rope didn't run?)".to_string())?;
+    gpu.rope_tail_inverse(attn_out_raw, pos_buf,
+        n_heads as i32, head_dim as i32,
+        cfg.qk_rope_head_dim as i32, cfg.rope_theta,
+    ).map_err(|e| format!("rope_tail_inverse l{layer_idx}: {e:?}"))?;
 
     // O-LoRA projection: wo_a per-group + wo_b.
     //   wo_a: [n_groups * o_lora_rank, heads_per_group * head_dim] MQ4

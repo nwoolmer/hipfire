@@ -1603,3 +1603,7 @@ pub const SWA_RING_WRITE_SRC: &str =
 // Phase 4 — Tail-only RoPE:
 pub const ROPE_TAIL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_halfsplit.hip");
+
+/// Inverse tail RoPE for V4F attention output (sin negated).
+pub const ROPE_TAIL_INVERSE_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_inverse.hip");
