@@ -253,6 +253,80 @@ fn tensor_to_f32_with_optional_fp8_scale(
     to_f32(raw_data, &meta.dtype)
 }
 
+/// Convert one E2M1 nibble (4-bit FP: 1 sign + 2 exp + 1 mantissa, bias=1) to f32.
+///
+/// E2M1 codes (signed magnitude on the 3 low bits, high bit is sign):
+///   nibble & 0x7 → magnitude  → value
+///   0  → 0          → 0.0
+///   1  → denorm 0.5 → 0.5
+///   2  → normal 1.0 → 1.0
+///   3  → normal 1.5 → 1.5
+///   4  → normal 2.0 → 2.0
+///   5  → normal 3.0 → 3.0
+///   6  → normal 4.0 → 4.0
+///   7  → normal 6.0 → 6.0
+/// Sign bit: bit 3 (0x8).
+///
+/// Total range: ±6.0. Per OCP MX spec (FP4 E2M1).
+#[inline]
+fn e2m1_to_f32(nibble: u8) -> f32 {
+    // Lookup table for the 8 magnitude codes; sign is applied after.
+    const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let n = (nibble & 0x0f) as usize;
+    let mag = MAG[n & 0x7];
+    if (n & 0x8) != 0 { -mag } else { mag }
+}
+
+/// Dequantize a paired E2M1 weight + UE8M0 scale tensor to f32.
+///
+/// `storage_shape` is the byte-shape from safetensors: [rows, cols_stored]
+/// where `cols_stored = logical_cols / 2` (two E2M1 nibbles per byte; low
+/// nibble is the even logical column, high nibble is the odd column).
+/// `scale_shape` is [scale_rows, scale_cols]; the implied block size in
+/// logical-element units is [rows / scale_rows, logical_cols / scale_cols].
+/// Per V4F spec (model.py:132-137): block 32 along logical K → scale_cols
+/// = logical_cols / 32.
+///
+/// Returns row-major f32 of LOGICAL shape, length = rows * cols_stored * 2.
+fn dequantize_e2m1_ue8m0_to_f32(
+    weight_bytes: &[u8],
+    storage_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+) -> (Vec<f32>, Vec<usize>) {
+    assert_eq!(storage_shape.len(), 2, "expected 2D storage shape, got {:?}", storage_shape);
+    assert_eq!(scale_shape.len(),   2, "expected 2D scale shape, got {:?}",   scale_shape);
+    let (rows, cols_stored) = (storage_shape[0], storage_shape[1]);
+    let logical_cols = cols_stored * 2;
+    let (sr, sc) = (scale_shape[0], scale_shape[1]);
+    assert_eq!(weight_bytes.len(), rows * cols_stored, "FP4 weight byte count mismatch");
+    assert_eq!(scale_bytes.len(),  sr * sc,            "FP4 scale byte count mismatch");
+    assert!(rows % sr == 0 && logical_cols % sc == 0,
+        "FP4 scale shape {:?} doesn't tile logical weight shape [{}, {}]",
+        scale_shape, rows, logical_cols);
+    let block_rows = rows / sr;
+    let block_cols_logical = logical_cols / sc;
+
+    let mut out = vec![0.0f32; rows * logical_cols];
+    for sr_i in 0..sr {
+        for sc_j in 0..sc {
+            let scale = ue8m0_to_scale(scale_bytes[sr_i * sc + sc_j]);
+            for di in 0..block_rows {
+                let r = sr_i * block_rows + di;
+                for dj in 0..block_cols_logical {
+                    let c = sc_j * block_cols_logical + dj;
+                    // c is the LOGICAL column. Byte storing it sits at
+                    // (c / 2); low nibble for even c, high nibble for odd.
+                    let byte = weight_bytes[r * cols_stored + (c / 2)];
+                    let nibble = if (c & 1) == 0 { byte & 0x0f } else { byte >> 4 };
+                    out[r * logical_cols + c] = e2m1_to_f32(nibble) * scale;
+                }
+            }
+        }
+    }
+    (out, vec![rows, logical_cols])
+}
+
 /// Dequantize a paired E4M3 weight + UE8M0 scale tensor to f32.
 ///
 /// `weight_shape` is the LOGICAL [rows, cols] of the weight matrix.
@@ -4020,10 +4094,44 @@ fn main() {
             && name.ends_with(".weight")
             && meta.shape.len() == 2
         {
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name, raw_data, meta, &fp8_scale_for, &st_files,
-            );
-            let k = meta.shape[1];
+            // V4F routed experts are FP4 (E2M1) per upstream `inference/
+            // model.py:132-137` and config `expert_dtype:"fp4"`. Safetensors
+            // shape is [out, in/2] with each byte packing two nibbles; the
+            // paired scale tensor is `<name>.scale` UE8M0 with block size
+            // 32 along logical K. Detect via implied block size: FP4 has
+            // weight_cols * 2 / scale_cols == 32, FP8 has weight_cols /
+            // scale_cols == {16,128}.
+            //
+            // Logical shape doubles in the K dim before MQ2-Lloyd.
+            let name_owned = name.to_string();
+            let (f32_data, logical_shape) = if meta.dtype == "I8"
+                && fp8_scale_for.contains_key(&name_owned)
+            {
+                let (sfi, sname) = &fp8_scale_for[&name_owned];
+                let (smeta, sbytes) = st_files[*sfi]
+                    .tensor_data(sname)
+                    .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
+                let cols_storage = meta.shape[1];
+                let scale_cols = smeta.shape[1];
+                let logical_block_fp4 = cols_storage * 2 / scale_cols;
+                let storage_block_fp8 = cols_storage / scale_cols;
+                let is_fp4_block = logical_block_fp4 == 32 && scale_cols > 0;
+                let is_fp8_block = storage_block_fp8 == 16 || storage_block_fp8 == 128;
+                if is_fp4_block && !is_fp8_block {
+                    let (vals, logical) = dequantize_e2m1_ue8m0_to_f32(
+                        raw_data, &meta.shape, sbytes, &smeta.shape);
+                    (vals, logical)
+                } else {
+                    let vals = tensor_to_f32_with_optional_fp8_scale(
+                        name, raw_data, meta, &fp8_scale_for, &st_files);
+                    (vals, meta.shape.clone())
+                }
+            } else {
+                let vals = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                (vals, meta.shape.clone())
+            };
+            let k = logical_shape[1];
             if k % 256 == 0
                 && (use_mq4_mq2lloyd_gptq_all || use_mq4_mqlloyd_antirez_gptq
                     || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_imatrix
@@ -4039,9 +4147,9 @@ fn main() {
                 } else {
                     quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2)
                 };
-                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                    "MQ2L-V4F", name, meta.shape,
+                let shape: Vec<u32> = logical_shape.iter().map(|&s| s as u32).collect();
+                eprintln!("  {:>8}: {} storage{:?} → logical{:?} ({:.1} KB → {:.1} KB)",
+                    "MQ2L-V4F", name, meta.shape, logical_shape,
                     raw_data.len() as f64 / 1024.0,
                     q.len() as f64 / 1024.0);
                 hfq_tensors.push(HfqTensor {
@@ -4049,7 +4157,7 @@ fn main() {
                     quant_type: QuantType::MQ2G256Lloyd,
                     shape, group_size: 256, data: q, spilled_len: 0,
                 });
-                quantized_params += n_elements as u64;
+                quantized_params += (logical_shape[0] * logical_shape[1]) as u64;
                 st_files[*file_idx].drop_tensor_pages(name);
                 if let Some(ref mut s) = spill {
                     maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
@@ -4820,6 +4928,42 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2m1_lookup_matches_ocp_spec() {
+        // OCP MX FP4 (E2M1) spec values for the 8 magnitude codes.
+        // Sign bit (0x8) flips sign of the magnitude.
+        let expected: &[(u8, f32)] = &[
+            (0x0,  0.0), (0x1,  0.5), (0x2,  1.0), (0x3,  1.5),
+            (0x4,  2.0), (0x5,  3.0), (0x6,  4.0), (0x7,  6.0),
+            (0x8, -0.0), (0x9, -0.5), (0xA, -1.0), (0xB, -1.5),
+            (0xC, -2.0), (0xD, -3.0), (0xE, -4.0), (0xF, -6.0),
+        ];
+        for &(nib, want) in expected {
+            assert_eq!(e2m1_to_f32(nib), want,
+                "e2m1_to_f32(0x{:x}) = {} want {}", nib, e2m1_to_f32(nib), want);
+        }
+    }
+
+    #[test]
+    fn e2m1_dequant_unpacks_nibbles_and_doubles_logical_cols() {
+        // Storage: 1 row × 1 col-byte. Byte = 0x42 → low nibble 0x2 (=1.0),
+        // high nibble 0x4 (=2.0). Scale: 1 row × 1 col, UE8M0=127 (=2^0=1.0).
+        // → logical row should be [1.0, 2.0] (length 2).
+        let (vals, shape) = dequantize_e2m1_ue8m0_to_f32(
+            &[0x42], &[1, 1], &[127], &[1, 1]);
+        assert_eq!(shape, vec![1, 2]);
+        assert_eq!(vals, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn e2m1_dequant_applies_ue8m0_scale() {
+        // Byte = 0x12 → low=2 (=1.0), high=1 (=0.5). Scale byte 128 → 2^1=2.0.
+        // → logical [2.0, 1.0].
+        let (vals, _) = dequantize_e2m1_ue8m0_to_f32(
+            &[0x12], &[1, 1], &[128], &[1, 1]);
+        assert_eq!(vals, vec![2.0, 1.0]);
+    }
 
     #[test]
     fn parse_layer_idx_safetensors_dense() {
