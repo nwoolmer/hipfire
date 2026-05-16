@@ -375,6 +375,13 @@ pub struct DeepseekV4State {
     /// of `wq_b @ q_lat_rot`. Tail-only RoPE applied in place.
     pub q: Option<rdna_compute::GpuTensor>,
 
+    /// Joint KV stream `[n_kv_heads * head_dim = 1 * 512 = 512]` F32.
+    /// Output of `wkv @ x`. V4F uses tied K=V via this single vector
+    /// (MQA with V tied to K — see project memory for the layout
+    /// open question; revisit during numerical-correctness gate).
+    /// Tail-only RoPE applied to last `qk_rope_head_dim = 64` dims.
+    pub kv: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -404,6 +411,7 @@ impl DeepseekV4State {
             q_lat: None,
             q_lat_rot: None,
             q: None,
+            kv: None,
             _scaffold: (),
         })
     }

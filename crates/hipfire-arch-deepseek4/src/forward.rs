@@ -60,10 +60,11 @@ pub fn decode_step(
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
 
-        // iii. Joint KV: x @ wkv → kv, split into k + v.
-        //      Apply tail RoPE on k. Append k/v to SWA ring at
-        //      slot = position % 128.
-        unimplemented_step("KV joint + tail RoPE on K + SWA ring write")?;
+        // iii. Joint KV: wkv @ tmp → kv [head_dim = 512] (tied K=V).
+        //      Apply tail RoPE on the last 64 of 512 dims.
+        //      SWA ring write deferred (needs swa_k state alloc per
+        //      layer; lands in step 5).
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
 
         // iv. Indexer path (only when compress_ratio > 0):
         //     a. Compressor: x @ compressor.wkv → idx_qk
@@ -145,6 +146,54 @@ pub fn decode_step(
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// Step 4 (attention block): Joint KV projection.
+///
+/// V4F has `n_kv_heads = 1`, `head_dim = 512`, so the entire KV
+/// stream per token is one 512-dim vector. `wkv` shape on disk is
+/// `[512, 4096]` — a standard small GEMV producing 512 outputs from
+/// 4096 hidden inputs.
+///
+/// Tail-only RoPE applies to the last `qk_rope_head_dim = 64` dims.
+/// The leading 448 dims are pass-through.
+///
+/// Caller assumes `state.tmp` is still the FWHT-rotated post-RMSNorm
+/// input from `q_lora` (gemv_mq4g256_prerotated doesn't modify x).
+fn kv_joint(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let wkv = layer.wkv.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
+
+    let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+    if state.kv.is_none() {
+        state.kv = Some(gpu.alloc_tensor(&[kv_dim], DType::F32)
+            .map_err(|e| format!("alloc kv: {e:?}"))?);
+    }
+    let tmp = state.tmp.as_ref().unwrap();
+    let kv  = state.kv.as_ref().unwrap();
+
+    gpu.gemv_mq4g256_prerotated(wkv, tmp, kv, kv_dim, cfg.hidden_size)
+        .map_err(|e| format!("gemv_mq4g256 wkv layer {layer_idx}: {e:?}"))?;
+
+    // Tail-only RoPE on the last qk_rope_head_dim of kv. The rope
+    // kernel takes Q and K separately and rotates both; here we
+    // apply to KV only (Q has its own rotation when wq_b output
+    // lands — TODO once position counter and head iteration are
+    // wired). For per-head loop semantics, treat kv as 1 head of
+    // head_dim=512 — n_heads_q = 0 (no Q to rotate from this call).
+    //
+    // Skipped for now (needs pos_buf in state); rope_tail_halfsplit
+    // will be called once on (q, k) when position counter is
+    // available.
+    let _ = (kv,);
     Ok(())
 }
 
