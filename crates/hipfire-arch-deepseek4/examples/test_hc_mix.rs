@@ -61,47 +61,28 @@ fn main() -> Result<(), String> {
     ];
     let scale: Vec<f32> = vec![1.0, 0.5, 2.0, 0.25];
 
-    // x_in[s, d] = (s + 1) * 0.1 for all d (constant per stream).
-    let mut x_in_f16 = vec![0u8; 4 * HIDDEN * 2];
+    // x_in[s, d] = (s + 1) * 0.1 for all d (constant per stream). F32 now.
+    let mut x_in_f32 = vec![0.0f32; 4 * HIDDEN];
     for s in 0..4 {
         let v = ((s + 1) as f32) * 0.1;
-        let h = f32_to_f16_bits(v);
         for d in 0..HIDDEN {
-            let off = (s * HIDDEN + d) * 2;
-            x_in_f16[off] = (h & 0xFF) as u8;
-            x_in_f16[off + 1] = (h >> 8) as u8;
+            x_in_f32[s * HIDDEN + d] = v;
         }
     }
+    let t_out_f32 = vec![0.05f32; HIDDEN];
 
-    // transform_out[d] = 0.05 for all d.
-    let mut t_out_f16 = vec![0u8; HIDDEN * 2];
-    {
-        let h = f32_to_f16_bits(0.05);
-        for d in 0..HIDDEN {
-            t_out_f16[d * 2] = (h & 0xFF) as u8;
-            t_out_f16[d * 2 + 1] = (h >> 8) as u8;
-        }
-    }
-
-    let d_xin = gpu.upload_raw(&x_in_f16, &[4, HIDDEN]).map_err(|e| format!("up xin: {e:?}"))?;
+    let d_xin = gpu.upload_f32(&x_in_f32, &[4, HIDDEN]).map_err(|e| format!("up xin: {e:?}"))?;
     let d_a   = gpu.upload_f32(&a, &[4, 4]).map_err(|e| format!("up a: {e:?}"))?;
     let d_sc  = gpu.upload_f32(&scale, &[4]).map_err(|e| format!("up scale: {e:?}"))?;
-    let d_to  = gpu.upload_raw(&t_out_f16, &[HIDDEN]).map_err(|e| format!("up to: {e:?}"))?;
-    let d_xout = gpu.zeros(&[4, HIDDEN], rdna_compute::DType::F16)
+    let d_to  = gpu.upload_f32(&t_out_f32, &[HIDDEN]).map_err(|e| format!("up to: {e:?}"))?;
+    let d_xout = gpu.zeros(&[4, HIDDEN], rdna_compute::DType::F32)
         .map_err(|e| format!("zeros xout: {e:?}"))?;
 
     gpu.hc_mix_4stream(&d_xin, &d_a, &d_sc, &d_to, &d_xout, HIDDEN as i32)
         .map_err(|e| format!("dispatch: {e:?}"))?;
 
-    // Download as raw bytes via direct memcpy (no f16-typed helper exists).
-    let mut xout_bytes = vec![0u8; 4 * HIDDEN * 2];
-    gpu.hip.memcpy_dtoh(&mut xout_bytes, &d_xout.buf)
-        .map_err(|e| format!("d2h: {e:?}"))?;
-    let mut xout = vec![0.0f32; 4 * HIDDEN];
-    for i in 0..4 * HIDDEN {
-        let bits = u16::from_le_bytes([xout_bytes[i * 2], xout_bytes[i * 2 + 1]]);
-        xout[i] = f16_bits_to_f32(bits);
-    }
+    // F32 now — direct download.
+    let xout = gpu.download_f32(&d_xout).map_err(|e| format!("d2h: {e:?}"))?;
 
     // Expected: with identity A:
     //   x_out[s, d] = 1 * x_in[s, d] + scale[s] * transform_out[d]

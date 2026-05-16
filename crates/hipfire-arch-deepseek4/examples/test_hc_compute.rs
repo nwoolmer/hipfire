@@ -40,7 +40,9 @@ fn main() -> Result<(), String> {
     // base[c] = 0.5 * (c + 1)
     let base: Vec<f32> = (0..N_CTRL).map(|c| 0.5 * (c + 1) as f32).collect();
 
-    let d_x  = gpu.upload_raw(&f32_to_f16_bytes(&x_flat), &[X_DIM])
+    // x_flat is F32 (V4F residual convention); w_fn and base are F16
+    // (HFQ-converted F16 storage).
+    let d_x  = gpu.upload_f32(&x_flat, &[X_DIM])
         .map_err(|e| format!("up x: {e:?}"))?;
     let d_w  = gpu.upload_raw(&f32_to_f16_bytes(&w_fn), &[N_CTRL, X_DIM])
         .map_err(|e| format!("up w: {e:?}"))?;
