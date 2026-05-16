@@ -253,6 +253,11 @@ pub struct DeepseekV4LayerWeights {
     /// weights), so we need fast CPU access during ffn_routed. Length
     /// = n_routed_experts; empty for hash-routed layers.
     pub gate_bias_host: Vec<f32>,
+    /// Hash-routing lookup table `tid2eid[vocab_size, n_activated_
+    /// experts]` for layers 0..num_hash_layers. Each token_id maps to
+    /// a static set of K expert IDs. Empty for non-hash-routed layers.
+    /// Stored as flat row-major Vec<u32> length = vocab_size * k.
+    pub tid2eid_host: Vec<u32>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
     pub shared_w1: Option<rdna_compute::GpuTensor>,
@@ -290,7 +295,8 @@ impl DeepseekV4LayerWeights {
             compressor_wkv: None, compressor_wgate: None, compressor_norm: None,
             hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
-            gate_weight: None, gate_bias: None, gate_bias_host: Vec::new(),
+            gate_weight: None, gate_bias: None,
+            gate_bias_host: Vec::new(), tid2eid_host: Vec::new(),
             shared_w1: None, shared_w2: None, shared_w3: None,
             expert_w1_blob: None, expert_w2_blob: None, expert_w3_blob: None,
             expert_w1_ptrs: None, expert_w2_ptrs: None, expert_w3_ptrs: None,

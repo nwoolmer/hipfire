@@ -325,6 +325,26 @@ impl Architecture for DeepseekV4 {
                 layer.gate_bias_host = gpu.download_f32(&bias_gpu)
                     .map_err(|e| format!("d2h gate_bias l{l}: {e:?}"))?;
                 layer.gate_bias = Some(bias_gpu);
+            } else {
+                // Hash-routed layer: read `tid2eid` lookup table (I32 raw
+                // bytes) if present. Pre-FP4-fix HFQs skipped this tensor
+                // at quant time, in which case forward falls back to
+                // shared-only on hash layers (current default behaviour).
+                let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
+                if let Some((info, bytes)) = hfq.tensor_data(&tid_name) {
+                    if bytes.len() % 4 == 0 {
+                        let vals: Vec<u32> = bytes.chunks_exact(4)
+                            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                            .collect();
+                        let expected = info.shape.iter().product::<u32>() as usize;
+                        if vals.len() == expected {
+                            layer.tid2eid_host = vals;
+                        } else {
+                            eprintln!("deepseek4: tid2eid l{l} size mismatch \
+                                ({} vs expected {}); ignoring", vals.len(), expected);
+                        }
+                    }
+                }
             }
 
             // Shared expert.

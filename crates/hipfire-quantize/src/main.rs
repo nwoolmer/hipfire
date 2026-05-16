@@ -2335,6 +2335,11 @@ enum QuantType {
     // HFQ1G128 = 21 which was reserved earlier on the feat/hfq1g128-perf-wins branch.
     HFP4G32 = 30,      // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
     MFP4G32 = 33,      // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    /// Raw I32 array (no quantization, no GPU upload by the engine loader).
+    /// Used for V4F's hash-routing `tid2eid` table — `[vocab_size, n_activated_experts]`
+    /// of expert IDs (range 0..255). Stored row-major LE bytes; consumers (arch
+    /// loaders) read via tensor_data() and reinterpret.
+    I32 = 22,
     // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
     // HFP4G16     = 31, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
     // HFP4G64     = 32, // v1.5 — RDNA1/2 sweet-spot ablation
@@ -4059,13 +4064,34 @@ fn main() {
         total_params += n_elements as u64;
 
         // V4F's `tid2eid` hash-routing tables are I64 integer lookups,
-        // not weights. The forward path (when it lands) needs them, but
-        // Phase 1 ingest skips them: they don't go through quantization
-        // and the existing pass-through plumbing only handles float
-        // dtypes. Re-add as raw bytes in a follow-up when forward
-        // bring-up needs them.
+        // not weights. Indices are 0..255 (n_routed_experts), so we
+        // downcast to I32 to halve storage and pass through as raw
+        // bytes with quant_type = I32 (22). Arch loaders read via
+        // tensor_data() and reinterpret as &[i32]. Other I64 tensors
+        // (none expected on V4F) get the legacy skip.
         if meta.dtype == "I64" {
-            eprintln!("  [skip-I64] {} {:?} ({} elements) — hash-routing table, restore in forward bring-up",
+            if is_v4f && name.ends_with(".tid2eid") {
+                // Convert i64 LE → i32 LE.
+                let i32_bytes: Vec<u8> = raw_data.chunks_exact(8)
+                    .flat_map(|w| {
+                        let v = i64::from_le_bytes(w.try_into().unwrap()) as i32;
+                        v.to_le_bytes()
+                    })
+                    .collect();
+                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+                eprintln!("  {:>8}: {} {:?} → I32 ({} elements, {:.1} KB)",
+                    "I32-V4F", name, meta.shape, n_elements,
+                    i32_bytes.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::I32,
+                    shape, group_size: 1, data: i32_bytes, spilled_len: 0,
+                });
+                quantized_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            eprintln!("  [skip-I64] {} {:?} ({} elements) — unsupported I64 tensor",
                 name, meta.shape, n_elements);
             skipped_params += n_elements as u64;
             continue;
