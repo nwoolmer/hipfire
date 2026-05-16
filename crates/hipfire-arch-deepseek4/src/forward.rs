@@ -58,13 +58,14 @@ pub fn decode_step(
         // Wire those into hc_compute_control as `α · (X · W) + base`
         // and retry. For now: pipeline runs HC-disabled producing
         // bounded but architecturally-trivial logits.
-        // mHC + α scaling: full paper-faithful path. Still produces
-        // overflow at runtime — likely the (8 × V) attn_out
-        // amplification per layer compounding. DISABLED until V4F
-        // attention is real (then transform_out shrinks).
+        // mHC DISABLED — same 4.27e37 magnitude overflow regardless
+        // of activation chain (sigmoid, exp + tight clamp, α scaling
+        // all attempted). Looks like a kernel-level issue not a math
+        // issue — possibly a parameter mismatch or uninitialized
+        // buffer read in hc_compute_control or hc_mix_4stream when
+        // chained 43 times. Needs intermediate-state logging to pin
+        // down. Reverted to stable: stream0 → hc_x_in.
         let _ = mhc_pre;
-
-        // Direct stream0 → hc_x_in for q_lora's transform input.
         {
             let streams = state.residual_streams.as_ref().unwrap();
             if state.hc_x_in.is_none() {
@@ -108,7 +109,6 @@ pub fn decode_step(
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // mHC mix disabled — uses too much amplified attn_out.
         let _ = hc_attn_mix;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
@@ -117,7 +117,6 @@ pub fn decode_step(
         // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
         // same kernel sequence as HC attn mix. Real FFN expert
         // dispatch lands in a follow-up (MoE routing complexity).
-        // FFN disabled with HC.
         ffn_zero(cfg, state, gpu)?;
         let _ = ffn_stub;
         let _ = hc_ffn_mix;

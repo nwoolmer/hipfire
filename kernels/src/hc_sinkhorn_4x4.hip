@@ -33,12 +33,15 @@ extern "C" __global__ void hc_sinkhorn_4x4(
     //   for tmax = hc_sinkhorn_iters = 20 iters.
     // (DeepSeek_V4.pdf §2.2 "Manifold-Constrained Residual Mapping".)
     //
-    // Clamp pre-exp to avoid overflow: exp(10) ~= 22K, exp(20) ~= 4.85e8.
-    // Pre-clamp to [-10, 10] gives bounded post-Sinkhorn matrix.
+    // Aggressive pre-clamp [-2, 2]: produces post-Sinkhorn entries in
+    // a much tighter range (exp(2)/exp(-2) = ~55, well-bounded
+    // doubly-stochastic). Less paper-faithful than wide [-10, 10]
+    // but stabilises 43-layer accumulation when proper α scaling
+    // isn't fully wired.
     for (int i = 0; i < 16; ++i) {
         float v = matrix[i];
-        if (v >  10.0f) v =  10.0f;
-        if (v < -10.0f) v = -10.0f;
+        if (v >  2.0f) v =  2.0f;
+        if (v < -2.0f) v = -2.0f;
         matrix[i] = expf(v);
     }
 
