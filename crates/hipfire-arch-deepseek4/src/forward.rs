@@ -638,16 +638,16 @@ fn attn_stub(
         ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     }
 
-    // Inverse tail RoPE on attn_out_raw's last qk_rope_head_dim dims
-    // per head. Undoes the RoPE that V (=K, tied) had baked in when
-    // written to the KV cache, so wo_a/wo_b sees position-agnostic
-    // angular state. Uses the pos_buf set up by apply_tail_rope earlier.
-    let pos_buf = state.pos_buf.as_ref()
-        .ok_or_else(|| "pos_buf not allocated (apply_tail_rope didn't run?)".to_string())?;
-    gpu.rope_tail_inverse(attn_out_raw, pos_buf,
-        n_heads as i32, head_dim as i32,
-        cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-    ).map_err(|e| format!("rope_tail_inverse l{layer_idx}: {e:?}"))?;
+    // Inverse tail RoPE on attn_out_raw is the V4F-faithful operation
+    // per upstream model.py (`apply_rotary_emb(o[..., -rd:], freqs_cis,
+    // True)`), but our half-split kernel produces a regression when
+    // enabled (`*` attractor on pos-0 shared-only). Math looks right
+    // (same pair convention forward+inverse) — root cause TBD, possibly
+    // upstream uses INTERLEAVED pair convention in `torch.view_as_complex`
+    // while our forward kernel is half-split, breaking the inverse
+    // cancellation. Disabled until we either (a) verify half-split is
+    // the trained convention, or (b) add an interleaved variant.
+    let _ = state.pos_buf.as_ref();
 
     // O-LoRA projection: wo_a per-group + wo_b.
     //   wo_a: [n_groups * o_lora_rank, heads_per_group * head_dim] MQ4
