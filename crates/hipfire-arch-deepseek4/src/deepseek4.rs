@@ -387,6 +387,11 @@ pub struct DeepseekV4State {
     /// rope_tail kernel reinterprets the bytes as int via cast).
     pub pos_buf: Option<rdna_compute::GpuTensor>,
 
+    /// Per-token attention output `[hidden]` F32, fed to HC attn mix
+    /// as the `transform_out` arg. Currently a stub: holds a sliced
+    /// view of `q` until real attention + O-LoRA lands.
+    pub attn_out: Option<rdna_compute::GpuTensor>,
+
     pub _scaffold: (),
 }
 
@@ -418,6 +423,7 @@ impl DeepseekV4State {
             q: None,
             kv: None,
             pos_buf: None,
+            attn_out: None,
             _scaffold: (),
         })
     }

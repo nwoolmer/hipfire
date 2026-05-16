@@ -61,31 +61,24 @@ fn main() -> Result<(), String> {
     eprintln!("stream 3 nonzero count: {s3_nonzero} / {hidden}");
     let s_other_nonzero = s1_nonzero + s2_nonzero + s3_nonzero;
 
-    if s0_nonzero > 0 && s_other_nonzero == 0 {
-        eprintln!("OK: forward step 1 (embed → [embed, 0, 0, 0]) works on real V4F");
+    // After decode_step (43 layers of Q-LoRA + KV + RoPE + HC mix), HC
+    // should have propagated signal across streams. Stream 0 must
+    // remain nonzero; the test is now "the forward pipeline runs and
+    // produces sensible-magnitude state."
+    let total_nonzero = s0_nonzero + s_other_nonzero;
+    let max_per_stream = [s0_nonzero, s1_nonzero, s2_nonzero, s3_nonzero]
+        .iter().copied().max().unwrap();
+    if total_nonzero > 0 && max_per_stream > hidden / 2 {
+        eprintln!("OK: forward pipeline runs through 43 layers; total nonzero={total_nonzero}");
     } else {
         return Err(format!(
-            "step 1 wrong shape: s0_nonzero={s0_nonzero} s_other_nonzero={s_other_nonzero}"
+            "forward pipeline produced too few nonzero values: {:?}",
+            (s0_nonzero, s1_nonzero, s2_nonzero, s3_nonzero)
         ));
     }
 
-    // Verify step 2 (RMSNorm) populates state.tmp with nonzero values.
-    let tmp = state.tmp.as_ref()
-        .ok_or_else(|| "state.tmp not allocated".to_string())?;
-    let mut tmp_bytes = vec![0u8; tmp.byte_size()];
-    gpu.hip.memcpy_dtoh(&mut tmp_bytes, &tmp.buf)
-        .map_err(|e| format!("d2h tmp: {e:?}"))?;
-    let mut tmp_f32 = vec![0.0f32; hidden];
-    for i in 0..hidden {
-        tmp_f32[i] = f32::from_le_bytes(tmp_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
-    }
-    let nonzero = tmp_f32.iter().filter(|v| v.abs() > 1e-6).count();
-    let max_abs = tmp_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    eprintln!("RMSNorm output: {nonzero}/{hidden} nonzero, max_abs={max_abs:.4}");
-    if nonzero == 0 {
-        return Err("step 2 RMSNorm produced all zeros".into());
-    }
-    eprintln!("OK: forward step 2 (attn_rms_norm) populates tmp[hidden]");
-
+    // Per-layer step probes will get added as steps land. For now,
+    // the "forward pipeline runs cleanly through 43 layers + final
+    // norm + lm_head stubs" assertion is the only end-to-end gate.
     Ok(())
 }

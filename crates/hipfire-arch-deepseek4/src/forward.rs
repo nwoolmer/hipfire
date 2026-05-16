@@ -85,23 +85,19 @@ pub fn decode_step(
             unimplemented_step("indexer score → top_k → KV gather")?;
         }
 
-        // v. Main attention over (SWA window ∪ gathered top-k).
-        //    Q[n_heads, head_dim] · concat(swa_k, k_gathered)[n_kv_heads, head_dim, m].
-        //    Output: attn_out [n_heads, head_dim].
-        //    Uses: existing FlashAttention kernel with `start_pos` wrap parameter
-        //    (Phase 4 modification — needs adding).
-        unimplemented_step("main attention over SWA + gathered")?;
+        // v + vi. Main attention + O-LoRA — STUB.
+        //
+        // Real impl needs: SWA-windowed FlashAttn + indexer gather +
+        // O-LoRA (whose wo_a/wo_b shapes don't match standard LoRA
+        // factorization — paper-verification TODO).
+        //
+        // Stub: set attn_out = stream0 (a no-op identity). Lets the
+        // HC mix downstream still exercise the full pipeline; the
+        // numerical output is meaningless until real attention lands.
+        attn_stub(cfg, state, gpu, layer_idx)?;
 
-        // vi. O-LoRA: attn_out @ wo_a → o_lat, o_lat @ wo_b → x_attn
-        unimplemented_step("O-LoRA")?;
-
-        // vii. Hyper-Connection mix for attention block:
-        //      a. `gpu.hc_compute_control(x_flat, hc_attn_fn, hc_attn_base, c_ctrl)`
-        //      b. Interpret first 16 entries of c_ctrl as a 4x4 matrix.
-        //      c. `gpu.hc_sinkhorn_4x4(A, eps = hc_eps, iters = hc_sinkhorn_iters)`
-        //      d. `gpu.hc_mix_4stream(x_in = streams, A, scale = hc_attn_scale, transform_out = x_attn, x_out)`
-        //      e. Update residual_streams = x_out.
-        unimplemented_step("HC attn mix")?;
+        // vii. HC attn mix.
+        hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         //
@@ -149,6 +145,102 @@ pub fn decode_step(
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
+    Ok(())
+}
+
+/// Step 6/7 STUB (attention + O-LoRA placeholder).
+///
+/// Real attention + O-LoRA pending: V4F's wo_a [8192, 4096] and
+/// wo_b [4096, 8192] shapes don't match standard LoRA-of-attention-
+/// output factorization. The o_groups=8 config field hints at a
+/// grouped-projection pattern — needs paper verification.
+///
+/// Stub: copies stream0 into attn_out. Numerically meaningless but
+/// keeps the HC mix downstream consuming a sensibly-shaped tensor.
+fn attn_stub(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    _layer_idx: usize,
+) -> Result<(), String> {
+    if state.attn_out.is_none() {
+        state.attn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc attn_out: {e:?}"))?);
+    }
+    let streams = state.residual_streams.as_ref().unwrap();
+    let attn_out = state.attn_out.as_ref().unwrap();
+    let bytes = cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&attn_out.buf, &streams.buf, bytes)
+        .map_err(|e| format!("d2d stub attn_out: {e:?}"))?;
+    Ok(())
+}
+
+/// Step 8 (attention block): Hyper-Connection mix.
+///
+///   c     = hc_attn_fn @ x_flat + hc_attn_base   [24]
+///   A     = sinkhorn(c reshaped to 4x4, eps, iters)
+///   x_out = A · x_in + scale[s] · transform_out
+///
+/// Then residual_streams = x_out.
+///
+/// First 16 entries of c interpreted as the 4x4 mixing matrix.
+/// Per the Phase 3 design doc, the [24]-vector decomposition is
+/// `16 + 4 + 4` (matrix + bias + scale) but verifying which slice
+/// is which awaits paper read. For now we take the first 16 floats
+/// as a row-major 4x4.
+fn hc_attn_mix(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let hc_fn    = layer.hc_attn_fn.as_ref().unwrap();
+    let hc_base  = layer.hc_attn_base.as_ref().unwrap();
+    let hc_scale = layer.hc_attn_scale.as_ref().unwrap();
+    let streams = state.residual_streams.as_ref().unwrap();
+    let attn_out = state.attn_out.as_ref().unwrap();
+
+    // Allocate small scratch on demand: c_ctrl [24] F32, a 4x4 view
+    // is the first 16 elements (treat as [4, 4]).
+    let n_ctrl = 24;  // V4F hc_attn_fn shape [24, 16384]
+    let x_dim = cfg.hidden_size * cfg.hc_mult;  // 4096 * 4 = 16384
+
+    // c_ctrl scratch: alloc once and stash on state.tmp? tmp is
+    // [hidden=4096] which is too big for the [24] output but the
+    // pool allows oversized writes. Use a sub-view to be safe.
+    let c_view = state.tmp.as_ref().unwrap().sub_offset(0, n_ctrl);
+
+    // 1. Control vector. hc_fn is F16 on disk; the kernel expects F16
+    // (per its signature). hc_base is F16 too. Output is F32.
+    gpu.hc_compute_control(
+        streams /* x_flat: streams memory is contiguous [4, hidden] */,
+        hc_fn, hc_base, &c_view,
+        n_ctrl as i32, x_dim as i32,
+    ).map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
+
+    // 2. Sinkhorn-normalise the first 16 entries as a 4x4 matrix.
+    // c_view is [24] but sinkhorn expects [16]. Build a 16-elem view
+    // over the same memory.
+    let a_view = state.tmp.as_ref().unwrap().sub_offset(0, 16);
+    gpu.hc_sinkhorn_4x4(&a_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
+        .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
+
+    // 3. Mix: streams_out = A · streams + scale · attn_out.
+    // Need a destination buffer different from streams. Reuse `q` for
+    // now (~32K F32, more than enough for [4, 4096]) — overwritten
+    // next layer.
+    let streams_out = state.q.as_ref().unwrap();
+    gpu.hc_mix_4stream(
+        streams, &a_view, hc_scale, attn_out, streams_out,
+        cfg.hidden_size as i32,
+    ).map_err(|e| format!("hc_mix_4stream layer {layer_idx}: {e:?}"))?;
+
+    // Copy back into residual_streams.
+    let bytes = cfg.hc_mult * cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
+        .map_err(|e| format!("d2d hc_mix → streams: {e:?}"))?;
     Ok(())
 }
 
