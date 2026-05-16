@@ -327,4 +327,61 @@ mod tests {
         assert_eq!(raw.sliding_window, 128);
         assert_eq!(raw.compress_ratios.len(), 8);
     }
+
+    /// Verify the parser handles the actual released V4F config.json
+    /// (snapshot 6976c7ff). Catches schema drift if the upstream
+    /// model card adds or renames fields.
+    #[test]
+    fn parses_real_v4f_config_json() {
+        let real_config_path =
+            "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
+             snapshots/6976c7ff1b30a1b2cb7805021b8ba4684041f136/config.json";
+        let raw_json = match std::fs::read_to_string(real_config_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("skipping real-config test — V4F not locally available");
+                return;
+            }
+        };
+        // Real config has extra fields beyond what RawDeepseekV4Config
+        // reads (architectures, attention_bias, etc). serde silently
+        // ignores them — verify we still parse the fields we care about.
+        let raw: RawDeepseekV4Config = serde_json::from_str(&raw_json)
+            .expect("real V4F config.json must parse — schema drift detected");
+
+        // Cross-check against the documented V4F constants.
+        assert_eq!(raw.num_hidden_layers, 43);
+        assert_eq!(raw.head_dim, 512);
+        assert_eq!(raw.qk_rope_head_dim, 64);
+        assert_eq!(raw.q_lora_rank, 1024);
+        assert_eq!(raw.o_lora_rank, 1024);
+        assert_eq!(raw.n_routed_experts, 256);
+        assert_eq!(raw.num_experts_per_tok, 6);
+        assert_eq!(raw.hc_mult, 4);
+        assert_eq!(raw.index_n_heads, 64);
+        assert_eq!(raw.sliding_window, 128);
+
+        // The released checkpoint's compress_ratios has length
+        // num_hidden_layers + num_nextn_predict_layers = 44.
+        assert_eq!(
+            raw.compress_ratios.len(),
+            raw.num_hidden_layers + raw.num_nextn_predict_layers
+        );
+
+        // Check the alternating pattern in the middle layers.
+        // V4F shipped pattern: [0, 0, 4, 128, 4, 128, ..., 4, 0].
+        for (i, &r) in raw.compress_ratios.iter().enumerate() {
+            if i < 2 || i == raw.compress_ratios.len() - 1 {
+                assert_eq!(r, 0, "layer {i}: expected ratio=0, got {r}");
+            } else {
+                let expected = if i % 2 == 0 { 4 } else { 128 };
+                assert_eq!(r, expected, "layer {i}: expected ratio={expected}, got {r}");
+            }
+        }
+
+        // Verify DeepseekV4State::new accepts the real config.
+        // (Reconstruct the full Config from raw to drive State::new.)
+        // Skip — would require a fake HfqFile. The shape test above
+        // is enough for the schema-drift gate.
+    }
 }
