@@ -19503,6 +19503,238 @@ impl Gpu {
         }
     }
 
+    /// Phase 3 — Mix 4 residual streams via gating matrix + transform output.
+    /// `x_out[s, d] = sum_t(A[s, t] * x_in[t, d]) + scale[s] * transform_out[d]`.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hc_mix_4stream(
+        &mut self,
+        x_in: &GpuTensor,            // [4, hidden] fp16
+        a_matrix: &GpuTensor,        // [4, 4] fp32 (post-Sinkhorn)
+        scale: &GpuTensor,           // [4] fp32
+        transform_out: &GpuTensor,   // [hidden] fp16
+        x_out: &GpuTensor,           // [4, hidden] fp16
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_mix_4stream", kernels::HC_MIX_4STREAM_SRC, "hc_mix_4stream")?;
+        let func = &self.functions["hc_mix_4stream"];
+        let xi  = x_in.buf.as_ptr();
+        let am  = a_matrix.buf.as_ptr();
+        let sc  = scale.buf.as_ptr();
+        let to  = transform_out.buf.as_ptr();
+        let xo  = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &xi as *const _ as *mut c_void,
+            &am as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &to as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 4, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 4 — Tail-only partial RoPE (V4F's last 64 of 512 head_dim).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn rope_tail_halfsplit(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,   // [1] i32, position index
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,            // qk_rope_head_dim
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_halfsplit",
+            kernels::ROPE_TAIL_HALFSPLIT_SRC,
+            "rope_tail_halfsplit_f32",
+        )?;
+        let func = &self.functions["rope_tail_halfsplit_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(half + 31) / 32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Compressed-K scoring (Q · K^T over indexer-compressed positions).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_compressed_k_score(
+        &mut self,
+        q_idx: &GpuTensor,         // [H, D] fp16
+        k_idx_cache: &GpuTensor,   // [H, D, N] fp16
+        scores: &GpuTensor,        // [H, N] fp32
+        n_idx_heads: i32,
+        idx_head_dim: i32,
+        n_compressed: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_compressed_k_score",
+            kernels::INDEXER_COMPRESSED_K_SCORE_SRC,
+            "indexer_compressed_k_score",
+        )?;
+        let func = &self.functions["indexer_compressed_k_score"];
+        let qp = q_idx.buf.as_ptr();
+        let kp = k_idx_cache.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut d  = idx_head_dim;
+        let mut nc = n_compressed;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        // grid.x = heads, grid.y = ceil(N / TILE_POSITIONS=8)
+        let grid_y = ((n_compressed + 7) / 8).max(1) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, grid_y, 1],
+                [64, 1, 1],  // THREADS_PER_BLOCK
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Per-head top-k selection.
+    pub fn indexer_top_k(
+        &mut self,
+        scores: &GpuTensor,         // [H, N] fp32
+        top_indices: &GpuTensor,    // [H, K] i32
+        n_idx_heads: i32,
+        n_compressed: i32,
+        k: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("indexer_top_k", kernels::INDEXER_TOP_K_SRC, "indexer_top_k")?;
+        let func = &self.functions["indexer_top_k"];
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut nc = n_compressed;
+        let mut kk = k;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        // shared mem = n_compressed bytes for the `taken` flag array.
+        let smem = n_compressed as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, 1, 1],
+                [1, 1, 1],  // stub single-thread per head
+                smem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Gather raw K/V rows from main cache at indexer indices.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_kv_gather(
+        &mut self,
+        k_main_cache: &GpuTensor,
+        v_main_cache: &GpuTensor,
+        unique_indices: &GpuTensor,
+        k_gathered: &GpuTensor,
+        v_gathered: &GpuTensor,
+        n_kv_heads: i32,
+        head_dim: i32,
+        max_seq: i32,
+        n_unique: i32,
+        compress_ratio: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_kv_gather",
+            kernels::INDEXER_KV_GATHER_SRC,
+            "indexer_kv_gather",
+        )?;
+        let func = &self.functions["indexer_kv_gather"];
+        let kc = k_main_cache.buf.as_ptr();
+        let vc = v_main_cache.buf.as_ptr();
+        let ui = unique_indices.buf.as_ptr();
+        let kg = k_gathered.buf.as_ptr();
+        let vg = v_gathered.buf.as_ptr();
+        let mut nh  = n_kv_heads;
+        let mut hd  = head_dim;
+        let mut ms  = max_seq;
+        let mut nu  = n_unique;
+        let mut cr  = compress_ratio;
+        let mut params: Vec<*mut c_void> = vec![
+            &kc as *const _ as *mut c_void,
+            &vc as *const _ as *mut c_void,
+            &ui as *const _ as *mut c_void,
+            &kg as *const _ as *mut c_void,
+            &vg as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_unique as u32, n_kv_heads as u32, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
