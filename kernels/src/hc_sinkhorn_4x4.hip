@@ -28,30 +28,35 @@ extern "C" __global__ void hc_sinkhorn_4x4(
 ) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;  // stub: single-thread.
 
-    // Sinkhorn requires non-negative input. The HC control vector
-    // (c = W_fn @ x + base) can be mixed-sign; abs() it to guarantee
-    // bounded output. Paper-canonical preprocessing may be
-    // exp()/softplus/etc instead — to verify. abs is a safe lower
-    // bound: it preserves magnitude order, kills sign.
+    // V4F mHC Sinkhorn-Knopp:
+    //   M^(0) = exp(B̃_l), then alternating column-row normalization
+    //   for tmax = hc_sinkhorn_iters = 20 iters.
+    // (DeepSeek_V4.pdf §2.2 "Manifold-Constrained Residual Mapping".)
+    //
+    // Clamp pre-exp to avoid overflow: exp(10) ~= 22K, exp(20) ~= 4.85e8.
+    // Pre-clamp to [-10, 10] gives bounded post-Sinkhorn matrix.
     for (int i = 0; i < 16; ++i) {
         float v = matrix[i];
-        matrix[i] = v < 0.0f ? -v : v;
+        if (v >  10.0f) v =  10.0f;
+        if (v < -10.0f) v = -10.0f;
+        matrix[i] = expf(v);
     }
 
+    // Paper: M^(t) = T_r(T_c(M^(t-1))) — column then row per iter.
     for (int it = 0; it < iters; ++it) {
-        // Row normalisation: each row sums to 1.
-        for (int r = 0; r < 4; ++r) {
-            float sum = 0.0f;
-            for (int c = 0; c < 4; ++c) sum += matrix[r * 4 + c];
-            sum += eps;
-            for (int c = 0; c < 4; ++c) matrix[r * 4 + c] /= sum;
-        }
-        // Column normalisation: each column sums to 1.
+        // Column normalisation.
         for (int c = 0; c < 4; ++c) {
             float sum = 0.0f;
             for (int r = 0; r < 4; ++r) sum += matrix[r * 4 + c];
             sum += eps;
             for (int r = 0; r < 4; ++r) matrix[r * 4 + c] /= sum;
+        }
+        // Row normalisation.
+        for (int r = 0; r < 4; ++r) {
+            float sum = 0.0f;
+            for (int c = 0; c < 4; ++c) sum += matrix[r * 4 + c];
+            sum += eps;
+            for (int c = 0; c < 4; ++c) matrix[r * 4 + c] /= sum;
         }
     }
 }
