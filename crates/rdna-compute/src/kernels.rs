@@ -1617,3 +1617,10 @@ pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
     include_str!("../../../kernels/src/hc_head_compute_pre.hip");
+
+/// V4F Compressor softmax-weighted pool along window dim.
+/// Used in Compressor.forward when should_compress fires every
+/// `ratio` steps, to produce a single compressed KV vector from
+/// T accumulated step values.
+pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
+    include_str!("../../../kernels/src/compressor_softmax_pool.hip");

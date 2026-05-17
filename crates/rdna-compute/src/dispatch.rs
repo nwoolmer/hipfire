@@ -19550,6 +19550,46 @@ impl Gpu {
         }
     }
 
+    /// V4F Compressor softmax-weighted pool. Compresses `T` window
+    /// positions of (kv_state, score_state) into one `head_dim` output:
+    ///   output[d] = sum_t softmax_t(score_state[:, d])[t] * kv_state[t, d]
+    pub fn compressor_softmax_pool_f32(
+        &mut self,
+        kv_state: &GpuTensor,     // [T, head_dim] F32
+        score_state: &GpuTensor,  // [T, head_dim] F32
+        output: &GpuTensor,       // [head_dim] F32
+        t: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_softmax_pool",
+            kernels::COMPRESSOR_SOFTMAX_POOL_SRC,
+            "compressor_softmax_pool_f32",
+        )?;
+        let func = &self.functions["compressor_softmax_pool_f32"];
+        let kp = kv_state.buf.as_ptr();
+        let sp = score_state.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let mut tv = t;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut tv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((head_dim as u32) + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid, 1, 1], [block, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// V4F head HC mix — compute the per-stream `pre` weights for the
     /// 4-stream → hidden projection before lm_head. Matches upstream
     /// `ParallelHead.hc_head`.
