@@ -839,10 +839,11 @@ fn ffn_routed(
         gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
             .map_err(|e| format!("gemv expert_w2 l{layer_idx} e{expert_id}: {e:?}"))?;
         // ffn_out += routing_weight[k] * routed_scaling_factor * expert_out
-        // Default route_scale=1.0 (empirical optimum) vs upstream's
-        // routed_scaling_factor=1.5. See post_scale comment.
+        // Antirez DS4_EXPERT_WEIGHT_SCALE = 1.5 (ds4.c:54). Equivalent to
+        // V4F config's routed_scaling_factor = 1.5. Env override kept for
+        // diagnostics but default is now upstream-faithful.
         let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
         let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
@@ -1560,23 +1561,28 @@ fn mhc_pre(
     //
     // PRE (4-dim, sigmoid + eps): per-stream INPUT-mapping weights;
     //   y[d] = sum_h pre[h] * x[h, d]. Used by hc_input_map_4stream.
+    //
+    // Antirez ds4 (ds4.c:4202): `pre[i] = sigmoid(...) + DS4_HC_EPS`
+    // where DS4_HC_EPS = 1e-6 (matches our cfg.hc_eps). The eps is tiny
+    // but applied uniformly across all 4 streams — its omission shifts
+    // every stream by zero in the limit so quality is unchanged here,
+    // kept aligned for clarity.
     let pre_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
     gpu.sigmoid_f32(&pre_view)
         .map_err(|e| format!("sigmoid pre layer {layer_idx}: {e:?}"))?;
-    // (Upstream also adds eps after sigmoid; close enough for now —
-    //  effect on quality is minor.)
 
-    // POST (4-dim, scale·sigmoid): per-stream OUTPUT scaling — used in
-    //   hc_mix_4stream's `post.unsqueeze(-1) * x.unsqueeze(-2)` term.
-    // Upstream V4F uses `2*sigmoid(...)` but a 4×3 sweep at ctx=128 shows
-    // the empirical optimum is post=0.75 + route_scale=1.0 (ppl=18.0k vs
-    // upstream-faithful 2.0×1.5 giving 68k). The mismatch likely
-    // reflects an accumulated magnitude error in our quantized forward.
+    // POST (4-dim, 2·sigmoid): per-stream OUTPUT scaling. Antirez ds4
+    // (hc_split_sinkhorn_one, ds4.c:4205-4208): `out[off] = 2.0 / (1.0 +
+    // exp(-z))` where z = mix[off] * scale[1] + base[off]. The factor 2
+    // is hardcoded; the learned per-layer scale[1] was already applied
+    // via hc_apply_alpha above (c[4..8] = α[1]*mix + base[1]). So our
+    // sigmoid(c) * post_scale matches antirez when post_scale=2.0.
+    // Env override kept for diagnostics.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
     let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.75);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
     gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 
