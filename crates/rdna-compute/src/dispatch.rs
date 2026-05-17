@@ -19677,17 +19677,22 @@ impl Gpu {
 
     /// V4F indexer-extended attention K/V gather. Reads from
     /// `main_kv_cache` [N_compressed, head_dim] at the indices given by
-    /// `topk_idx` [K] and writes [head_dim, K] (n_kv=1 implicit) into
-    /// `out` — matching the layout expected by the modified SWA kernel.
-    /// Sentinel `topk_idx[k] = -1` (or out-of-range) writes zeros.
+    /// `topk_idx` [K] and writes into columns `[col_offset, col_offset+K)`
+    /// of an [n_kv=1, head_dim, out_stride] output tensor — letting the
+    /// caller stage the gather into a buffer whose first `col_offset`
+    /// columns hold raw SWA window K/V. Sentinel `topk_idx[k] = -1` (or
+    /// out-of-range) writes zeros.
+    #[allow(clippy::too_many_arguments)]
     pub fn v4f_topk_kv_gather_f32(
         &mut self,
         kv_cache: &GpuTensor,    // [N_compressed, head_dim] F32
         topk_idx: &GpuTensor,    // [K] i32
-        out: &GpuTensor,         // [head_dim, K] F32 (n_kv=1)
+        out: &GpuTensor,         // [head_dim, out_stride] F32 (n_kv=1)
         k_active: i32,
         head_dim: i32,
         n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -19702,6 +19707,8 @@ impl Gpu {
         let mut k = k_active;
         let mut hd = head_dim;
         let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
         let mut params: Vec<*mut c_void> = vec![
             &cp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -19709,11 +19716,77 @@ impl Gpu {
             &mut k as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
         ];
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [k_active as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F indexer-extended SWA attention. Reads from the SWA ring
+    /// buffer (`swa_k/v` [n_kv=1, head_dim, swa_window]) AND the
+    /// indexer-gathered top-K K/V (`topk_k/v` [n_kv=1, head_dim,
+    /// topk_window]) under a single joint softmax with `attn_sink` as
+    /// an extra entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_topk_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor, swa_v: &GpuTensor,
+        topk_k: &GpuTensor, topk_v: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32, head_dim: i32,
+        swa_window: i32, topk_window: i32,
+        n_valid_swa: i32, n_active_topk: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_attn_swa_topk",
+            kernels::V4F_ATTN_SWA_TOPK_SRC,
+            "v4f_attn_swa_topk_f32",
+        )?;
+        let func = &self.functions["v4f_attn_swa_topk_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let tkp = topk_k.buf.as_ptr();
+        let tvp = topk_v.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut vsw = n_valid_swa;
+        let mut atk = n_active_topk;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tkp as *const _ as *mut c_void,
+            &tvp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut vsw as *mut _ as *mut c_void,
+            &mut atk as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
                 [head_dim as u32, 1, 1],
                 0,
                 self.stream_ref(),

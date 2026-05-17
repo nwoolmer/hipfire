@@ -1349,15 +1349,15 @@ fn mhc_pre(
 
     // POST (4-dim, scale·sigmoid): per-stream OUTPUT scaling — used in
     //   hc_mix_4stream's `post.unsqueeze(-1) * x.unsqueeze(-2)` term.
-    // Upstream V4F uses `2*sigmoid(...)` but 2D sweep at ctx=128 shows
-    // empirical optimum is post=0.5 + route_scale=1.0 (ppl=19k vs
+    // Upstream V4F uses `2*sigmoid(...)` but a 4×3 sweep at ctx=128 shows
+    // the empirical optimum is post=0.75 + route_scale=1.0 (ppl=18.0k vs
     // upstream-faithful 2.0×1.5 giving 68k). The mismatch likely
     // reflects an accumulated magnitude error in our quantized forward.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
     let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.75);
     gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 

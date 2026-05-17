@@ -1,28 +1,29 @@
 // V4F indexer-extended attention: gather K/V rows from main_kv_cache
-// at indexer's top-K compressed-slot indices, lay out as
-// [n_kv, head_dim, K_active] to match v4f_attn_swa's swa_k layout.
+// at indexer's top-K compressed-slot indices, lay out as a column-slab
+// of an [n_kv=1, head_dim, out_stride] tensor — writing columns
+// [col_offset, col_offset + K).
 //
-// V4F has n_kv = 1 and tied K=V, so the gather produces one tensor
-// reused as both K and V by the consumer kernel. We still take an
-// `n_kv` parameter for future generalization.
+// This lets the caller stage the gather into an extension of the SWA
+// buffer: combined[:, :win] holds raw SWA window K/V; this kernel
+// writes combined[:, win:win+K] from main_kv_cache.
 //
-// Grid:
-//   block.x = K_active (one block per gathered slot)
-//   block dim = head_dim (one thread per D)
+// V4F has n_kv = 1 and tied K=V, so this kernel emits one buffer and
+// the consumer re-uses it as both K and V.
 //
-// Top-K index -1 is a sentinel meaning "fewer than K valid slots"; we
-// write zeros so the downstream softmax can attend to a degenerate
-// row without poisoning the result.
+// Sentinel topk_idx[k] = -1 (or out-of-range) writes zeros so the
+// downstream softmax handles degenerate slots gracefully.
 
 #include <hip/hip_runtime.h>
 
 extern "C" __global__ void v4f_topk_kv_gather_f32(
     const float* __restrict__ kv_cache,   // [N_compressed, head_dim]
     const int*   __restrict__ topk_idx,   // [K]
-    float*       __restrict__ out,        // [n_kv=1, head_dim, K]
+    float*       __restrict__ out,        // [n_kv=1, head_dim, out_stride]
     int K,
     int head_dim,
-    int N_compressed
+    int N_compressed,
+    int out_stride,
+    int col_offset
 ) {
     const int k = blockIdx.x;
     const int d = threadIdx.x;
@@ -33,7 +34,5 @@ extern "C" __global__ void v4f_topk_kv_gather_f32(
     if (idx >= 0 && idx < N_compressed) {
         val = kv_cache[idx * head_dim + d];
     }
-    // Output layout: [head_dim, K] with K contiguous → out[d * K + k].
-    // n_kv = 1, so the (n_kv, ...) prefix is identity.
-    out[d * K + k] = val;
+    out[d * out_stride + col_offset + k] = val;
 }

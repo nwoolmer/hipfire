@@ -1643,3 +1643,9 @@ pub const INDEXER_RELU_SCORE_SRC: &str =
 /// that matches the v4f_attn_swa K layout for downstream concat.
 pub const V4F_TOPK_KV_GATHER_SRC: &str =
     include_str!("../../../kernels/src/v4f_topk_kv_gather.hip");
+
+/// V4F indexer-extended SWA attention: jointly attends to the SWA
+/// window K/V and the indexer-gathered top-K K/V slots under a single
+/// softmax (with attn_sink as an additional entry).
+pub const V4F_ATTN_SWA_TOPK_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_topk.hip");

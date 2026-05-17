@@ -18,7 +18,11 @@
 #include <hip/hip_runtime.h>
 #include <math.h>
 
-#define MAX_WINDOW 256           // sliding_window, V4F=128
+// V4F: 128 SWA + 512 indexer top-K = 640. Round up to 1024 for headroom.
+// Increases per-thread-0 stack from 1KB to 4KB; spilled to scratch on
+// gfx1151. SWA-only path with n_valid ≤ 128 still uses only ~128 entries
+// — extra capacity is dead weight, not a perf hit.
+#define MAX_WINDOW 1024
 
 extern "C" __global__ void v4f_attn_swa(
     const float* __restrict__ q,           // [n_heads, head_dim]
