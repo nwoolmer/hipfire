@@ -1624,3 +1624,9 @@ pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
 /// T accumulated step values.
 pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
     include_str!("../../../kernels/src/compressor_softmax_pool.hip");
+
+/// V4F Compressor overlap-transform concat. Builds the [2*ratio,
+/// head_dim] view for compression from the [2*ratio, 2*head_dim]
+/// kv_state / score_state buffer (overlap=true, ratio=4 case).
+pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
+    include_str!("../../../kernels/src/compressor_overlap_concat.hip");

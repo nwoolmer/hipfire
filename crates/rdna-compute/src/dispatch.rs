@@ -19550,6 +19550,42 @@ impl Gpu {
         }
     }
 
+    /// V4F Compressor overlap-transform concat (overlap=true / ratio=4).
+    /// Reads [2*ratio, 2*head_dim] kv_state and writes [2*ratio, head_dim]
+    /// dst by taking first half-cols for old window rows and second
+    /// half-cols for current window rows.
+    pub fn compressor_overlap_concat_f32(
+        &mut self,
+        src: &GpuTensor,  // [2*ratio, 2*head_dim] F32
+        dst: &GpuTensor,  // [2*ratio, head_dim] F32
+        ratio: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_overlap_concat",
+            kernels::COMPRESSOR_OVERLAP_CONCAT_SRC,
+            "compressor_overlap_concat_f32",
+        )?;
+        let func = &self.functions["compressor_overlap_concat_f32"];
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut rv = ratio;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut rv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(2 * ratio) as u32, 1, 1], [head_dim as u32, 1, 1],
+                0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// V4F Compressor softmax-weighted pool. Compresses `T` window
     /// positions of (kv_state, score_state) into one `head_dim` output:
     ///   output[d] = sum_t softmax_t(score_state[:, d])[t] * kv_state[t, d]
