@@ -98,14 +98,43 @@ Compressor with gated pooling + APE.
   for main_kv_cache/kv_state/score_state, indexer equivalents,
   per-step q_idx/idx_weights/index_score/topk_idx_indices.
   All None; lazy-alloc when forward runs.
+- **Phase 3a.1 (pool kernel)**: 2962e55 — compressor_softmax_pool_f32:
+  output[d] = sum_t softmax_t(score[:, d])[t] * kv[t, d]. One thread
+  per d, iterates T (≤16 for ratio=4 overlap, ≤128 ratio=128).
+- **Phase 3a.2 (concat kernel)**: 0262886 — compressor_overlap_concat_f32:
+  builds [2*ratio, head_dim] view from [2*ratio, 2*head_dim] state by
+  taking first-half cols for old window rows, second-half for current.
+  Equivalent to upstream cat([state[:r, :d], state[r:, d:]], dim=1).
 
 ### Phases pending
-- **Phase 3 (Compressor.forward decode)**: per-step kv=wkv(x),
-  score=wgate(x), store in kv_state[ratio+pos%ratio], score_state
-  +ape[pos%ratio]; every ratio steps run overlap_transform +
-  softmax(score) along window-dim + weighted sum into kv_cache
-  [pos//ratio]. Needs new kernels: window-softmax,
-  weighted-pool, possibly overlap_transform copy.
+- **Phase 3b (Compressor.forward Rust)**: kernels are ready; need
+  the Rust function that wires them together for decode:
+
+  ```rust
+  fn compressor_forward(cfg, weights, state, gpu, layer_idx,
+      x_rotated, position, is_indexer: bool) -> Result<()>
+  ```
+
+  Per step:
+  1. kv = wkv @ x_rotated  (MQ4 GEMV → [coff*head_dim])
+  2. score = wgate @ x_rotated
+  3. score += ape[pos%ratio]  (slice of ape via sub_offset + add_inplace)
+  4. Write kv into state.{main,indexer}_kv_state[(ratio + pos%ratio) *
+     stride] via memcpy_dtod_auto (sub_offset of state buffer)
+  5. Same for score → state.{main,indexer}_score_state
+  6. If (pos+1) % ratio == 0:
+     a. compressor_overlap_concat_f32(kv_state, concat_kv_scratch, ...)
+     b. compressor_overlap_concat_f32(score_state, concat_score_scratch, ...)
+     c. compressor_softmax_pool_f32(concat_kv, concat_score, kv_cache_slot, T, hd)
+     d. rmsnorm_f32 (in place, using compressor.norm weight)
+     e. If is_indexer: apply rope_tail_interleaved with compress_rope_theta=160000
+     f. Shift kv_state[:ratio] = kv_state[ratio:] (memcpy_dtod for the upper half
+        back to the lower half) — same for score_state
+
+  Need to add scratch state slots for concat_kv (size [2*ratio, head_dim] F32)
+  and concat_score similarly. Caching capacity for kv_cache: pick a default
+  like 1024 compressed positions (= 4096 token ctx for ratio=4); make env-
+  overridable via HIPFIRE_V4F_MAX_COMPRESS_POS.
 - **Phase 4 (Indexer.forward)**: q = wq_b @ qr; tail RoPE with
   compress_rope_theta=160000; FWHT rotate; weights = weights_proj
   @ x; index_score[t] = relu(Q·K_idx_cache[t]^T) · weights summed
