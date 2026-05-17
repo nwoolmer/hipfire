@@ -1,21 +1,50 @@
 # DeepSeek V4 Flash — next session
 
-V4F is end-to-end chat-testable + MoE-active. 36 commits this
-session drove ppl from 119k → 21k at ctx=128.
+V4F is end-to-end chat-testable + MoE-active. ~50 commits across two
+sessions drove ppl from 119k → 18.0k at ctx=128. Phase 5
+(indexer-extended attention) wired but broken — needs investigation.
 
 ## Current PPL baseline (wikitext2-test, MoE+SWA, default settings)
 
-| ctx | ppl   | notes                                  |
-|-----|-------|----------------------------------------|
-|  64 |  25k  |                                        |
-| 128 |  21k  | within SWA window                      |
-| 256 |  40k  | needs indexer for >128                 |
+| ctx | ppl    | notes                                          |
+|-----|--------|------------------------------------------------|
+| 128 | **18.0k** | within SWA window — post=0.75 default (178d427) |
+| 256 |  ~40k  | needs phase 5 (indexer-extended attn) to fix   |
 
-Shared-only (no MoE) at ctx=128: **71k** — MoE provides 3.4x gain.
+Shared-only (no MoE) at ctx=128: **68k** — MoE provides 3.8x gain.
 
 Defaults (in `crates/hipfire-arch-deepseek4/src/forward.rs`):
-- `HIPFIRE_V4F_POST_SCALE=0.5` (empirical optimum; upstream uses 2.0)
+- `HIPFIRE_V4F_POST_SCALE=0.75` (empirical optimum; upstream uses 2.0)
 - `HIPFIRE_V4F_ROUTE_SCALE=1.0` (empirical optimum; upstream uses 1.5)
+
+## Phase 5 status (compressed-KV indexer attention)
+
+Phases 1-4b shipped + working under env flags:
+
+| Env flag                       | Path enabled                          | Effect on ppl |
+|--------------------------------|---------------------------------------|---------------|
+| (none)                         | SWA-only main attention               | 18.0k         |
+| HIPFIRE_V4F_RUN_COMPRESSOR=1   | + main + indexer compressors fill caches | 18.0k (no-op) |
+| HIPFIRE_V4F_RUN_INDEXER=1      | + indexer scoring + top-K selection   | 18.0k (no-op) |
+| HIPFIRE_V4F_USE_INDEXER_ATTN=1 | + joint SWA + gathered-topK softmax   | **1080k (16× regress)** |
+
+The phase 5 attention regression is reproducible and likely due to a
+K-space mismatch: `main_kv_cache` content (softmax-pool of `wkv @ x`
+through `compressor.norm`, no RoPE) is NOT in the same space as
+`swa_k` (`wkv @ x` through `kv_norm` then tail-RoPE). Joint softmax
+poisons the output.
+
+Tried adding tail-RoPE (`rope_theta=10000`) to main compressor output
+— bit-identical PPL, so K-RoPE is NOT the gating issue. Next session
+should bisect:
+1. Pass dummy zeros for gathered_k/v with n_active_topk=1 → if PPL
+   matches v4f_attn_swa, kernel math is right and the regression is
+   purely about main_kv_cache content.
+2. Dump main_kv_cache magnitudes and compare against SWA K magnitudes.
+   If magnitudes differ by >2-3x, that's the smoking gun.
+3. Try replacing main_kv_cache with a copy of swa_k content via gather
+   from indices < n_valid_swa. If PPL improves, full positional cache
+   is what's needed (not compressed cache).
 
 ## Big bugs fixed this session
 
