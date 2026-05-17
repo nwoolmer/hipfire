@@ -4589,16 +4589,23 @@ fn main() {
             } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if non_expert_f16 && use_mq4_mq2lloyd_native {
-                // Antirez ds4 recipe: keep non-expert weights at F16 to
-                // preserve compressor / indexer / attention projection
-                // precision. Reached only for Base-tier non-expert tensors
-                // (routed experts handled in the earlier expert split).
+            } else if non_expert_f16 && use_mq4_mq2lloyd_native && {
+                // Antirez ds4 recipe (PARTIAL — precision-sensitive tensors only):
+                // promote compressor / indexer / HC / router tensors to F16 while
+                // leaving attention projections (wq_a/b, wkv, wo_a/b, shared_w*) at
+                // MQ4 because the per-group sub_offset byte-stride logic in
+                // hipfire-arch-deepseek4's attn_stub assumes byte-sized dtype.
+                // Compressor and indexer don't use sub_offset on their weights, so
+                // F16 promotion there is safe and addresses the smoking-gun
+                // K-magnitude mismatch on phase-5 attention.
+                name.contains("compressor") || name.contains("indexer")
+                    || name.contains("hc_") || name.contains("gate.bias")
+            } {
                 let f16_bytes: Vec<u8> = f32_data
                     .iter()
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
-                (f16_bytes, QuantType::F16, 0u32, "F16 (non-expert)")
+                (f16_bytes, QuantType::F16, 0u32, "F16 (compressor/indexer/HC)")
             } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {

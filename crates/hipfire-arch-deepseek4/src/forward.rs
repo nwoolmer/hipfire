@@ -22,6 +22,40 @@
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// V4F GEMV dispatch: switch kernel based on weight dtype.
+///
+/// - `DType::MQ4G256` (default V4F non-expert quant): consume FWHT-rotated
+///   input via `gemv_mq4g256_prerotated`. This is the existing fast path.
+/// - `DType::F32` (set by `--non-expert-f16` quantizer flag, F16 source
+///   converted to F32 on upload): consume plain RMSNorm'd input (no FWHT)
+///   via `gemv_f32`. Used to faithfully reproduce antirez/ds4's PROVEN
+///   recipe of keeping compressor / indexer / attn projections at F16
+///   precision.
+///
+/// Caller passes BOTH the FWHT-rotated and plain inputs; helper picks
+/// whichever the weight needs. `m` and `k` are passed-through for the
+/// MQ4 path only — gemv_f32 derives them from the weight's shape.
+fn gemv_auto(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated: &GpuTensor,
+    x_plain: &GpuTensor,
+    y: &GpuTensor,
+    m: usize, k: usize,
+) -> Result<(), String> {
+    // `upload_global_raw` stores quant-format weights as `DType::Raw`;
+    // F16-source weights are decoded to F32 at upload and tagged F32.
+    // So a simple binary split is sufficient: F32 → plain F32 GEMV,
+    // anything else → MQ4 prerotated.
+    if weight.dtype == DType::F32 {
+        gpu.gemv_f32(weight, x_plain, y)
+            .map_err(|e| format!("gemv_f32 (non-expert F16→F32): {e:?}"))
+    } else {
+        gpu.gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
+            .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}"))
+    }
+}
+
 /// V4F Compressor decode step (phase 3b scaffold — not yet wired).
 ///
 /// Implements the upstream `Compressor.forward` decode case
@@ -160,12 +194,14 @@ fn compressor_forward(
     let slot = if overlap { ratio + pos % ratio } else { pos % ratio };
 
     // 1. kv = wkv @ x_rotated; score = wgate @ x_rotated
+    //    Dispatch: MQ4 path uses x_rotated (FWHT'd); F16 path uses
+    //    tmp_plain (plain RMSNorm, no FWHT — see q_lora step 1b).
     let kv_buf = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
     let score_buf = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
-    gpu.gemv_mq4g256_prerotated(wkv, x_rotated, kv_buf, proj_dim, hidden)
-        .map_err(|e| format!("comp wkv gemv l{layer_idx}: {e:?}"))?;
-    gpu.gemv_mq4g256_prerotated(wgate, x_rotated, score_buf, proj_dim, hidden)
-        .map_err(|e| format!("comp wgate gemv l{layer_idx}: {e:?}"))?;
+    let tmp_plain = state.tmp_plain.as_ref()
+        .ok_or_else(|| format!("comp l{layer_idx}: tmp_plain missing (q_lora must run first)"))?;
+    gemv_auto(gpu, wkv, x_rotated, tmp_plain, kv_buf, proj_dim, hidden)?;
+    gemv_auto(gpu, wgate, x_rotated, tmp_plain, score_buf, proj_dim, hidden)?;
 
     // 2. score += ape[pos % ratio]
     // ape is shape [ratio, proj_dim] F16; row pos%ratio is proj_dim consecutive F16s.
@@ -372,11 +408,12 @@ fn indexer_forward(
     }
 
     // 1. q_idx = wq_b @ q_lat_rot   (MQ4 prerotated GEMV: M = H*D, K = q_lora_rank)
+    let q_lat = state.q_lat.as_ref()
+        .ok_or_else(|| "indexer: q_lat not allocated".to_string())?;
     let q_lat_rot = state.q_lat_rot.as_ref()
         .ok_or_else(|| "indexer: q_lat_rot not allocated".to_string())?;
     let q_idx = state._indexer[layer_idx].q_idx.as_ref().unwrap();
-    gpu.gemv_mq4g256_prerotated(wq_b, q_lat_rot, q_idx, h * d, cfg.q_lora_rank)
-        .map_err(|e| format!("idx wq_b gemv l{layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, wq_b, q_lat_rot, q_lat, q_idx, h * d, cfg.q_lora_rank)?;
 
     // 2. Tail RoPE on q_idx with compress_rope_theta (matching is_indexer=true
     //    K-side compressor's RoPE). Use main `pos_buf` (already holds current
@@ -394,9 +431,10 @@ fn indexer_forward(
     // 3. idx_w = weights_proj @ state.tmp  → [H]
     let tmp = state.tmp.as_ref()
         .ok_or_else(|| "indexer: state.tmp missing".to_string())?;
+    let tmp_plain = state.tmp_plain.as_ref()
+        .ok_or_else(|| "indexer: tmp_plain missing".to_string())?;
     let idx_w = state._indexer[layer_idx].idx_weights.as_ref().unwrap();
-    gpu.gemv_mq4g256_prerotated(weights_proj, tmp, idx_w, h, cfg.hidden_size)
-        .map_err(|e| format!("idx weights_proj gemv l{layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, weights_proj, tmp, tmp_plain, idx_w, h, cfg.hidden_size)?;
 
     // 4. Score: combined relu-weighted dot products.
     let kv_cache = state._indexer[layer_idx].indexer_kv_cache.as_ref()
@@ -643,8 +681,13 @@ fn ffn_stub(
         state.ffn_silu_rot = Some(gpu.alloc_tensor(&[im], DType::F32)
             .map_err(|e| format!("alloc ffn_silu_rot: {e:?}"))?);
     }
+    if state.ffn_x_plain.is_none() {
+        state.ffn_x_plain = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc ffn_x_plain: {e:?}"))?);
+    }
 
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
+    let ffn_x_plain = state.ffn_x_plain.as_ref().unwrap();
     let gate = state.ffn_gate.as_ref().unwrap();
     let up   = state.ffn_up.as_ref().unwrap();
     let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
@@ -654,14 +697,15 @@ fn ffn_stub(
     gpu.fused_rmsnorm_rotate_mq(hc_x_in, ffn_norm, ffn_x_rot,
         cfg.hidden_size, cfg.rms_norm_eps)
         .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
+    // 1b. Plain RMSNorm (no FWHT) for F16 non-expert GEMVs.
+    gpu.rmsnorm_f32(hc_x_in, ffn_norm, ffn_x_plain, cfg.rms_norm_eps)
+        .map_err(|e| format!("rmsnorm_f32 ffn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. gate = x @ shared_w1
-    gpu.gemv_mq4g256_prerotated(shared_w1, ffn_x_rot, gate, im, cfg.hidden_size)
-        .map_err(|e| format!("gemv shared_w1 layer {layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, shared_w1, ffn_x_rot, ffn_x_plain, gate, im, cfg.hidden_size)?;
 
     // 3. up = x @ shared_w3
-    gpu.gemv_mq4g256_prerotated(shared_w3, ffn_x_rot, up, im, cfg.hidden_size)
-        .map_err(|e| format!("gemv shared_w3 layer {layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, shared_w3, ffn_x_rot, ffn_x_plain, up, im, cfg.hidden_size)?;
 
     // 4. V4F SwiGLU with swiglu_limit clamp (cfg.swiglu_limit = 10.0
     //    on V4F). Same Expert class used for shared and routed in
@@ -674,8 +718,9 @@ fn ffn_stub(
         .map_err(|e| format!("rotate_x_mq silu layer {layer_idx}: {e:?}"))?;
 
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
-    gpu.gemv_mq4g256_prerotated(shared_w2, silu_rot, ffn_out, cfg.hidden_size, im)
-        .map_err(|e| format!("gemv shared_w2 layer {layer_idx}: {e:?}"))?;
+    // shared_w2: rotated path uses silu_rot (FWHT'd), plain path uses
+    // `gate` itself (post-silu_mul, no FWHT).
+    gemv_auto(gpu, shared_w2, silu_rot, gate, ffn_out, cfg.hidden_size, im)?;
 
     Ok(())
 }
@@ -1019,10 +1064,9 @@ fn final_norm_and_head(
     gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
         .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
 
-    // 5. lm_head GEMV.
-    gpu.gemv_mq4g256_prerotated(head, final_norm_rot, logits,
-        cfg.vocab_size, cfg.hidden_size)
-        .map_err(|e| format!("gemv_mq4g256 head: {e:?}"))?;
+    // 5. lm_head GEMV. F16 path uses un-rotated final_norm.
+    gemv_auto(gpu, head, final_norm_rot, final_norm, logits,
+        cfg.vocab_size, cfg.hidden_size)?;
 
     Ok(())
 }
@@ -1627,11 +1671,12 @@ fn kv_joint(
             .map_err(|e| format!("alloc kv: {e:?}"))?);
     }
     let tmp = state.tmp.as_ref().unwrap();
+    let tmp_plain = state.tmp_plain.as_ref()
+        .ok_or_else(|| "kv_joint: tmp_plain missing (q_lora must run first)".to_string())?;
     let kv  = state.kv.as_ref().unwrap();
 
-    // wkv @ tmp → kv.
-    gpu.gemv_mq4g256_prerotated(wkv, tmp, kv, kv_dim, cfg.hidden_size)
-        .map_err(|e| format!("gemv_mq4g256 wkv layer {layer_idx}: {e:?}"))?;
+    // wkv @ tmp → kv.  Dispatch on weight dtype (MQ4G256 / F32-from-F16).
+    gemv_auto(gpu, wkv, tmp, tmp_plain, kv, kv_dim, cfg.hidden_size)?;
 
     // kv_norm RMSNorm in place (upstream V4F: `kv = self.kv_norm(kv)`
     // after wkv, before apply_rotary_emb). Was missing — likely
@@ -1701,9 +1746,15 @@ fn q_lora(
         state.q_head_ones = Some(gpu.upload_f32(&ones, &[cfg.head_dim])
             .map_err(|e| format!("upload q_head_ones: {e:?}"))?);
     }
+    // Plain rmsnorm output for F16 non-expert GEMVs (antirez recipe).
+    if state.tmp_plain.is_none() {
+        state.tmp_plain = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc tmp_plain: {e:?}"))?);
+    }
 
     let hc_x_in = state.hc_x_in.as_ref().unwrap();
     let tmp = state.tmp.as_ref().unwrap();
+    let tmp_plain = state.tmp_plain.as_ref().unwrap();
     let q_lat = state.q_lat.as_ref().unwrap();
     let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
     let q = state.q.as_ref().unwrap();
@@ -1713,10 +1764,12 @@ fn q_lora(
     // 1. Fused RMSNorm + FWHT-rotate hc_x_in → tmp.
     gpu.fused_rmsnorm_rotate_mq(hc_x_in, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
         .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
+    // 1b. Plain RMSNorm (no FWHT) → tmp_plain for F16 non-expert GEMVs.
+    gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
+        .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
-    gpu.gemv_mq4g256_prerotated(wq_a, tmp, q_lat, cfg.q_lora_rank, cfg.hidden_size)
-        .map_err(|e| format!("gemv_mq4g256 wq_a layer {layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, wq_a, tmp, tmp_plain, q_lat, cfg.q_lora_rank, cfg.hidden_size)?;
 
     // 2.5. Apply q_norm to the q-LoRA bottleneck (upstream V4F:
     //     `q = self.q_norm(self.wq_a(x))`). RMSNorm with q_norm weight.
@@ -1729,9 +1782,9 @@ fn q_lora(
         .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
 
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
+    //    Use q_lat (un-rotated) for F16 path; q_lat_rot for MQ4 path.
     let q_total = cfg.num_attention_heads * cfg.head_dim;
-    gpu.gemv_mq4g256_prerotated(wq_b, q_lat_rot, q, q_total, cfg.q_lora_rank)
-        .map_err(|e| format!("gemv_mq4g256 wq_b layer {layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, wq_b, q_lat_rot, q_lat, q, q_total, cfg.q_lora_rank)?;
 
     // 4.5. Per-head RMSNorm of Q (upstream V4F:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).

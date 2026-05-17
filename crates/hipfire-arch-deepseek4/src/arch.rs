@@ -35,6 +35,13 @@ impl DeepseekV4 {
     /// Upload one global HFQ tensor verbatim (raw bytes) to GPU.
     /// Used for embed/quantized-weights where the on-disk quant format
     /// matches the format the kernels expect to consume.
+    ///
+    /// Auto-detects F16 (quant_type=1) and converts to F32 on the fly so
+    /// the runtime GEMV dispatcher can route to `gemv_f32`. F16-source
+    /// tensors get GpuTensor.dtype = F32 after conversion; non-F16 quants
+    /// preserve their raw layout. This makes the `--non-expert-f16`
+    /// quantizer flag transparent to forward.rs: forward.rs only needs to
+    /// branch on the GpuTensor's dtype field.
     fn upload_global_raw(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -44,6 +51,25 @@ impl DeepseekV4 {
             .tensor_data(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        // quant_type = 1 → F16 (matches QuantType::F16 in hipfire-quantize).
+        // For F16-source weights, convert to F32 on the GPU so we can use
+        // gemv_f32 in V4F's forward path. Cost: 2× VRAM for that tensor.
+        if info.quant_type == 1 {
+            let n: usize = shape.iter().product();
+            if bytes.len() != n * 2 {
+                return Err(format!(
+                    "deepseek4: '{name}' marked F16 but byte size {} != 2 × {n}",
+                    bytes.len()
+                ));
+            }
+            let f32_vals: Vec<f32> = (0..n).map(|i| {
+                let lo = bytes[i * 2];
+                let hi = bytes[i * 2 + 1];
+                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
+            }).collect();
+            return gpu.upload_f32(&f32_vals, &shape)
+                .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"));
+        }
         gpu.upload_raw(bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
     }
@@ -477,6 +503,17 @@ impl Architecture for DeepseekV4 {
             }
         }
 
+        // Drop the HFQ mmap now that all weights are uploaded. On
+        // unified-memory APUs (gfx1151 / Strix Halo) the mmap and the
+        // "GPU" allocation share the same physical RAM, so keeping the
+        // mmap alive doubles memory pressure to ~160 GB on a 125 GB
+        // system → kernel evicts mmap pages → next access faults back
+        // in from disk → sustained 2.5 GB/s page-fault traffic for the
+        // life of the process. Matches the qwen35 path (commit 7f23bc
+        // landed the same fix there). After this call, tensor_data()
+        // panics; only tensor_data_pread() works (and we don't call it
+        // post-upload).
+        hfq.drop_mmap();
         Ok(weights)
     }
 

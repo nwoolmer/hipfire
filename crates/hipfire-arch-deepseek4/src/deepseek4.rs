@@ -462,6 +462,13 @@ pub struct DeepseekV4State {
     /// FWHT-rotated input to first GEMV, etc. Reused across layers.
     pub tmp: Option<rdna_compute::GpuTensor>,
 
+    /// Plain RMSNorm'd attention-side input `[hidden]` F32 — no FWHT.
+    /// Mirrors `tmp` but skips the rotation step. Consumed by F32 (F16-
+    /// source) non-expert GEMVs (`--non-expert-f16` antirez recipe) since
+    /// `gemv_f32` expects un-rotated input. Computed once per layer in
+    /// `q_lora` alongside `tmp`.
+    pub tmp_plain: Option<rdna_compute::GpuTensor>,
+
     /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
     /// `wq_a @ x`, input to `wq_b`. Reused across layers.
     pub q_lat: Option<rdna_compute::GpuTensor>,
@@ -507,6 +514,10 @@ pub struct DeepseekV4State {
     /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
     /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
     pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Plain RMSNorm'd FFN-side input `[hidden]` F32 — no FWHT. Mirror of
+    /// `ffn_x_rot` for F32 (F16-source) non-expert GEMVs (antirez recipe).
+    pub ffn_x_plain: Option<rdna_compute::GpuTensor>,
 
     /// Shared expert SwiGLU gate scratch `[moe_intermediate=2048]` F32.
     pub ffn_gate: Option<rdna_compute::GpuTensor>,
@@ -603,6 +614,7 @@ impl DeepseekV4State {
             residual_streams: None,  // allocated on first `decode_step` (needs Gpu).
             embed_scratch: None,
             tmp: None,
+            tmp_plain: None,
             q_lat: None,
             q_lat_rot: None,
             q: None,
@@ -612,6 +624,7 @@ impl DeepseekV4State {
             attn_out: None,
             ffn_out: None,
             ffn_x_rot: None,
+            ffn_x_plain: None,
             ffn_gate: None,
             ffn_up: None,
             ffn_silu_rot: None,
