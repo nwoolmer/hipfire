@@ -361,8 +361,27 @@ pub fn decode_step(
         //     g. `gpu.indexer_kv_gather(k_main_cache, v_main_cache, unique_indices, ...)`
         //
         //     When compress_ratio == 0: skip; attention reads SWA only.
-        if layer.compress_ratio > 0 {
-            unimplemented_step("indexer score → top_k → KV gather")?;
+        //
+        // Phase 3c: run main + indexer compressors. Both consume the FWHT-
+        // rotated post-attn_norm input held in `state.tmp` (populated by
+        // q_lora's fused_rmsnorm_rotate_mq step above). Gated on
+        // HIPFIRE_V4F_RUN_COMPRESSOR (default off until phases 4-5 land,
+        // since the cache fill alone does not affect attention output yet
+        // but does consume VRAM + GEMV cycles per layer per token).
+        if layer.compress_ratio > 0
+            && std::env::var("HIPFIRE_V4F_RUN_COMPRESSOR").ok().as_deref() == Some("1")
+        {
+            // Non-owning view of state.tmp so we can re-borrow state mutably.
+            let tmp_view = {
+                let t = state.tmp.as_ref().unwrap();
+                t.sub_offset(0, t.numel())
+            };
+            compressor_forward(cfg, weights, state, gpu, layer_idx,
+                &tmp_view, position, /*is_indexer=*/false)?;
+            if layer.compress_ratio == 4 {
+                compressor_forward(cfg, weights, state, gpu, layer_idx,
+                    &tmp_view, position, /*is_indexer=*/true)?;
+            }
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
