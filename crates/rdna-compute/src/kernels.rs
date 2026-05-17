@@ -1613,6 +1613,14 @@ pub const ROPE_TAIL_INVERSE_SRC: &str =
 pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_interleaved.hip");
 
+/// YaRN-aware tail-only RoPE for compressed-layer attention (V4F).
+/// Adds per-call freq_scale / ext_factor / attn_factor / corr_dims to
+/// match antirez/ds4 rope_tail_ext_inplace. For dense (uncompressed)
+/// layers, caller passes ext_factor=0 to disable YaRN — math collapses
+/// to standard RoPE.
+pub const ROPE_TAIL_YARN_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

@@ -20263,6 +20263,81 @@ impl Gpu {
         }
     }
 
+    /// YaRN-aware tail-only RoPE (V4F compressed layers). Mirrors
+    /// antirez/ds4 `rope_tail_ext_inplace`. Caller supplies:
+    ///   freq_base    — 10000 (dense) or 160000 (compressed)
+    ///   freq_scale   — 1.0 (dense) or 1/16 = 0.0625 (compressed)
+    ///   ext_factor   — 0.0 (dense, no YaRN) or 1.0 (compressed)
+    ///   attn_factor  — 1.0 net (cancels with the inner log correction)
+    ///   corr_low/high — output of yarn_corr_dims (computed on host)
+    ///   inverse      — 0 for forward, 1 for inverse rotation
+    ///
+    /// For ext_factor=0 the math collapses to plain rope_tail_interleaved
+    /// at freq=freq_scale*freq_base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_tail_yarn_interleaved(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        corr_low: f32,
+        corr_high: f32,
+        inverse: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_yarn_interleaved",
+            kernels::ROPE_TAIL_YARN_INTERLEAVED_SRC,
+            "rope_tail_yarn_interleaved_f32",
+        )?;
+        let func = &self.functions["rope_tail_yarn_interleaved_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut fs = freq_scale;
+        let mut ef = ext_factor;
+        let mut af = attn_factor;
+        let mut cl = corr_low;
+        let mut ch = corr_high;
+        let mut inv = inverse;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut fs as *mut _ as *mut c_void,
+            &mut ef as *mut _ as *mut c_void,
+            &mut af as *mut _ as *mut c_void,
+            &mut cl as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+            &mut inv as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(half + 31) / 32, 1, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// V4F inverse tail RoPE on attention output. Undoes the RoPE that V
     /// had baked in (since K=V tied and K's tail dims were RoPE'd at
     /// write time). Upstream calls `apply_rotary_emb(o[..., -rd:],

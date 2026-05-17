@@ -507,7 +507,7 @@ pub fn decode_step(
         //     Apply rotation on last `qk_rope_head_dim = 64` of each
         //     head's 512 dims.
         //     SWA ring write deferred (needs swa state alloc per layer).
-        apply_tail_rope(cfg, state, gpu, position, layer_idx)?;
+        apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
 
         // iv. Indexer path (only when compress_ratio > 0):
         //     a. Compressor: x @ compressor.wkv → idx_qk
@@ -1280,16 +1280,33 @@ fn attn_stub(
         }
     }
 
-    // Inverse tail RoPE on attn_out_raw. Same freq_base as forward
-    // apply_tail_rope (rope_theta everywhere — see note there about
-    // the compress_rope_theta + YaRN tradeoff).
+    // Inverse tail RoPE on attn_out_raw. Same YaRN params as the forward
+    // apply_tail_rope so the rotation cancels correctly across attention.
+    // Antirez `layer_forward_self_one` does the matching:
+    //   rope_tail_layer_inplace(q,     ..., pos, il, false)  // forward
+    //   rope_tail_layer_inplace(heads, ..., pos, il, true)   // inverse
+    // (ds4.c:7868, 7874)
     let pos_buf = state.pos_buf.as_ref()
         .ok_or_else(|| "pos_buf not allocated".to_string())?;
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        gpu.rope_tail_inverse(attn_out_raw, pos_buf,
-            n_heads as i32, head_dim as i32,
-            cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-        ).map_err(|e| format!("rope_tail_inverse l{layer_idx}: {e:?}"))?;
+        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+            gpu.rope_tail_inverse(attn_out_raw, pos_buf,
+                n_heads as i32, head_dim as i32,
+                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
+            ).map_err(|e| format!("rope_tail_inverse (no-yarn) l{layer_idx}: {e:?}"))?;
+        } else {
+            let layer = &weights.layers[layer_idx];
+            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                layer_rope_params(cfg, layer.compress_ratio);
+            gpu.rope_tail_yarn_interleaved(
+                attn_out_raw, attn_out_raw, pos_buf,
+                n_heads as i32, 0,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+                /*inverse=*/1,
+            ).map_err(|e| format!("rope_tail_yarn_interleaved (inverse) l{layer_idx}: {e:?}"))?;
+        }
     }
 
     // O-LoRA projection: wo_a per-group + wo_b.
@@ -1633,8 +1650,52 @@ fn hc_attn_mix(
 /// (treated as 1 head).
 ///
 /// Uses `rope_tail_halfsplit_f32` with V4F's `rope_theta = 10000`.
+/// YaRN correction dim: per-dim-pair index at which the high-vs-low
+/// frequency split happens. Matches antirez ds4's `rope_yarn_corr_dim`.
+fn rope_yarn_corr_dim(n_dims: u32, n_ctx_orig: u64, n_rot: f32, base: f32) -> f32 {
+    n_dims as f32 * ((n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln())
+        / (2.0 * base.ln())
+}
+
+/// Per-layer RoPE parameters: returns (freq_base, freq_scale, ext_factor,
+/// attn_factor, corr_low, corr_high). Mirrors antirez's
+/// `layer_rope_freq_base` / `layer_rope_freq_scale` + the attn_factor
+/// cancellation in `rope_tail_layer_inplace`.
+fn layer_rope_params(
+    cfg: &DeepseekV4Config,
+    compress_ratio: u32,
+) -> (f32, f32, f32, f32, f32, f32) {
+    let compressed = compress_ratio != 0;
+    let freq_base = if compressed { cfg.compress_rope_theta } else { cfg.rope_theta };
+    let scale_factor = cfg.rope_scaling_factor;
+    let freq_scale = if compressed && scale_factor > 1.0 { 1.0 / scale_factor } else { 1.0 };
+    let ext_factor = if compressed && scale_factor > 1.0 { 1.0 } else { 0.0 };
+    // attn_factor: antirez pre-divides by (1+0.1*log(1/fs)) here so the
+    // kernel's inner `mscale *= (1+0.1*log(1/fs))` cancels it back to 1.0
+    // (see ds4.c:4769-4778). For dense (ext_factor=0) the kernel skips the
+    // log multiplication, so attn_factor stays 1.0.
+    let attn_factor = if ext_factor != 0.0 && freq_scale > 0.0 {
+        1.0 / (1.0 + 0.1 * (1.0_f32 / freq_scale).ln())
+    } else {
+        1.0
+    };
+    let n_rot = cfg.qk_rope_head_dim as u32;
+    let n_ctx_orig = cfg.rope_scaling_original_max_position_embeddings as u64;
+    let beta_fast = cfg.rope_scaling_beta_fast as f32;
+    let beta_slow = cfg.rope_scaling_beta_slow as f32;
+    let (corr_low, corr_high) = if ext_factor != 0.0 {
+        let lo = rope_yarn_corr_dim(n_rot, n_ctx_orig, beta_fast, freq_base).floor().max(0.0);
+        let hi = rope_yarn_corr_dim(n_rot, n_ctx_orig, beta_slow, freq_base).ceil().min((n_rot - 1) as f32);
+        (lo, hi)
+    } else {
+        (0.0, 0.0)
+    };
+    (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high)
+}
+
 fn apply_tail_rope(
     cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     position: u32,
@@ -1654,23 +1715,38 @@ fn apply_tail_rope(
     let q  = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
 
-    // V4F upstream uses `compress_rope_theta` (160000) WITH YaRN for
-    // layers with compress_ratio>0, and `rope_theta` (10000) WITHOUT
-    // YaRN for ratio=0. Tested using compress_rope_theta naively (no
-    // YaRN) for ratio>0 layers → ppl 272k (worse than 119k with base
-    // 10000 everywhere). Without proper YaRN scaling the larger theta
-    // gives wrong rotations. Keeping rope_theta everywhere as the less-
-    // wrong approximation until YaRN is wired.
-    let _ = layer_idx;
+    // V4F upstream (per antirez ds4 reference):
+    //   compress_ratio == 0 (layers 0, 1, MTP): rope_theta = 10000, no YaRN
+    //   compress_ratio  > 0 (layers 2..42):      compress_rope_theta = 160000,
+    //                                            YaRN with scale_factor = 16
+    // Pre-YaRN escape hatch: HIPFIRE_V4F_NO_YARN=1 reverts to the old
+    // single-theta path (rope_theta=10000 everywhere) for direct A/B
+    // comparison with prior tuning data.
+    if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+        gpu.rope_tail_interleaved(
+            q, kv, pos_buf,
+            cfg.num_attention_heads as i32,
+            cfg.num_key_value_heads as i32,
+            cfg.head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            cfg.rope_theta,
+        ).map_err(|e| format!("rope_tail_interleaved (no-yarn): {e:?}"))?;
+        return Ok(());
+    }
 
-    gpu.rope_tail_interleaved(
+    let layer = &weights.layers[layer_idx];
+    let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+        layer_rope_params(cfg, layer.compress_ratio);
+
+    gpu.rope_tail_yarn_interleaved(
         q, kv, pos_buf,
         cfg.num_attention_heads as i32,
         cfg.num_key_value_heads as i32,
         cfg.head_dim as i32,
         cfg.qk_rope_head_dim as i32,
-        cfg.rope_theta,
-    ).map_err(|e| format!("rope_tail_interleaved: {e:?}"))?;
+        freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+        /*inverse=*/0,
+    ).map_err(|e| format!("rope_tail_yarn_interleaved: {e:?}"))?;
 
     Ok(())
 }
