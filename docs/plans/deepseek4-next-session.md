@@ -46,20 +46,31 @@ SWA window (no double-counting), so default behaviour and ctx≤128 are
 clean. ctx=256 regression is contained at 133k (vs 35.5k baseline, vs
 1080k unfiltered).
 
-**Next-session fixes to try:**
-1. **Re-quantize `compressor.norm` AND `compressor.wkv` with FP16
-   passthrough** — MQ2-Lloyd likely damages small-magnitude weights.
-   Pin both to FP16 in the HFQ converter. Re-quant takes ~30 min and
-   adds maybe 200 MB to the model.
-2. **Bypass main compressor entirely** — keep a full positional K cache
-   (n_kv=1, head_dim=512, max_ctx=4096 → 8 MB/layer × 43 layers ≈ 350 MB).
-   Phase 5 gathers raw K (post-RoPE, post-kv_norm) at indexer-selected
-   positions translated from compressed slots → absolute positions
-   (c * ratio + ratio/2). Larger memory but architecturally cleaner.
-3. **Tried & failed**: `HIPFIRE_V4F_TOPK_K_SCALE` (commit 416e098) —
-   multiply gathered K/V by a constant. Best K_SCALE=8 gives 103k @
-   ctx=256, still 3× worse than 35.5k baseline. Confirms it's not just
-   magnitude — content is also wrong.
+**Critical finding (2026-05-17 evening)**: K_SCALE=0 (gather writes zeros)
+gives 137k ppl, WORSE than baseline 35.5k. **The joint softmax itself is
+the bug, not the gathered content.** Adding neutral-score (exp(0)=1)
+entries inflates the partition function, diluting SWA probabilities.
+With 32 zero gathered entries vs ~few high-scoring SWA entries, gathered
+dominates the partition by ~4×, scaling SWA attention output down by
+the same factor. Cascades across 43 layers → 4× PPL regression.
+
+**This rules out all magnitude/content-only fixes.** The next-session
+architectural fix must change the attention combination strategy:
+
+1. **Separate softmaxes + weighted combine** (most upstream-faithful):
+   compute `A_swa = softmax(Q·K_swa^T)·V_swa` and
+   `A_topk = softmax(Q·K_topk^T)·V_topk` independently, then return
+   `A = alpha·A_swa + (1-alpha)·A_topk` for some learned/scalar alpha.
+2. **Score-threshold mask in joint softmax**: at gather time, score
+   each topk entry against Q first; if score < (SWA min score - margin),
+   write -infinity to its score slot so softmax ignores it. Lets relevant
+   gathered entries contribute, suppresses noise dilution.
+3. **Full positional K cache** still on the table for K-space alignment,
+   but only valuable AFTER the softmax architecture is fixed.
+
+`HIPFIRE_V4F_TOPK_K_SCALE` env (commit 416e098) kept for diagnostic — best
+K_SCALE=8 gives 103k @ ctx=256, still 3× worse than baseline. Confirmed
+softmax-dilution dominates magnitude effects.
 
 ## Big bugs fixed this session
 
