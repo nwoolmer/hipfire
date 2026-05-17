@@ -19681,7 +19681,9 @@ impl Gpu {
     /// of an [n_kv=1, head_dim, out_stride] output tensor — letting the
     /// caller stage the gather into a buffer whose first `col_offset`
     /// columns hold raw SWA window K/V. Sentinel `topk_idx[k] = -1` (or
-    /// out-of-range) writes zeros.
+    /// out-of-range) writes zeros. The `scale` parameter multiplies the
+    /// gathered values; pass 1.0 for pass-through, larger to compensate
+    /// for compressor.norm undershoot.
     #[allow(clippy::too_many_arguments)]
     pub fn v4f_topk_kv_gather_f32(
         &mut self,
@@ -19693,6 +19695,7 @@ impl Gpu {
         n_compressed: i32,
         out_stride: i32,
         col_offset: i32,
+        scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -19709,6 +19712,7 @@ impl Gpu {
         let mut nc = n_compressed;
         let mut os = out_stride;
         let mut co = col_offset;
+        let mut sc = scale;
         let mut params: Vec<*mut c_void> = vec![
             &cp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -19718,6 +19722,7 @@ impl Gpu {
             &mut nc as *mut _ as *mut c_void,
             &mut os as *mut _ as *mut c_void,
             &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
         ];
         unsafe {
             self.hip.launch_kernel(

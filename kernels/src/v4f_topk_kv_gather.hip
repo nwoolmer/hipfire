@@ -23,7 +23,8 @@ extern "C" __global__ void v4f_topk_kv_gather_f32(
     int head_dim,
     int N_compressed,
     int out_stride,
-    int col_offset
+    int col_offset,
+    float scale                            // 1.0 = pass-through; >1 boosts compressed K magnitude
 ) {
     const int k = blockIdx.x;
     const int d = threadIdx.x;
@@ -32,7 +33,7 @@ extern "C" __global__ void v4f_topk_kv_gather_f32(
     const int idx = topk_idx[k];
     float val = 0.0f;
     if (idx >= 0 && idx < N_compressed) {
-        val = kv_cache[idx * head_dim + d];
+        val = kv_cache[idx * head_dim + d] * scale;
     }
     out[d * out_stride + col_offset + k] = val;
 }

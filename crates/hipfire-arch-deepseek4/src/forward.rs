@@ -1167,11 +1167,15 @@ fn attn_stub(
             let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
             let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
 
-            // Gather top-K rows into gathered_k[:, :, 0..k_active].
+            // Gather top-K rows into gathered_k[:, :, 0..k_active]. Scale
+            // by HIPFIRE_V4F_TOPK_K_SCALE to compensate for compressor.norm
+            // undershoot relative to kv_norm output magnitude.
+            let topk_k_scale: f32 = std::env::var("HIPFIRE_V4F_TOPK_K_SCALE")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
             gpu.v4f_topk_kv_gather_f32(
                 main_kv_cache, topk_idx, gathered_k,
                 k_active as i32, head_dim as i32, n_compressed as i32,
-                topk_max as i32, 0,
+                topk_max as i32, 0, topk_k_scale,
             ).map_err(|e| format!("topk gather l{layer_idx}: {e:?}"))?;
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
