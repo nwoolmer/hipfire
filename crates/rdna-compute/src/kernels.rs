@@ -1652,6 +1652,11 @@ pub const INDEXER_RELU_SCORE_SRC: &str =
 pub const V4F_TOPK_KV_GATHER_SRC: &str =
     include_str!("../../../kernels/src/v4f_topk_kv_gather.hip");
 
+/// V4F mixed-attention identity gather (ratio=128 layers without indexer).
+/// Copies main_kv_cache[0..K, :] to gathered_k[:, 0..K] directly.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_identity.hip");
+
 /// V4F indexer-extended SWA attention: jointly attends to the SWA
 /// window K/V and the indexer-gathered top-K K/V slots under a single
 /// softmax (with attn_sink as an additional entry).

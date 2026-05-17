@@ -19736,6 +19736,48 @@ impl Gpu {
         }
     }
 
+    /// V4F mixed-attention identity gather (ratio=128 path). Same output
+    /// layout as `v4f_topk_kv_gather_f32` but skips topk-index lookup —
+    /// copies main_kv_cache[0..K] directly into gathered_k[:, 0..K].
+    pub fn v4f_topk_kv_gather_identity_f32(
+        &mut self,
+        kv_cache: &GpuTensor,
+        out: &GpuTensor,
+        k_active: i32,
+        head_dim: i32,
+        out_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_identity",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_SRC,
+            "v4f_topk_kv_gather_identity_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_identity_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F indexer-extended SWA attention. Reads from the SWA ring
     /// buffer (`swa_k/v` [n_kv=1, head_dim, swa_window]) AND the
     /// indexer-gathered top-K K/V (`topk_k/v` [n_kv=1, head_dim,

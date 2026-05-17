@@ -528,10 +528,14 @@ pub fn decode_step(
         // HIPFIRE_V4F_RUN_COMPRESSOR (default off until phases 4-5 land,
         // since the cache fill alone does not affect attention output yet
         // but does consume VRAM + GEMV cycles per layer per token).
+        // V4F compressor + indexer (antirez-faithful default behavior):
+        // Always run for ratio>0 layers (no env gate). Antirez ds4 runs
+        // compressor unconditionally for compressed layers and the
+        // indexer for ratio==4 layers (ds4.c:7505-7555).
+        // Env opt-out: HIPFIRE_V4F_NO_COMPRESSOR=1 for diagnosis.
         if layer.compress_ratio > 0
-            && std::env::var("HIPFIRE_V4F_RUN_COMPRESSOR").ok().as_deref() == Some("1")
+            && std::env::var("HIPFIRE_V4F_NO_COMPRESSOR").ok().as_deref() != Some("1")
         {
-            // Non-owning view of state.tmp so we can re-borrow state mutably.
             let tmp_view = {
                 let t = state.tmp.as_ref().unwrap();
                 t.sub_offset(0, t.numel())
@@ -541,13 +545,7 @@ pub fn decode_step(
             if layer.compress_ratio == 4 {
                 compressor_forward(cfg, weights, state, gpu, layer_idx,
                     &tmp_view, position, /*is_indexer=*/true)?;
-                // Phase 4b: indexer scoring + top-K selection.
-                // Output → state._indexer[l].topk_idx_indices (consumed by
-                // phase 5's modified attention). Currently dead in the
-                // pipeline because phase 5 is not yet wired.
-                if std::env::var("HIPFIRE_V4F_RUN_INDEXER").ok().as_deref() == Some("1") {
-                    let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
-                }
+                let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
             }
         }
 
@@ -1178,99 +1176,89 @@ fn attn_stub(
         }
         let n_valid = (pos + 1).min(win) as i32;
 
-        // Phase 5c: indexer-extended attention when (a) HIPFIRE_V4F_RUN_INDEXER=1
-        // populated topk_idx_indices this step, and (b) this layer is an
-        // indexer-active layer (compress_ratio == 4). Joint softmax over the
-        // SWA window K/V AND the top-K K rows gathered from main_kv_cache.
+        // Antirez-faithful mixed attention (ds4.c:7559-7566):
+        //   ratio == 0 (dense): plain SWA attention over raw_kv
+        //   ratio  > 0 (compressed): JOINT softmax over raw_kv + main_kv_cache
+        //     ratio == 4: indexer top-K selects which compressor entries
+        //     ratio == 128: no indexer, attend to ALL compressor entries
         //
-        // Filter: phase 5 only matters when there are compressed slots that
-        // represent positions BEFORE the SWA window. Compressed slot c (with
-        // ratio=4 overlap) covers token positions [c*ratio - ratio, c*ratio +
-        // ratio - 1]. For SWA window [pos-win, pos] to NOT cover slot c, we
-        // need c*ratio + ratio - 1 < pos - win, i.e., c < (pos - win) / ratio.
-        // The number of "pre-window" slots = max(0, (pos - win + 1) / ratio).
-        // If 0, fall through to plain SWA — no need to gather from main_kv_cache.
-        let ratio = 4usize;
-        let n_pre_window_slots = if pos >= win {
-            ((pos - win + 1) / ratio).min(cfg.index_topk)
-        } else { 0 };
+        // Both compressor and raw entries share ONE softmax with the
+        // attn_sink as an extra implicit drain entry. The compressed
+        // cache contains the model's "coarse memory" — even at small pos
+        // (within SWA window) the compressor cache provides DIFFERENT
+        // signal than raw KV (compressed entries are softmax-pooled
+        // wkv outputs with compressor.norm + RoPE applied; raw KV is the
+        // per-position post-kv_norm post-RoPE K=V).
+        //
+        // Env opt-out: HIPFIRE_V4F_NO_MIXED=1 falls back to SWA-only.
+        let no_mixed = std::env::var("HIPFIRE_V4F_NO_MIXED").ok().as_deref() == Some("1");
+        let do_mixed = !no_mixed
+            && layer.compress_ratio > 0
+            && state._indexer[layer_idx].main_kv_cache.is_some();
 
-        let layer_indexer_active = layer.compress_ratio == 4
-            && std::env::var("HIPFIRE_V4F_USE_INDEXER_ATTN").ok().as_deref() == Some("1")
-            && state._indexer[layer_idx].topk_idx_indices.is_some()
-            && state._indexer[layer_idx].main_kv_cache.is_some()
-            && n_pre_window_slots > 0;
-
-        if layer_indexer_active {
+        if do_mixed {
             let topk_max = cfg.index_topk;
-            // Lazy-alloc gathered_k / gathered_v scratch.
             if state._attention[layer_idx].gathered_k.is_none() {
                 state._attention[layer_idx].gathered_k = Some(
                     gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
                         .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?
                 );
             }
-            // V4F has tied K=V → re-use the gathered_k buffer for V via a
-            // separate slot pointing to the same allocation. The
-            // v4f_attn_swa_topk_f32 kernel reads two pointers but we can
-            // pass the same one for both since K==V on V4F.
-            let n_compressed = (pos + 1) / ratio;
-            // Cap k_active by both topk_max and the count of pre-window slots —
-            // top-K may include in-window slots that we don't want to attend to
-            // (they'd double-count with SWA). Conservative: take only as many
-            // gathered slots as we have pre-window compressed slots.
-            let k_active = n_pre_window_slots.min(n_compressed);
-            let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
-            let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-            let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+            let ratio = layer.compress_ratio as usize;
+            // n_compressed: number of compressed slots committed so far.
+            // Compressor commits a slot every `ratio` steps when
+            // (pos+1) % ratio == 0. With state.n_tokens being the
+            // just-incremented position, n_committed = (state.n_tokens) / ratio.
+            // Actually since we're at the END of attn_stub's pos (= state.n_tokens
+            // before increment), and the compressor ran BEFORE attn_stub:
+            //   at pos p with (p+1)%ratio==0, compressor wrote slot p/ratio.
+            //   n_committed after compressor = (p+1) / ratio.
+            let n_compressed = ((pos + 1) / ratio).min(topk_max);
 
-            // Gather top-K rows into gathered_k[:, :, 0..k_active]. Scale
-            // by HIPFIRE_V4F_TOPK_K_SCALE to compensate for compressor.norm
-            // undershoot relative to kv_norm output magnitude.
-            let topk_k_scale: f32 = std::env::var("HIPFIRE_V4F_TOPK_K_SCALE")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            gpu.v4f_topk_kv_gather_f32(
-                main_kv_cache, topk_idx, gathered_k,
-                k_active as i32, head_dim as i32, n_compressed as i32,
-                topk_max as i32, 0, topk_k_scale,
-            ).map_err(|e| format!("topk gather l{layer_idx}: {e:?}"))?;
+            let k_active = if n_compressed == 0 {
+                0
+            } else if layer.compress_ratio == 4
+                && state._indexer[layer_idx].topk_idx_indices.is_some()
+            {
+                // ratio=4: gather using indexer top-K. The topk_idx_indices
+                // was populated by indexer_forward — it has up to index_topk
+                // entries, padded with -1 sentinels beyond n_compressed.
+                let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
+                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+                let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+                let k = cfg.index_topk.min(n_compressed);
+                gpu.v4f_topk_kv_gather_f32(
+                    main_kv_cache, topk_idx, gathered_k,
+                    k as i32, head_dim as i32, n_compressed as i32,
+                    topk_max as i32, 0, /*scale=*/1.0,
+                ).map_err(|e| format!("mixed gather (idx) l{layer_idx}: {e:?}"))?;
+                k
+            } else {
+                // ratio=128 (or fallback): no indexer, attend to all
+                // n_compressed entries directly. Copy main_kv_cache[0..n]
+                // into gathered_k[0..n] (transposed layout).
+                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+                let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+                gpu.v4f_topk_kv_gather_identity_f32(
+                    main_kv_cache, gathered_k,
+                    n_compressed as i32, head_dim as i32, topk_max as i32,
+                ).map_err(|e| format!("mixed gather (all) l{layer_idx}: {e:?}"))?;
+                n_compressed
+            };
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-
-            // Phase 5d: SEPARATE softmaxes + weighted combine.
-            //
-            // The joint softmax in v4f_attn_swa_topk_f32 is poisonous —
-            // adding gathered entries (even with K=0, V=0) inflates the
-            // partition function and dilutes SWA probabilities. Proof:
-            // K_SCALE=0 → 137k ppl @ ctx=256 vs SWA-only 35.5k baseline.
-            //
-            // Mitigation: run SWA attention to attn_out_raw, then run a
-            // SECOND attention pass over gathered K/V to a side buffer,
-            // and scaled_add the topk contribution with alpha (env-gated,
-            // default 0.0 = pure SWA = no change). Tune alpha at ctx>=256.
-            let topk_alpha: f32 = std::env::var("HIPFIRE_V4F_TOPK_ALPHA")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            // Pass 1: SWA attention to attn_out_raw.
-            gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
-                n_heads as i32, head_dim as i32, n_groups as i32,
-                n_valid, win as i32,
-            ).map_err(|e| format!("v4f_attn_swa (phase5d swa) l{layer_idx}: {e:?}"))?;
-
-            if topk_alpha > 0.0 {
-                // Pass 2: gathered attention. Re-use attn_out_raw_rot as
-                // a scratch (it's only used downstream of inverse-RoPE,
-                // so safe to reuse here).
-                let attn_out_raw_topk = state.attn_out_raw_rot.as_ref().unwrap();
-                gpu.v4f_attn_swa(q, gathered_k, gathered_k, attn_sink, attn_out_raw_topk,
-                    n_heads as i32, head_dim as i32, n_groups as i32,
-                    k_active as i32, topk_max as i32,
-                ).map_err(|e| format!("v4f_attn_swa (phase5d topk) l{layer_idx}: {e:?}"))?;
-                // attn_out_raw += topk_alpha * attn_out_raw_topk
-                gpu.scaled_add_inplace_cpu_scalar_f32(
-                    attn_out_raw, attn_out_raw_topk, topk_alpha
-                ).map_err(|e| format!("phase5d scaled_add l{layer_idx}: {e:?}"))?;
-            }
+            let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+            // Joint softmax: scores = Q·K for [swa_k, gathered_k, attn_sink],
+            // single normalization, V = swa_v + gathered_v (K=V tied, so
+            // we pass gathered_k as V too).
+            gpu.v4f_attn_swa_topk_f32(
+                q, swa_k, swa_v, gathered_k, gathered_k,
+                attn_sink, attn_out_raw,
+                n_heads as i32, head_dim as i32,
+                win as i32, topk_max as i32,
+                n_valid, k_active as i32,
+            ).map_err(|e| format!("v4f_attn_swa_topk l{layer_idx}: {e:?}"))?;
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
