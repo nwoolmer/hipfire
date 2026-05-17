@@ -1,18 +1,21 @@
 // V4F mHC α-scaling post-step.
 //
-// hc_compute_control writes c = (X · W_fn) + base [24]. The paper
-// (DeepSeek_V4.pdf §2.2 eqs 3-5) actually specifies:
-//   Ã = α^pre  · (X · W^pre)  + S^pre
-//   B̃ = α^res  · (X · W^res)  + S^res
-//   C̃ = α^post · (X · W^post) + S^post
+// hc_compute_control writes c = (X · W_fn · rsqrt) + base [24].
+// Upstream V4F's hc_split_sinkhorn applies:
+//   pre[h]      = sigmoid(mixes[h]      * hc_scale[0] + hc_base[h])  + eps   // h ∈ [0, hc=4)
+//   post[h]     = 2*sigmoid(mixes[h+hc] * hc_scale[1] + hc_base[h+hc])        // h ∈ [0, hc)
+//   comb[j,k]   = mixes[2*hc + j*hc + k] * hc_scale[2] + hc_base[2*hc + j*hc + k]
 //
-// where α^* are per-block learnable scalars stored in hc_*_scale[3].
+// Segments in the 24-element mixes vector (upstream layout):
+//   [0..hc=4]:           PRE  (uses hc_scale[0])
+//   [hc..2*hc=4..8]:     POST (uses hc_scale[1])
+//   [2*hc..mix_hc=8..24]: COMB (uses hc_scale[2])
+//
 // This kernel post-rescales c so each segment has the right α:
-//
 //   c_new[i] = α[seg(i)] · (c[i] - base[i]) + base[i]
 //            = α[seg(i)] · c[i] + (1 - α[seg(i)]) · base[i]
-//
-// Segments (V4F): [0..4]=pre, [4..20]=res, [20..24]=post.
+//   Algebra check: result = α · (X·W·rsqrt) + base, matching upstream's
+//   `mixes * hc_scale + hc_base`.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -26,10 +29,11 @@ extern "C" __global__ void hc_apply_alpha(
     const int i = threadIdx.x;
     if (i >= 24) return;
 
+    // Upstream layout: [pre(4), post(4), comb(16)] at offsets [0, 4, 8].
     int seg;
-    if      (i < 4)  seg = 0;
-    else if (i < 20) seg = 1;
-    else             seg = 2;
+    if      (i < 4) seg = 0;  // pre  → α[0]
+    else if (i < 8) seg = 1;  // post → α[1]
+    else            seg = 2;  // comb → α[2]
 
     float a = __half2float(alpha[seg]);
     float b = __half2float(base[i]);
