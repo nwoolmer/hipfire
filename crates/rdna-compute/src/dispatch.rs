@@ -19550,6 +19550,58 @@ impl Gpu {
         }
     }
 
+    /// V4F head HC mix — compute the per-stream `pre` weights for the
+    /// 4-stream → hidden projection before lm_head. Matches upstream
+    /// `ParallelHead.hc_head`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_head_compute_pre(
+        &mut self,
+        x_flat: &GpuTensor,    // [hc_mult * hidden] F32
+        w_fn: &GpuTensor,      // [hc_mult, hc_mult * hidden] F16
+        base: &GpuTensor,      // [hc_mult] F16
+        pre_out: &GpuTensor,   // [hc_mult] F32
+        hc_mult: i32,
+        x_dim: i32,
+        scale: f32,            // hc_head_scale (scalar)
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_head_compute_pre",
+            kernels::HC_HEAD_COMPUTE_PRE_SRC, "hc_head_compute_pre")?;
+        let func = &self.functions["hc_head_compute_pre"];
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let pp = pre_out.buf.as_ptr();
+        let mut hm = hc_mult;
+        let mut xd = x_dim;
+        let mut sv = scale;
+        let mut ne = norm_eps;
+        let mut he = hc_eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut hm as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut sv as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut he as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [hc_mult as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Sinkhorn-normalise a 4×4 gating matrix (in place).
     /// `matrix` is row-major 16 floats; `iters` = `hc_sinkhorn_iters`
     /// from V4F config (= 20). `eps` = `hc_eps` (= 1e-6).

@@ -206,6 +206,9 @@ impl DeepseekV4 {
             token_embd: None,
             output_norm: None,
             head: None,
+            hc_head_fn: None,
+            hc_head_base: None,
+            hc_head_scale: 1.0,  // overwritten at load time
             layers,
             mtp_layer: None,  // skipped by quantize per `mtp.` prefix; Phase 5 work.
             _scaffold: (),
@@ -262,6 +265,20 @@ impl Architecture for DeepseekV4 {
         weights.token_embd  = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
         weights.output_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "norm.weight")?);
         weights.head        = Some(Self::upload_global_raw(hfq, gpu, "head.weight")?);
+
+        // Head HC mix tensors — F16 raw on GPU; scale is scalar host-side.
+        weights.hc_head_fn   = Some(Self::upload_global_raw(hfq, gpu, "hc_head_fn")?);
+        weights.hc_head_base = Some(Self::upload_global_raw(hfq, gpu, "hc_head_base")?);
+        {
+            let (info, bytes) = hfq.tensor_data("hc_head_scale")
+                .ok_or_else(|| "deepseek4: hc_head_scale missing".to_string())?;
+            if info.shape != vec![1] {
+                return Err(format!("deepseek4: hc_head_scale unexpected shape {:?}", info.shape));
+            }
+            let scale = hipfire_runtime::llama::f16_to_f32(
+                u16::from_le_bytes([bytes[0], bytes[1]]));
+            weights.hc_head_scale = scale;
+        }
 
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {

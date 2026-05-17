@@ -485,13 +485,19 @@ fn hc_ffn_mix(
     Ok(())
 }
 
-/// Final norm + lm_head.
+/// Final head HC mix + norm + lm_head.
 ///
-/// `final_norm = rmsnorm(stream0, output_norm)` [hidden]
-/// `logits = head_weight @ final_norm`             [vocab_size]
+/// Upstream V4F ParallelHead.hc_head:
+///   x_flat = streams.flatten()  # [hc_mult * hidden]
+///   rsqrt = rsqrt(mean(x_flat^2) + eps)
+///   mixes = (hc_head_fn @ x_flat) * rsqrt        # [hc_mult]
+///   pre   = sigmoid(mixes * hc_head_scale + hc_head_base) + hc_eps
+///   y[d]  = sum_h pre[h] * streams[h, d]         # [hidden]
+///   final = rmsnorm(y, output_norm)              # [hidden]
+///   logits = head @ final                        # [vocab_size]
 ///
-/// head_weight is MQ4G256, so we need to FWHT-rotate final_norm
-/// first via `rotate_x_mq`, then call `gemv_mq4g256_prerotated`.
+/// We were previously taking ONLY stream 0 for the head — discarding 75%
+/// of the model's output state. This wires the full HC mix.
 fn final_norm_and_head(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -502,6 +508,10 @@ fn final_norm_and_head(
         .ok_or_else(|| "output_norm not uploaded".to_string())?;
     let head = weights.head.as_ref()
         .ok_or_else(|| "head not uploaded".to_string())?;
+    let hc_head_fn = weights.hc_head_fn.as_ref()
+        .ok_or_else(|| "hc_head_fn not uploaded".to_string())?;
+    let hc_head_base = weights.hc_head_base.as_ref()
+        .ok_or_else(|| "hc_head_base not uploaded".to_string())?;
     let streams = state.residual_streams.as_ref().unwrap();
 
     if state.final_norm.is_none() {
@@ -516,21 +526,41 @@ fn final_norm_and_head(
         state.logits = Some(gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
             .map_err(|e| format!("alloc logits: {e:?}"))?);
     }
+    if state.head_hc_pre.is_none() {
+        state.head_hc_pre = Some(gpu.alloc_tensor(&[cfg.hc_mult], DType::F32)
+            .map_err(|e| format!("alloc head_hc_pre: {e:?}"))?);
+    }
+    if state.head_hc_out.is_none() {
+        state.head_hc_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc head_hc_out: {e:?}"))?);
+    }
 
-    let stream0 = streams.sub_offset(0, cfg.hidden_size);
     let final_norm = state.final_norm.as_ref().unwrap();
     let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
     let logits = state.logits.as_ref().unwrap();
+    let head_hc_pre = state.head_hc_pre.as_ref().unwrap();
+    let head_hc_out = state.head_hc_out.as_ref().unwrap();
 
-    // 1. RMSNorm
-    gpu.rmsnorm_f32(&stream0, output_norm, final_norm, cfg.rms_norm_eps)
+    // 1. Head HC: compute pre[hc_mult] = sigmoid((hc_head_fn @ x_flat * rsqrt) * scale + base) + eps
+    let x_dim = cfg.hidden_size * cfg.hc_mult;
+    gpu.hc_head_compute_pre(streams, hc_head_fn, hc_head_base, head_hc_pre,
+        cfg.hc_mult as i32, x_dim as i32,
+        weights.hc_head_scale, cfg.rms_norm_eps, cfg.hc_eps,
+    ).map_err(|e| format!("hc_head_compute_pre: {e:?}"))?;
+
+    // 2. Head HC combine: head_hc_out[d] = sum_h pre[h] * streams[h, d]
+    gpu.hc_input_map_4stream(head_hc_pre, streams, head_hc_out, cfg.hidden_size as i32)
+        .map_err(|e| format!("hc_input_map (head): {e:?}"))?;
+
+    // 3. RMSNorm of the combined stream output.
+    gpu.rmsnorm_f32(head_hc_out, output_norm, final_norm, cfg.rms_norm_eps)
         .map_err(|e| format!("final rmsnorm_f32: {e:?}"))?;
 
-    // 2. FWHT-rotate for MQ4 GEMV
+    // 4. FWHT-rotate for MQ4 GEMV.
     gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
         .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
 
-    // 3. lm_head: head @ final_norm_rot → logits [vocab_size]
+    // 5. lm_head GEMV.
     gpu.gemv_mq4g256_prerotated(head, final_norm_rot, logits,
         cfg.vocab_size, cfg.hidden_size)
         .map_err(|e| format!("gemv_mq4g256 head: {e:?}"))?;

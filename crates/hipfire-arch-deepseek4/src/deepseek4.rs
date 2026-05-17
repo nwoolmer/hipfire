@@ -322,6 +322,12 @@ pub struct DeepseekV4Weights {
     pub output_norm: Option<rdna_compute::GpuTensor>,
     /// LM head weight (MQ4G256, shape [vocab_size, hidden]).
     pub head: Option<rdna_compute::GpuTensor>,
+    /// Head HC mix: `hc_head_fn` [hc_mult, hc_mult * hidden] F16 raw on GPU.
+    pub hc_head_fn: Option<rdna_compute::GpuTensor>,
+    /// `hc_head_base` [hc_mult] F16 raw on GPU.
+    pub hc_head_base: Option<rdna_compute::GpuTensor>,
+    /// `hc_head_scale` is shape [1] F16 on disk — cached as host f32 scalar.
+    pub hc_head_scale: f32,
     /// One bundle per `num_hidden_layers` (43 on V4F).
     pub layers: Vec<DeepseekV4LayerWeights>,
     /// MTP head — structurally identical to a main layer, plus an
@@ -483,6 +489,11 @@ pub struct DeepseekV4State {
     /// FWHT-rotated wo_a_out for the wo_b GEMV input.
     pub wo_a_out_rot: Option<rdna_compute::GpuTensor>,
 
+    /// Head HC pre-weights `[hc_mult=4]` F32 from hc_head_compute_pre.
+    pub head_hc_pre: Option<rdna_compute::GpuTensor>,
+    /// Head HC combined-streams output `[hidden]` F32 → output_norm → lm_head.
+    pub head_hc_out: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -538,6 +549,8 @@ impl DeepseekV4State {
             attn_out_raw_rot: None,
             wo_a_out: None,
             wo_a_out_rot: None,
+            head_hc_pre: None,
+            head_hc_out: None,
             n_tokens: 0,
             _scaffold: (),
         })

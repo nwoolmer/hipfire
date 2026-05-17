@@ -1612,3 +1612,8 @@ pub const ROPE_TAIL_INVERSE_SRC: &str =
 /// `torch.view_as_complex` variant, distinct from HF rotate_half).
 pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_interleaved.hip");
+
+/// V4F head HC mix — compute per-stream pre weights for the final
+/// 4-stream → hidden projection before lm_head.
+pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
+    include_str!("../../../kernels/src/hc_head_compute_pre.hip");
