@@ -56,12 +56,16 @@ fn main() -> Result<(), String> {
 
     let c_out = gpu.download_f32(&d_c).map_err(|e| format!("d2h: {e:?}"))?;
 
-    // Expected: sum_d x[d] * W[c, d] + base[c]
-    //         = X_DIM * 0.01 * 0.001 * (c+1) + 0.5*(c+1)
-    //         = 0.00256 * (c+1) + 0.5*(c+1)
+    // V4F-faithful: c = (X·W) * rsqrt(mean(X^2) + eps) + base
+    //   X·W summed = X_DIM * 0.01 * 0.001 * (c+1) = 0.00256 * (c+1)
+    //   mean(X^2) = 0.01^2 = 1e-4
+    //   rsqrt = 1 / sqrt(1e-4 + 1e-6) ≈ 1 / 0.01005 ≈ 99.504
+    //   c[c] = 0.00256*(c+1) * 99.504 + 0.5*(c+1) ≈ 0.2547*(c+1) + 0.5*(c+1)
+    let mean_sq = 0.01f32 * 0.01f32;
+    let rsqrt = 1.0 / (mean_sq + 1e-6f32).sqrt();
     let expected: Vec<f32> = (0..N_CTRL).map(|c| {
         let f = (c + 1) as f32;
-        X_DIM as f32 * 0.01 * 0.001 * f + 0.5 * f
+        X_DIM as f32 * 0.01 * 0.001 * f * rsqrt + 0.5 * f
     }).collect();
 
     eprintln!("c_out:    {c_out:?}");
