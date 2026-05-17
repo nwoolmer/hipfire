@@ -71,7 +71,7 @@ pub fn decode_step(
         //     Apply rotation on last `qk_rope_head_dim = 64` of each
         //     head's 512 dims.
         //     SWA ring write deferred (needs swa state alloc per layer).
-        apply_tail_rope(cfg, state, gpu, position)?;
+        apply_tail_rope(cfg, state, gpu, position, layer_idx)?;
 
         // iv. Indexer path (only when compress_ratio > 0):
         //     a. Compressor: x @ compressor.wkv → idx_qk
@@ -654,9 +654,9 @@ fn attn_stub(
         ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
     }
 
-    // Inverse tail RoPE on attn_out_raw (interleaved convention,
-    // matches forward apply_tail_rope). Undoes the RoPE that V baked
-    // in so wo_a/wo_b sees position-agnostic angular state.
+    // Inverse tail RoPE on attn_out_raw. Same freq_base as forward
+    // apply_tail_rope (rope_theta everywhere — see note there about
+    // the compress_rope_theta + YaRN tradeoff).
     let pos_buf = state.pos_buf.as_ref()
         .ok_or_else(|| "pos_buf not allocated".to_string())?;
     gpu.rope_tail_inverse(attn_out_raw, pos_buf,
@@ -984,6 +984,7 @@ fn apply_tail_rope(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     position: u32,
+    layer_idx: usize,
 ) -> Result<(), String> {
     // Lazy-alloc pos_buf and write current position. Use F32 alloc;
     // the kernel reinterprets the 4-byte slot as int.
@@ -999,9 +1000,15 @@ fn apply_tail_rope(
     let q  = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
 
-    // V4F upstream uses `torch.view_as_complex` → INTERLEAVED pairs
-    // (2i, 2i+1) within the tail region. Half-split would give the
-    // wrong rotation against the trained K weights.
+    // V4F upstream uses `compress_rope_theta` (160000) WITH YaRN for
+    // layers with compress_ratio>0, and `rope_theta` (10000) WITHOUT
+    // YaRN for ratio=0. Tested using compress_rope_theta naively (no
+    // YaRN) for ratio>0 layers → ppl 272k (worse than 119k with base
+    // 10000 everywhere). Without proper YaRN scaling the larger theta
+    // gives wrong rotations. Keeping rope_theta everywhere as the less-
+    // wrong approximation until YaRN is wired.
+    let _ = layer_idx;
+
     gpu.rope_tail_interleaved(
         q, kv, pos_buf,
         cfg.num_attention_heads as i32,
