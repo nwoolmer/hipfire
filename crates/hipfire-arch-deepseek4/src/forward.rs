@@ -679,10 +679,12 @@ fn attn_stub(
     // the compress_rope_theta + YaRN tradeoff).
     let pos_buf = state.pos_buf.as_ref()
         .ok_or_else(|| "pos_buf not allocated".to_string())?;
-    gpu.rope_tail_inverse(attn_out_raw, pos_buf,
-        n_heads as i32, head_dim as i32,
-        cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-    ).map_err(|e| format!("rope_tail_inverse l{layer_idx}: {e:?}"))?;
+    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
+        gpu.rope_tail_inverse(attn_out_raw, pos_buf,
+            n_heads as i32, head_dim as i32,
+            cfg.qk_rope_head_dim as i32, cfg.rope_theta,
+        ).map_err(|e| format!("rope_tail_inverse l{layer_idx}: {e:?}"))?;
+    }
 
     // O-LoRA projection: wo_a per-group + wo_b.
     //   wo_a: [n_groups * o_lora_rank, heads_per_group * head_dim] MQ4
@@ -812,8 +814,6 @@ fn moe_route(
         .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
     let gate_b = layer.gate_bias.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} gate.bias missing (score-routed)"))?;
-    let hc_x_in = state.hc_x_in.as_ref()
-        .ok_or_else(|| "hc_x_in not allocated for router".to_string())?;
 
     let n_exp = cfg.n_routed_experts;
     let k = cfg.num_experts_per_tok;
@@ -828,17 +828,16 @@ fn moe_route(
     let scores = state.router_scores.as_ref().unwrap();
     let topk = state.topk_indices.as_ref().unwrap();
 
-    // gate.weight is MQ4G256, so feed the FWHT-rotated ffn_input.
-    // hc_x_in is NOT rotated (it's the linear A·X output). We need
-    // to rotate first. Reuse state.tmp (overwriting whatever's there
-    // — at this point ffn-block hasn't started yet so tmp is free).
-    let tmp = state.tmp.as_ref()
-        .ok_or_else(|| "tmp not allocated for router rotation".to_string())?;
-    gpu.rotate_x_mq(hc_x_in, tmp, cfg.hidden_size)
-        .map_err(|e| format!("rotate_x_mq router layer {layer_idx}: {e:?}"))?;
+    // Upstream V4F gates on the POST-ffn_norm input (same x that
+    // shared/routed experts see). ffn_x_rot is already FWHT(ffn_norm
+    // (hc_x_in)) — the right tensor to feed the gate's MQ4 GEMV.
+    // Using raw hc_x_in (as we did before) caused scores to scale with
+    // stream magnitude, biasing expert selection.
+    let ffn_x_rot = state.ffn_x_rot.as_ref()
+        .ok_or_else(|| "ffn_x_rot not allocated — moe_route must run after ffn_stub".to_string())?;
 
-    // logits = gate.weight @ tmp_rot
-    gpu.gemv_mq4g256_prerotated(gate_w, tmp, scores, n_exp, cfg.hidden_size)
+    // logits = gate.weight @ ffn_x_rot
+    gpu.gemv_mq4g256_prerotated(gate_w, ffn_x_rot, scores, n_exp, cfg.hidden_size)
         .map_err(|e| format!("gemv gate layer {layer_idx}: {e:?}"))?;
 
     // logits += gate.bias (bias is F16, scores is F32 — need a kernel
