@@ -1181,11 +1181,11 @@ fn q_lora(
 
     // 4.5. Per-head RMSNorm of Q (upstream V4F:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
-    //     NO learnable scale — pass a [head_dim] vector of ones as
-    //     weight. Q is shaped [n_heads, head_dim] so rmsnorm_f32's
-    //     batched path normalizes each head independently.
-    gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
-        .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
+    //     Skip via HIPFIRE_V4F_SKIP_QHN=1 for bisecting.
+    if std::env::var("HIPFIRE_V4F_SKIP_QHN").ok().as_deref() != Some("1") {
+        gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
+            .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
+    }
 
     Ok(())
 }
