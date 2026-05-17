@@ -202,15 +202,73 @@ fn compressor_forward(
     let should_compress = (pos + 1) % ratio == 0;
     if !should_compress { return Ok(()); }
 
-    // TODO (phase 3b.3): compress + norm + (optional RoPE) + kv_cache write + state shift.
-    // Pieces needed:
-    //   if overlap: compressor_overlap_concat_f32 → concat_kv, concat_score
-    //   else:       use kv_state/score_state directly as [ratio, head_dim]
-    //   compressor_softmax_pool_f32 → kv_cache slot
-    //   rmsnorm_f32 (with `norm` weight)
-    //   if is_indexer: rope_tail_interleaved with compress_rope_theta
-    //   for overlap: memcpy kv_state[ratio:2*ratio] → kv_state[0:ratio]
-    let _ = (norm, max_compressed);
+    let compressed_slot = pos / ratio;
+    if compressed_slot >= max_compressed {
+        // Cache full; skip — TODO: ring or panic when long context exceeds cap.
+        return Ok(());
+    }
+
+    let l_state = &state._indexer[layer_idx];
+    let kv_state = if is_indexer {
+        l_state.indexer_kv_state.as_ref().unwrap()
+    } else {
+        l_state.main_kv_state.as_ref().unwrap()
+    };
+    let score_state = if is_indexer {
+        l_state.indexer_score_state.as_ref().unwrap()
+    } else {
+        l_state.main_score_state.as_ref().unwrap()
+    };
+    let kv_cache = if is_indexer {
+        l_state.indexer_kv_cache.as_ref().unwrap()
+    } else {
+        l_state.main_kv_cache.as_ref().unwrap()
+    };
+
+    let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+
+    if overlap {
+        let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
+        let concat_score = l_state.comp_concat_score.as_ref().unwrap();
+
+        // Build concat views from [2*ratio, 2*head_dim] state → [2*ratio, head_dim].
+        gpu.compressor_overlap_concat_f32(kv_state, concat_kv, ratio as i32, head_dim as i32)
+            .map_err(|e| format!("comp concat_kv l{layer_idx}: {e:?}"))?;
+        gpu.compressor_overlap_concat_f32(score_state, concat_score, ratio as i32, head_dim as i32)
+            .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
+
+        // Pool with softmax weights → [head_dim] at kv_cache slot.
+        gpu.compressor_softmax_pool_f32(concat_kv, concat_score, &kv_cache_slot,
+            (2 * ratio) as i32, head_dim as i32)
+            .map_err(|e| format!("comp pool l{layer_idx}: {e:?}"))?;
+    } else {
+        // overlap=false (ratio=128): state IS already [ratio, head_dim] since
+        // coff=1 → proj_dim=head_dim. Pool directly.
+        gpu.compressor_softmax_pool_f32(kv_state, score_state, &kv_cache_slot,
+            ratio as i32, head_dim as i32)
+            .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
+    }
+
+    // RMSNorm in place on the compressed kv_cache slot.
+    gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
+        .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
+
+    // TODO (phase 3b.4): if is_indexer, apply tail RoPE on kv_cache_slot
+    //   with cfg.compress_rope_theta and position (pos // ratio) * ratio.
+
+    // State shift for overlap: kv_state[:ratio] = kv_state[ratio:].
+    if overlap {
+        let shift_bytes = ratio * proj_dim * 4;
+        let src_view = kv_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
+        let dst_view = kv_state.sub_offset(0, ratio * proj_dim);
+        gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
+            .map_err(|e| format!("comp kv_state shift l{layer_idx}: {e:?}"))?;
+
+        let src_view = score_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
+        let dst_view = score_state.sub_offset(0, ratio * proj_dim);
+        gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
+            .map_err(|e| format!("comp score_state shift l{layer_idx}: {e:?}"))?;
+    }
 
     Ok(())
 }
