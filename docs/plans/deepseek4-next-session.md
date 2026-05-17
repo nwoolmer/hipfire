@@ -28,23 +28,34 @@ Phases 1-4b shipped + working under env flags:
 | HIPFIRE_V4F_RUN_INDEXER=1      | + indexer scoring + top-K selection   | 18.0k (no-op) |
 | HIPFIRE_V4F_USE_INDEXER_ATTN=1 | + joint SWA + gathered-topK softmax   | **1080k (16× regress)** |
 
-The phase 5 attention regression is reproducible and likely due to a
-K-space mismatch: `main_kv_cache` content (softmax-pool of `wkv @ x`
-through `compressor.norm`, no RoPE) is NOT in the same space as
-`swa_k` (`wkv @ x` through `kv_norm` then tail-RoPE). Joint softmax
-poisons the output.
+The phase 5 attention regression is reproducible. **Root cause isolated
+via HIPFIRE_V4F_DUMP_PHASE5_K**: main_kv_cache K is 10-1000× smaller in
+RMS than swa_k. E.g. at ctx=32:
 
-Tried adding tail-RoPE (`rope_theta=10000`) to main compressor output
-— bit-identical PPL, so K-RoPE is NOT the gating issue. Next session
-should bisect:
-1. Pass dummy zeros for gathered_k/v with n_active_topk=1 → if PPL
-   matches v4f_attn_swa, kernel math is right and the regression is
-   purely about main_kv_cache content.
-2. Dump main_kv_cache magnitudes and compare against SWA K magnitudes.
-   If magnitudes differ by >2-3x, that's the smoking gun.
-3. Try replacing main_kv_cache with a copy of swa_k content via gather
-   from indices < n_valid_swa. If PPL improves, full positional cache
-   is what's needed (not compressed cache).
+  L 2: swa_k rms=0.57   |  main_kv_cache rms=0.003   (200× smaller)
+  L22: swa_k rms=1.08   |  main_kv_cache rms=0.24    (4.5× smaller)
+  L42: swa_k rms=0.66   |  main_kv_cache rms=0.0007  (~1000× smaller)
+
+Gathered K contributes ~zero to Q·K dot products → softmax collapses
+weights toward SWA-only → but gathered V values (also tiny) still get
+some probability mass → contributes near-zero V → pulls attention
+output toward zero → breaks residual stream.
+
+**Pre-window filter** (1043fc3) at least disables phase 5 within the
+SWA window (no double-counting), so default behaviour and ctx≤128 are
+clean. ctx=256 regression is contained at 133k (vs 35.5k baseline, vs
+1080k unfiltered).
+
+**Next-session fixes to try:**
+1. **Re-quantize `compressor.norm` with FP16 passthrough** — MQ2-Lloyd
+   rounds small RMSNorm weights toward 0, killing the compressor's K
+   magnitude. Pin compressor.norm.weight to FP16 in the HFQ converter.
+2. **Multiply gathered K/V by a per-layer scale at gather time** —
+   normalize gathered values up to match SWA K RMS. Quick test:
+   `scale = (swa_k_rms / main_kv_cache_rms)` computed once per layer.
+3. **Bypass main compressor entirely** — use a full positional K cache
+   instead. Phase 5 then gathers raw K (post-RoPE, post-kv_norm) at
+   indexer-selected positions. Larger but architecturally cleaner.
 
 ## Big bugs fixed this session
 
