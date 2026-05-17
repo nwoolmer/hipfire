@@ -3768,6 +3768,15 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
+
+    // Antirez ds4 recipe (PROVEN reference): keep precision-sensitive
+    // non-expert tensors at F16 to match antirez/ds4's Q2-imatrix layout.
+    // When set with --format mq4-mq2lloyd-native, all Base-tier non-expert
+    // weight matrices that would have been MQ4G256 ship as F16 instead.
+    // Effect: model size ≈ 82 GB → ~100 GB but matches antirez's "IQ2 +
+    // F16 everywhere else" recipe that's known to produce coherent
+    // long-context output. Routed experts stay MQ2-Lloyd unchanged.
+    let non_expert_f16 = args.iter().any(|a| a == "--non-expert-f16");
     if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
@@ -4580,6 +4589,16 @@ fn main() {
             } else if (use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if non_expert_f16 && use_mq4_mq2lloyd_native {
+                // Antirez ds4 recipe: keep non-expert weights at F16 to
+                // preserve compressor / indexer / attention projection
+                // precision. Reached only for Base-tier non-expert tensors
+                // (routed experts handled in the earlier expert split).
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                (f16_bytes, QuantType::F16, 0u32, "F16 (non-expert)")
             } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {

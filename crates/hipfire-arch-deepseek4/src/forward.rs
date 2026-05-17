@@ -1180,13 +1180,40 @@ fn attn_stub(
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-            gpu.v4f_attn_swa_topk_f32(
-                q, swa_k, swa_v, gathered_k, gathered_k,
-                attn_sink, attn_out_raw,
-                n_heads as i32, head_dim as i32,
-                win as i32, topk_max as i32,
-                n_valid, k_active as i32,
-            ).map_err(|e| format!("v4f_attn_swa_topk l{layer_idx}: {e:?}"))?;
+
+            // Phase 5d: SEPARATE softmaxes + weighted combine.
+            //
+            // The joint softmax in v4f_attn_swa_topk_f32 is poisonous —
+            // adding gathered entries (even with K=0, V=0) inflates the
+            // partition function and dilutes SWA probabilities. Proof:
+            // K_SCALE=0 → 137k ppl @ ctx=256 vs SWA-only 35.5k baseline.
+            //
+            // Mitigation: run SWA attention to attn_out_raw, then run a
+            // SECOND attention pass over gathered K/V to a side buffer,
+            // and scaled_add the topk contribution with alpha (env-gated,
+            // default 0.0 = pure SWA = no change). Tune alpha at ctx>=256.
+            let topk_alpha: f32 = std::env::var("HIPFIRE_V4F_TOPK_ALPHA")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            // Pass 1: SWA attention to attn_out_raw.
+            gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
+                n_heads as i32, head_dim as i32, n_groups as i32,
+                n_valid, win as i32,
+            ).map_err(|e| format!("v4f_attn_swa (phase5d swa) l{layer_idx}: {e:?}"))?;
+
+            if topk_alpha > 0.0 {
+                // Pass 2: gathered attention. Re-use attn_out_raw_rot as
+                // a scratch (it's only used downstream of inverse-RoPE,
+                // so safe to reuse here).
+                let attn_out_raw_topk = state.attn_out_raw_rot.as_ref().unwrap();
+                gpu.v4f_attn_swa(q, gathered_k, gathered_k, attn_sink, attn_out_raw_topk,
+                    n_heads as i32, head_dim as i32, n_groups as i32,
+                    k_active as i32, topk_max as i32,
+                ).map_err(|e| format!("v4f_attn_swa (phase5d topk) l{layer_idx}: {e:?}"))?;
+                // attn_out_raw += topk_alpha * attn_out_raw_topk
+                gpu.scaled_add_inplace_cpu_scalar_f32(
+                    attn_out_raw, attn_out_raw_topk, topk_alpha
+                ).map_err(|e| format!("phase5d scaled_add l{layer_idx}: {e:?}"))?;
+            }
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
