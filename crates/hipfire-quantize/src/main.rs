@@ -4590,14 +4590,10 @@ fn main() {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if non_expert_f16 && use_mq4_mq2lloyd_native && {
-                // Antirez ds4 recipe (PARTIAL — precision-sensitive tensors only):
-                // promote compressor / indexer / HC / router tensors to F16 while
-                // leaving attention projections (wq_a/b, wkv, wo_a/b, shared_w*) at
-                // MQ4 because the per-group sub_offset byte-stride logic in
-                // hipfire-arch-deepseek4's attn_stub assumes byte-sized dtype.
-                // Compressor and indexer don't use sub_offset on their weights, so
-                // F16 promotion there is safe and addresses the smoking-gun
-                // K-magnitude mismatch on phase-5 attention.
+                // Antirez ds4 PRECISION-CRITICAL group: F16 for compressor /
+                // indexer / HC / router-bias (small tensors, sensitive to
+                // quant noise). Matches antirez's "F16 everywhere else"
+                // tier exactly.
                 name.contains("compressor") || name.contains("indexer")
                     || name.contains("hc_") || name.contains("gate.bias")
             } {
@@ -4606,6 +4602,23 @@ fn main() {
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16 (compressor/indexer/HC)")
+            } else if non_expert_f16 && use_mq4_mq2lloyd_native && {
+                // Antirez ds4 ATTENTION + SHARED EXPERT group: Q8_0 for
+                // attention projections (wq_a, wq_b, wkv, wo_a, wo_b) and
+                // shared experts (w1, w2, w3). Antirez stores these as Q8_0
+                // (8.5 bpw) instead of MQ4G256 (4.5 bpw) — 2× precision.
+                // Hand-pattern-match by tensor name suffix to avoid
+                // catching the FFN routed experts (handled separately in
+                // the expert-split path above).
+                name.contains("attn.wq_a") || name.contains("attn.wq_b")
+                    || name.contains("attn.wkv") || name.contains("attn.wo_a")
+                    || name.contains("attn.wo_b")
+                    || name.contains("shared_experts.w1")
+                    || name.contains("shared_experts.w2")
+                    || name.contains("shared_experts.w3")
+            } {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8F16 (attn/shared antirez)")
             } else if use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {

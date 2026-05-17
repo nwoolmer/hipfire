@@ -48,14 +48,20 @@ impl DeepseekV4 {
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
     }
 
-    /// Upload a weight that may be either MQ4G256 (Raw bytes) or F16
-    /// (per `--non-expert-f16` quant flag). When F16 in HFQ, decode to F32
-    /// on host and upload as F32 (DType::F32). Otherwise upload raw bytes
-    /// (DType::Raw). Forward.rs branches on the resulting GpuTensor.dtype
-    /// to choose between `gemv_mq4g256_prerotated` (Raw) and `gemv_f32`
-    /// (F32). Distinct from `upload_global_raw` because the HC kernels
+    /// Upload a weight whose HFQ format is one of:
+    ///   - F16 (quant_type=1): decode to F32 on host, upload as F32, set
+    ///     GpuTensor.dtype = F32. Forward routes to `gemv_f32` with plain
+    ///     (non-FWHT) input.
+    ///   - Q8F16 (quant_type=3): upload raw bytes, set GpuTensor.dtype =
+    ///     Q8_0. Forward routes to `gemv_q8_0` with plain input.
+    ///   - Otherwise (typically quant_type=13 MQ4G256): upload raw bytes,
+    ///     dtype stays Raw. Forward routes to `gemv_mq4g256_prerotated`
+    ///     with FWHT-rotated input.
+    ///
+    /// Distinct from `upload_global_raw` because the HC kernels
     /// (hc_compute_control, hc_apply_alpha) expect their weights as
-    /// `__half*` — caller must pick the right helper per tensor.
+    /// `__half*` — those tensors must use `upload_global_raw`, NOT this
+    /// helper, so the GPU pointer is a raw F16 byte buffer.
     fn upload_quant_or_f16(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -65,8 +71,8 @@ impl DeepseekV4 {
             .tensor_data(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
-        // quant_type = 1 → F16 (matches QuantType::F16 in hipfire-quantize).
         if info.quant_type == 1 {
+            // F16 source → decode to F32 on upload.
             let n: usize = shape.iter().product();
             if bytes.len() != n * 2 {
                 return Err(format!(
@@ -82,8 +88,15 @@ impl DeepseekV4 {
             return gpu.upload_f32(&f32_vals, &shape)
                 .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"));
         }
-        gpu.upload_raw(bytes, &shape)
-            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+        // Q8F16 (quant_type=3) or MQ4G256 (quant_type=13) and other 2D
+        // quants: upload raw, then tag the GpuTensor dtype so forward.rs
+        // can dispatch the right GEMV kernel.
+        let mut t = gpu.upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
+        if info.quant_type == 3 {
+            t.dtype = rdna_compute::DType::Q8_0;
+        }
+        Ok(t)
     }
 
     /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
@@ -351,15 +364,19 @@ impl Architecture for DeepseekV4 {
                 &format!("layers.{l}.attn.attn_sink"))?);
 
             // Attention LoRA + KV joint.
-            layer.wq_a = Some(Self::upload_global_raw(hfq, gpu,
+            // Attention projections — antirez recipe ships these as Q8_0
+            // (8.5 bpw, 2× precision of MQ4G256). Dispatcher in
+            // forward.rs branches on GpuTensor.dtype: Raw → MQ4 prerotated,
+            // Q8_0 → gemv_q8_0 with plain RMSNorm'd input.
+            layer.wq_a = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.attn.wq_a.weight"))?);
-            layer.wq_b = Some(Self::upload_global_raw(hfq, gpu,
+            layer.wq_b = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.attn.wq_b.weight"))?);
-            layer.wkv  = Some(Self::upload_global_raw(hfq, gpu,
+            layer.wkv  = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.attn.wkv.weight"))?);
-            layer.wo_a = Some(Self::upload_global_raw(hfq, gpu,
+            layer.wo_a = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.attn.wo_a.weight"))?);
-            layer.wo_b = Some(Self::upload_global_raw(hfq, gpu,
+            layer.wo_b = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.attn.wo_b.weight"))?);
 
             // Main-attention compressor — only when ratio > 0. Use the
@@ -446,11 +463,12 @@ impl Architecture for DeepseekV4 {
             }
 
             // Shared expert.
-            layer.shared_w1 = Some(Self::upload_global_raw(hfq, gpu,
+            // Shared experts — antirez Q8_0 path (same dispatch logic).
+            layer.shared_w1 = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.ffn.shared_experts.w1.weight"))?);
-            layer.shared_w2 = Some(Self::upload_global_raw(hfq, gpu,
+            layer.shared_w2 = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.ffn.shared_experts.w2.weight"))?);
-            layer.shared_w3 = Some(Self::upload_global_raw(hfq, gpu,
+            layer.shared_w3 = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.ffn.shared_experts.w3.weight"))?);
 
             // Routed experts: 256 × 3 = 768 tensors per layer ×

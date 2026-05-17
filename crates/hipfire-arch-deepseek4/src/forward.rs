@@ -43,16 +43,17 @@ fn gemv_auto(
     y: &GpuTensor,
     m: usize, k: usize,
 ) -> Result<(), String> {
-    // `upload_global_raw` stores quant-format weights as `DType::Raw`;
-    // F16-source weights are decoded to F32 at upload and tagged F32.
-    // So a simple binary split is sufficient: F32 → plain F32 GEMV,
-    // anything else → MQ4 prerotated.
-    if weight.dtype == DType::F32 {
-        gpu.gemv_f32(weight, x_plain, y)
-            .map_err(|e| format!("gemv_f32 (non-expert F16→F32): {e:?}"))
-    } else {
-        gpu.gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
-            .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}"))
+    // Dispatch by GpuTensor.dtype (set by upload_quant_or_f16):
+    //   F32  — F16-source weight, decoded at upload. Use plain input.
+    //   Q8_0 — Q8F16-source (antirez attn/shared quant). Use plain input.
+    //   else (Raw) — MQ4G256 default. Use FWHT-rotated input.
+    match weight.dtype {
+        DType::F32 => gpu.gemv_f32(weight, x_plain, y)
+            .map_err(|e| format!("gemv_f32: {e:?}")),
+        DType::Q8_0 => gpu.gemv_q8_0(weight, x_plain, y, m, k)
+            .map_err(|e| format!("gemv_q8_0: {e:?}")),
+        _ => gpu.gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
+            .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}")),
     }
 }
 
@@ -1309,28 +1310,51 @@ fn attn_stub(
     // FWHT-rotate per-group slices of attn_out_raw (k=heads_per_group*head_dim).
     let heads_per_group = n_heads / n_groups;
     let per_group_in = heads_per_group * head_dim;
-    // wo_a is MQ4G256 with 136 bytes per 256 elements. Per-group slice
-    // has o_lora_rank * per_group_in elements → bytes = (m*k/256)*136.
-    let per_group_wa_bytes = (o_lora_rank * per_group_in / 256) * 136;
+    let per_group_elems = o_lora_rank * per_group_in;
+    // Per-group byte stride depends on wo_a's dtype:
+    //   MQ4G256 (Raw):     136 bytes per 256 elements
+    //   Q8_0:               34 bytes per 32 elements
+    //   F32 (F16-source):   4 bytes per element (handled via sub_offset's
+    //                       built-in size scaling — pass elem count)
+    let per_group_wa_bytes_raw = (per_group_elems / 256) * 136;
+    let per_group_wa_bytes_q8  = (per_group_elems / 32) * 34;
 
     for g in 0..n_groups {
         let raw_view = attn_out_raw.sub_offset(g * per_group_in, per_group_in);
         let rot_view = attn_out_raw_rot.sub_offset(g * per_group_in, per_group_in);
-        let wo_a_view = wo_a.sub_offset(g * per_group_wa_bytes, per_group_wa_bytes);
+        // Dtype-aware sub-view for wo_a's per-group slice.
+        let wo_a_view = match wo_a.dtype {
+            DType::F32 => {
+                // sub_offset handles size scaling for F32 (size=4). Result
+                // is 1D; gemv_f32 expects 2D [m, k] so we mutate the shape.
+                let mut v = wo_a.sub_offset(g * per_group_elems, per_group_elems);
+                v.shape = vec![o_lora_rank, per_group_in];
+                v
+            }
+            DType::Q8_0 => {
+                wo_a.sub_offset(g * per_group_wa_bytes_q8, per_group_wa_bytes_q8)
+            }
+            _ => {
+                wo_a.sub_offset(g * per_group_wa_bytes_raw, per_group_wa_bytes_raw)
+            }
+        };
         let out_view = wo_a_out.sub_offset(g * o_lora_rank, o_lora_rank);
+        // FWHT-rotate input. Only the MQ4 path actually consumes the
+        // rotated view (gemv_f32 / gemv_q8_0 use plain input), but the
+        // rotation is cheap and we always have raw_view available.
         gpu.rotate_x_mq(&raw_view, &rot_view, per_group_in)
             .map_err(|e| format!("rotate attn_out g{g} l{layer_idx}: {e:?}"))?;
-        gpu.gemv_mq4g256_prerotated(&wo_a_view, &rot_view, &out_view,
-                o_lora_rank, per_group_in)
-            .map_err(|e| format!("gemv wo_a g{g} l{layer_idx}: {e:?}"))?;
+        // Dispatch per dtype with the correct input.
+        gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
+                  o_lora_rank, per_group_in)?;
     }
 
     // FWHT-rotate wo_a_out then wo_b GEMV → final_attn_out [hidden].
+    // wo_b path: F32/Q8 use plain wo_a_out; MQ4 uses wo_a_out_rot.
     gpu.rotate_x_mq(wo_a_out, wo_a_out_rot, groups_o_lora)
         .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
-    gpu.gemv_mq4g256_prerotated(wo_b, wo_a_out_rot, final_attn_out,
-            cfg.hidden_size, groups_o_lora)
-        .map_err(|e| format!("gemv wo_b l{layer_idx}: {e:?}"))?;
+    gemv_auto(gpu, wo_b, wo_a_out_rot, wo_a_out, final_attn_out,
+              cfg.hidden_size, groups_o_lora)?;
 
     Ok(())
 }
