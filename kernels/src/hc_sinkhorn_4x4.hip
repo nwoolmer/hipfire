@@ -1,23 +1,18 @@
 // Hyper-Connections Sinkhorn normaliser (V4F Phase 3).
 //
-// Takes a 4×4 mixing matrix (stored as 16 fp32 values, derived from
-// the per-layer hc_*_fn projection + hc_*_base bias) and runs N
-// rounds of alternating row/column normalisation. After N iters,
-// each row and column sums to 1 (within `eps`).
+// Mirrors upstream `hc_split_sinkhorn_kernel` exactly:
+//   1. comb = softmax(comb, dim=-1) + eps    (row-wise softmax + eps)
+//   2. comb = comb / (comb.sum(-2) + eps)    (column normalize)
+//   3. for sinkhorn_iters - 1 more iters:
+//        comb = comb / (comb.sum(-1) + eps)  (row normalize)
+//        comb = comb / (comb.sum(-2) + eps)  (column normalize)
 //
-// V4F uses N = hc_sinkhorn_iters = 20 by default.
+// Result is approximately doubly stochastic (rows and columns sum to 1).
 //
-// Signature:
-//
-//   matrix : [16] fp32, in/out (modified in place)
-//   eps    : scalar fp32
-//   iters  : scalar int (N)
-//
-// Strategy: one workgroup, 4 threads (one per row). Communication
-// via warp-shuffles or shared memory.
-//
-// Status: STUB. Single-thread reference implementation for
-// correctness; production version uses warp-level reduction.
+// Previous version used a clamp([-2,2])+exp+alternating-col-row pattern
+// which has different initial dynamics than upstream's row-softmax. The
+// clamp limited dynamic range too aggressively and the iteration order
+// was col-first rather than row-first.
 
 #include <hip/hip_runtime.h>
 
@@ -26,40 +21,52 @@ extern "C" __global__ void hc_sinkhorn_4x4(
     float  eps,
     int    iters
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;  // stub: single-thread.
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;  // single-thread reference
 
-    // V4F mHC Sinkhorn-Knopp:
-    //   M^(0) = exp(B̃_l), then alternating column-row normalization
-    //   for tmax = hc_sinkhorn_iters = 20 iters.
-    // (DeepSeek_V4.pdf §2.2 "Manifold-Constrained Residual Mapping".)
-    //
-    // Aggressive pre-clamp [-2, 2]: produces post-Sinkhorn entries in
-    // a much tighter range (exp(2)/exp(-2) = ~55, well-bounded
-    // doubly-stochastic). Less paper-faithful than wide [-10, 10]
-    // but stabilises 43-layer accumulation when proper α scaling
-    // isn't fully wired.
-    for (int i = 0; i < 16; ++i) {
-        float v = matrix[i];
-        if (v >  2.0f) v =  2.0f;
-        if (v < -2.0f) v = -2.0f;
-        matrix[i] = expf(v);
+    // Step 1: row-softmax + eps
+    for (int r = 0; r < 4; ++r) {
+        // row max
+        float rm = matrix[r * 4 + 0];
+        for (int c = 1; c < 4; ++c) {
+            float v = matrix[r * 4 + c];
+            if (v > rm) rm = v;
+        }
+        // exp(x - rm)
+        float rs = 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            float v = __expf(matrix[r * 4 + c] - rm);
+            matrix[r * 4 + c] = v;
+            rs += v;
+        }
+        // normalize + eps
+        for (int c = 0; c < 4; ++c) {
+            matrix[r * 4 + c] = matrix[r * 4 + c] / rs + eps;
+        }
     }
 
-    // Paper: M^(t) = T_r(T_c(M^(t-1))) — column then row per iter.
-    for (int it = 0; it < iters; ++it) {
-        // Column normalisation.
-        for (int c = 0; c < 4; ++c) {
-            float sum = 0.0f;
-            for (int r = 0; r < 4; ++r) sum += matrix[r * 4 + c];
-            sum += eps;
-            for (int r = 0; r < 4; ++r) matrix[r * 4 + c] /= sum;
-        }
-        // Row normalisation.
+    // Step 2: column normalize
+    for (int c = 0; c < 4; ++c) {
+        float cs = 0.0f;
+        for (int r = 0; r < 4; ++r) cs += matrix[r * 4 + c];
+        cs += eps;
+        for (int r = 0; r < 4; ++r) matrix[r * 4 + c] /= cs;
+    }
+
+    // Step 3: (iters - 1) more iterations alternating row and column.
+    for (int it = 0; it < iters - 1; ++it) {
+        // row normalize
         for (int r = 0; r < 4; ++r) {
-            float sum = 0.0f;
-            for (int c = 0; c < 4; ++c) sum += matrix[r * 4 + c];
-            sum += eps;
-            for (int c = 0; c < 4; ++c) matrix[r * 4 + c] /= sum;
+            float rs = 0.0f;
+            for (int c = 0; c < 4; ++c) rs += matrix[r * 4 + c];
+            rs += eps;
+            for (int c = 0; c < 4; ++c) matrix[r * 4 + c] /= rs;
+        }
+        // column normalize
+        for (int c = 0; c < 4; ++c) {
+            float cs = 0.0f;
+            for (int r = 0; r < 4; ++r) cs += matrix[r * 4 + c];
+            cs += eps;
+            for (int r = 0; r < 4; ++r) matrix[r * 4 + c] /= cs;
         }
     }
 }
