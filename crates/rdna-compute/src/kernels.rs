@@ -1630,3 +1630,10 @@ pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
 /// kv_state / score_state buffer (overlap=true, ratio=4 case).
 pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
     include_str!("../../../kernels/src/compressor_overlap_concat.hip");
+
+/// V4F indexer scoring kernel — combined across heads with relu
+/// gating and per-head weights from weights_proj. Operates on the
+/// indexer's compressed K cache (shared across heads, NOT per-head
+/// like the older indexer_compressed_k_score variant).
+pub const INDEXER_RELU_SCORE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score.hip");

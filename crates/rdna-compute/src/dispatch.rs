@@ -19626,6 +19626,55 @@ impl Gpu {
         }
     }
 
+    /// V4F indexer scoring — combined across heads with relu gating.
+    /// `scores[n] = sum_h relu(q[h, :] · k_cache[n, :]) * weights[h]`.
+    /// Block per slot N, threads-per-block = H (one head per thread),
+    /// LDS reduction across heads.
+    pub fn indexer_relu_score_f32(
+        &mut self,
+        q: &GpuTensor,         // [H, D] F32
+        k_cache: &GpuTensor,   // [N, D] F32
+        weights: &GpuTensor,   // [H] F32
+        scores: &GpuTensor,    // [N] F32
+        h: i32,
+        d: i32,
+        n: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_relu_score",
+            kernels::INDEXER_RELU_SCORE_SRC,
+            "indexer_relu_score_f32",
+        )?;
+        let func = &self.functions["indexer_relu_score_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut hi = h;
+        let mut di = d;
+        let mut ni = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n as u32, 1, 1],
+                [h as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F head HC mix — compute the per-stream `pre` weights for the
     /// 4-stream → hidden projection before lm_head. Matches upstream
     /// `ParallelHead.hc_head`.
