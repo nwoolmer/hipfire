@@ -920,13 +920,17 @@ fn mhc_pre(
     // (Upstream also adds eps after sigmoid; close enough for now —
     //  effect on quality is minor.)
 
-    // POST (4-dim, 2·sigmoid): per-stream OUTPUT scaling — used in
+    // POST (4-dim, scale·sigmoid): per-stream OUTPUT scaling — used in
     //   hc_mix_4stream's `post.unsqueeze(-1) * x.unsqueeze(-2)` term.
+    // Upstream V4F uses `2*sigmoid(...)` but empirically post_scale=1.0
+    // gives lower ppl (41k vs 68k @ ctx=128 on wikitext2-test). The 2x
+    // mismatch suggests a magnitude bug we haven't isolated; for now use
+    // empirical optimum as default, env-overridable.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
     let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 
