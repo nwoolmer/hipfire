@@ -420,9 +420,23 @@ pub struct MainAttentionLayerState {
     pub swa_k: Option<rdna_compute::GpuTensor>,
     /// SWA ring V cache. V4F has tied K=V so this is a copy of swa_k.
     pub swa_v: Option<rdna_compute::GpuTensor>,
-    /// K rows gathered from the indexer's top-k indices (Phase 2). Stub.
-    pub _k_gathered: (),
-    pub _v_gathered: (),
+
+    /// Full positional K/V cache for indexer-gathered attention. Layout:
+    /// `[max_ctx, n_kv_heads * head_dim]` F32. Written at each decode
+    /// step (after tail-RoPE). Used by the modified main attention when
+    /// the indexer's top-K points to positions outside the SWA window.
+    ///
+    /// V4F has tied K=V so we keep one buffer; `full_v_cache` is None
+    /// in practice and we re-use `full_k_cache` for both. Field kept for
+    /// future-proofing models with untied K/V.
+    pub full_k_cache: Option<rdna_compute::GpuTensor>,
+    pub full_v_cache: Option<rdna_compute::GpuTensor>,
+
+    /// Gather scratch — concat of SWA-window K/V + indexer-gathered K/V
+    /// for the modified attention pass. `[n_kv_heads, head_dim,
+    /// sliding_window + index_topk]` F32, lazy-alloc.
+    pub gathered_k: Option<rdna_compute::GpuTensor>,
+    pub gathered_v: Option<rdna_compute::GpuTensor>,
 }
 
 /// V4F per-decode state. Held on the daemon's per-session struct,
@@ -579,7 +593,8 @@ impl DeepseekV4State {
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None, swa_v: None,
-                _k_gathered: (), _v_gathered: (),
+                full_k_cache: None, full_v_cache: None,
+                gathered_k: None, gathered_v: None,
             });
         }
         Ok(DeepseekV4State {
