@@ -35,13 +35,6 @@ impl DeepseekV4 {
     /// Upload one global HFQ tensor verbatim (raw bytes) to GPU.
     /// Used for embed/quantized-weights where the on-disk quant format
     /// matches the format the kernels expect to consume.
-    ///
-    /// Auto-detects F16 (quant_type=1) and converts to F32 on the fly so
-    /// the runtime GEMV dispatcher can route to `gemv_f32`. F16-source
-    /// tensors get GpuTensor.dtype = F32 after conversion; non-F16 quants
-    /// preserve their raw layout. This makes the `--non-expert-f16`
-    /// quantizer flag transparent to forward.rs: forward.rs only needs to
-    /// branch on the GpuTensor's dtype field.
     fn upload_global_raw(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -51,9 +44,28 @@ impl DeepseekV4 {
             .tensor_data(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        gpu.upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
+    }
+
+    /// Upload a weight that may be either MQ4G256 (Raw bytes) or F16
+    /// (per `--non-expert-f16` quant flag). When F16 in HFQ, decode to F32
+    /// on host and upload as F32 (DType::F32). Otherwise upload raw bytes
+    /// (DType::Raw). Forward.rs branches on the resulting GpuTensor.dtype
+    /// to choose between `gemv_mq4g256_prerotated` (Raw) and `gemv_f32`
+    /// (F32). Distinct from `upload_global_raw` because the HC kernels
+    /// (hc_compute_control, hc_apply_alpha) expect their weights as
+    /// `__half*` — caller must pick the right helper per tensor.
+    fn upload_quant_or_f16(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         // quant_type = 1 → F16 (matches QuantType::F16 in hipfire-quantize).
-        // For F16-source weights, convert to F32 on the GPU so we can use
-        // gemv_f32 in V4F's forward path. Cost: 2× VRAM for that tensor.
         if info.quant_type == 1 {
             let n: usize = shape.iter().product();
             if bytes.len() != n * 2 {
@@ -350,32 +362,36 @@ impl Architecture for DeepseekV4 {
             layer.wo_b = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.attn.wo_b.weight"))?);
 
-            // Main-attention compressor — only when ratio > 0.
+            // Main-attention compressor — only when ratio > 0. Use the
+            // dual-dtype helper so `--non-expert-f16` quants land as F32
+            // (gemv_f32 path) while default MQ4G256 quants land as Raw
+            // (gemv_mq4g256_prerotated path). gemv_auto in forward.rs
+            // branches on GpuTensor.dtype to pick the right kernel.
             if layer.compress_ratio > 0 {
-                layer.compressor_wkv   = Some(Self::upload_global_raw(hfq, gpu,
+                layer.compressor_wkv   = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.wkv.weight"))?);
-                layer.compressor_wgate = Some(Self::upload_global_raw(hfq, gpu,
+                layer.compressor_wgate = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.wgate.weight"))?);
-                layer.compressor_norm  = Some(Self::upload_global_raw(hfq, gpu,
+                // compressor.norm is a 1D rmsnorm weight — always F16 in HFQ
+                // (kmap rule), kernel expects F32 input via
+                // upload_global_f16_as_f32.
+                layer.compressor_norm  = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.norm.weight"))?);
                 layer.compressor_ape   = Some(Self::upload_global_raw(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.ape"))?);
             }
 
-            // Indexer sub-module — only on layers with compress_ratio == 4
-            // (V4F: layers 2, 4, 6, ..., 42 — alternating with ratio=128 layers).
-            // ratio=128 layers have the main compressor (above) but not the
-            // indexer's Q-projection / weights_proj / separate compressor.
+            // Indexer sub-module — only on layers with compress_ratio == 4.
             if layer.compress_ratio == 4 {
-                layer.indexer_wq_b = Some(Self::upload_global_raw(hfq, gpu,
+                layer.indexer_wq_b = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.wq_b.weight"))?);
-                layer.indexer_weights_proj = Some(Self::upload_global_raw(hfq, gpu,
+                layer.indexer_weights_proj = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.weights_proj.weight"))?);
-                layer.indexer_compressor_wkv = Some(Self::upload_global_raw(hfq, gpu,
+                layer.indexer_compressor_wkv = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.wkv.weight"))?);
-                layer.indexer_compressor_wgate = Some(Self::upload_global_raw(hfq, gpu,
+                layer.indexer_compressor_wgate = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.wgate.weight"))?);
-                layer.indexer_compressor_norm = Some(Self::upload_global_raw(hfq, gpu,
+                layer.indexer_compressor_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.norm.weight"))?);
                 layer.indexer_compressor_ape = Some(Self::upload_global_raw(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.ape"))?);
