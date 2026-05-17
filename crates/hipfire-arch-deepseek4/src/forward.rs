@@ -1093,12 +1093,59 @@ fn attn_stub(
                 .map_err(|e| format!("swa_v write: {e:?}"))?;
         }
         let n_valid = (pos + 1).min(win) as i32;
-        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
-        let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-        gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
-            n_heads as i32, head_dim as i32, n_groups as i32,
-            n_valid, win as i32,
-        ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
+
+        // Phase 5c: indexer-extended attention when (a) HIPFIRE_V4F_RUN_INDEXER=1
+        // populated topk_idx_indices this step, and (b) this layer is an
+        // indexer-active layer (compress_ratio == 4). Joint softmax over the
+        // SWA window K/V AND the top-K K rows gathered from main_kv_cache.
+        let layer_indexer_active = layer.compress_ratio == 4
+            && std::env::var("HIPFIRE_V4F_USE_INDEXER_ATTN").ok().as_deref() == Some("1")
+            && state._indexer[layer_idx].topk_idx_indices.is_some()
+            && state._indexer[layer_idx].main_kv_cache.is_some();
+
+        if layer_indexer_active {
+            let topk_max = cfg.index_topk;
+            // Lazy-alloc gathered_k / gathered_v scratch.
+            if state._attention[layer_idx].gathered_k.is_none() {
+                state._attention[layer_idx].gathered_k = Some(
+                    gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
+                        .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?
+                );
+            }
+            // V4F has tied K=V → re-use the gathered_k buffer for V via a
+            // separate slot pointing to the same allocation. The
+            // v4f_attn_swa_topk_f32 kernel reads two pointers but we can
+            // pass the same one for both since K==V on V4F.
+            let n_compressed = (pos + 1) / 4;  // ratio=4 layers
+            let k_active = n_compressed.min(topk_max);
+            let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+            let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
+            let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+
+            // Gather top-K rows into gathered_k[:, :, 0..k_active].
+            gpu.v4f_topk_kv_gather_f32(
+                main_kv_cache, topk_idx, gathered_k,
+                k_active as i32, head_dim as i32, n_compressed as i32,
+                topk_max as i32, 0,
+            ).map_err(|e| format!("topk gather l{layer_idx}: {e:?}"))?;
+
+            let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+            let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+            gpu.v4f_attn_swa_topk_f32(
+                q, swa_k, swa_v, gathered_k, gathered_k,
+                attn_sink, attn_out_raw,
+                n_heads as i32, head_dim as i32,
+                win as i32, topk_max as i32,
+                n_valid, k_active as i32,
+            ).map_err(|e| format!("v4f_attn_swa_topk l{layer_idx}: {e:?}"))?;
+        } else {
+            let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+            let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+            gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
+                n_heads as i32, head_dim as i32, n_groups as i32,
+                n_valid, win as i32,
+            ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
+        }
     }
 
     // Inverse tail RoPE on attn_out_raw. Same freq_base as forward
