@@ -52,16 +52,120 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// session.md` for the precise step-by-step.
 #[allow(dead_code, clippy::too_many_arguments)]
 fn compressor_forward(
-    _cfg: &DeepseekV4Config,
-    _weights: &DeepseekV4Weights,
-    _state: &mut DeepseekV4State,
-    _gpu: &mut Gpu,
-    _layer_idx: usize,
-    _x_rotated: &GpuTensor,
-    _position: u32,
-    _is_indexer: bool,
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    x_rotated: &GpuTensor,
+    position: u32,
+    is_indexer: bool,
 ) -> Result<(), String> {
-    // Phase 3b: TBD. Kernels ready; needs Rust orchestration.
+    let layer = &weights.layers[layer_idx];
+    let ratio = layer.compress_ratio as usize;
+    if ratio == 0 { return Ok(()); }
+    if is_indexer && ratio != 4 { return Ok(()); }
+
+    let overlap = ratio == 4;
+    let coff: usize = if overlap { 2 } else { 1 };
+    let head_dim = if is_indexer { cfg.index_head_dim } else { cfg.head_dim };
+    let proj_dim = coff * head_dim;
+    let state_rows = coff * ratio;  // 8 for ratio=4 overlap, 128 for ratio=128
+
+    // Pick weights based on which compressor (main vs indexer).
+    let (wkv, wgate, norm, ape) = if is_indexer {
+        (
+            layer.indexer_compressor_wkv.as_ref()
+                .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?,
+            layer.indexer_compressor_wgate.as_ref()
+                .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?,
+            layer.indexer_compressor_norm.as_ref()
+                .ok_or_else(|| format!("idx_comp_norm l{layer_idx}"))?,
+            layer.indexer_compressor_ape.as_ref()
+                .ok_or_else(|| format!("idx_comp_ape l{layer_idx}"))?,
+        )
+    } else {
+        (
+            layer.compressor_wkv.as_ref()
+                .ok_or_else(|| format!("comp_wkv l{layer_idx}"))?,
+            layer.compressor_wgate.as_ref()
+                .ok_or_else(|| format!("comp_wgate l{layer_idx}"))?,
+            layer.compressor_norm.as_ref()
+                .ok_or_else(|| format!("comp_norm l{layer_idx}"))?,
+            layer.compressor_ape.as_ref()
+                .ok_or_else(|| format!("comp_ape l{layer_idx}"))?,
+        )
+    };
+
+    let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+
+    // Lazy-allocate state buffers per (layer, compressor-type).
+    {
+        let l_state = &mut state._indexer[layer_idx];
+        if is_indexer {
+            if l_state.indexer_kv_state.is_none() {
+                l_state.indexer_kv_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx kv_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.indexer_score_state.is_none() {
+                l_state.indexer_score_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.indexer_kv_cache.is_none() {
+                l_state.indexer_kv_cache = Some(gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?);
+            }
+        } else {
+            if l_state.main_kv_state.is_none() {
+                l_state.main_kv_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc main kv_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.main_score_state.is_none() {
+                l_state.main_score_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.main_kv_cache.is_none() {
+                l_state.main_kv_cache = Some(gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?);
+            }
+        }
+    }
+
+    // Scratch: kv_buf, score_buf [proj_dim] + (if overlap) concat scratches
+    // [2*ratio, head_dim]. Per-step, can reuse across layers — keep on state.
+    // For simplicity, allocate per-layer (small cost).
+    {
+        let l_state = &mut state._indexer[layer_idx];
+        let buf_field = if is_indexer { &mut l_state.q_idx } else { &mut l_state.idx_weights };
+        if buf_field.is_none() {
+            // Reuse q_idx slot for per-step kv_buf (different but unused so far)
+            // — TODO: cleaner separate slot. For now skip per-step allocation
+            // in this commit; will be handled when full body is wired.
+        }
+    }
+
+    // PER-STEP DISPATCH — not yet executing GEMVs in this commit.
+    // TODO (phase 3b.2):
+    //   1. kv_buf = wkv @ x_rotated     (gemv_mq4g256_prerotated)
+    //   2. score_buf = wgate @ x_rotated
+    //   3. score_buf += ape.sub_offset((pos%ratio) * proj_dim, proj_dim)
+    //   4. memcpy_dtod kv_buf → kv_state[(ratio + pos%ratio) * proj_dim,
+    //                                   ((ratio + pos%ratio + 1)) * proj_dim)
+    //   5. same for score
+    //   6. if (pos+1) % ratio == 0:
+    //      a. compressor_overlap_concat_f32(kv_state, concat_kv, ratio, head_dim)
+    //      b. compressor_overlap_concat_f32(score_state, concat_score, ratio, head_dim)
+    //      c. compressor_softmax_pool_f32(concat_kv, concat_score,
+    //         kv_cache.sub_offset((pos/ratio)*head_dim, head_dim),
+    //         2*ratio, head_dim)
+    //      d. rmsnorm_f32 in-place on the kv_cache slot
+    //      e. if is_indexer: rope_tail_interleaved on the slot's tail dims
+    //      f. memcpy_dtod kv_state[ratio..2*ratio] → kv_state[0..ratio]
+    //         same for score_state
+
+    let _ = (wkv, wgate, norm, ape, x_rotated, position);
+
     Ok(())
 }
 
