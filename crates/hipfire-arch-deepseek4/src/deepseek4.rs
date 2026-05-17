@@ -472,6 +472,14 @@ pub struct DeepseekV4State {
     /// rope_tail kernel reinterprets the bytes as int via cast).
     pub pos_buf: Option<rdna_compute::GpuTensor>,
 
+    /// Separate position buffer for the indexer compressor's tail-RoPE
+    /// step. Distinct from `pos_buf` because the compressor uses a
+    /// start-of-window position `(pos / ratio) * ratio`, while the main
+    /// attention's inverse-rope (called after the compressor) needs the
+    /// current `position`. Sharing one buffer would clobber the value
+    /// the main-attn inverse rope reads.
+    pub comp_pos_buf: Option<rdna_compute::GpuTensor>,
+
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
     /// view of `q` until real attention + O-LoRA lands.
@@ -585,6 +593,7 @@ impl DeepseekV4State {
             q: None,
             kv: None,
             pos_buf: None,
+            comp_pos_buf: None,
             attn_out: None,
             ffn_out: None,
             ffn_x_rot: None,

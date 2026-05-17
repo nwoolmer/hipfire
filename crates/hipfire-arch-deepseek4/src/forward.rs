@@ -262,15 +262,15 @@ fn compressor_forward(
     // entries — those go into the K/V cache for sparse attention and rely on
     // the standard tail-RoPE already applied during decode's apply_tail_rope.
     if is_indexer {
-        if state.pos_buf.is_none() {
-            state.pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
-                .map_err(|e| format!("alloc comp pos_buf l{layer_idx}: {e:?}"))?);
+        if state.comp_pos_buf.is_none() {
+            state.comp_pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("alloc comp_pos_buf l{layer_idx}: {e:?}"))?);
         }
-        let pos_buf = state.pos_buf.as_ref().unwrap();
+        let pos_buf = state.comp_pos_buf.as_ref().unwrap();
         let rope_pos = ((position as usize) / ratio * ratio) as i32;
         let pos_bytes = rope_pos.to_le_bytes();
         gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
-            .map_err(|e| format!("htod comp pos_buf l{layer_idx}: {e:?}"))?;
+            .map_err(|e| format!("htod comp_pos_buf l{layer_idx}: {e:?}"))?;
 
         gpu.rope_tail_interleaved(
             &kv_cache_slot, &kv_cache_slot, pos_buf,
