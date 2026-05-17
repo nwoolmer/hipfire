@@ -551,6 +551,29 @@ pub fn decode_step(
             eprintln!("[layer {layer_idx:>2}] streams rms={:.4} max={:.4} | attn_out rms={:.4} max={:.4} | ffn_out rms={:.4} max={:.4}",
                 rms(&host), max(&host), rms(&host_attn), max(&host_attn), rms(&host_ffn), max(&host_ffn));
         }
+
+        // Phase 5 debug: dump SWA K vs main_kv_cache K magnitudes for the
+        // first indexer-active layer. Helps next session diagnose the
+        // K-space mismatch causing phase 5 regression at ctx>128.
+        if layer.compress_ratio == 4
+            && std::env::var("HIPFIRE_V4F_DUMP_PHASE5_K").ok().as_deref() == Some("1")
+            && state._attention[layer_idx].swa_k.is_some()
+            && state._indexer[layer_idx].main_kv_cache.is_some()
+        {
+            let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+            let main_kv = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+            let swa_host = gpu.download_f32(swa_k).unwrap_or_default();
+            let main_host = gpu.download_f32(main_kv).unwrap_or_default();
+            let rms = |v: &[f32]| {
+                let n = v.iter().filter(|x| **x != 0.0).count().max(1);
+                (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / n as f64).sqrt()
+            };
+            let max = |v: &[f32]| v.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+            let n_compressed = (state.n_tokens as usize + 1) / 4;
+            let main_view = &main_host[0..n_compressed.max(1) * cfg.head_dim];
+            eprintln!("[L{layer_idx:>2} K-spaces] swa_k rms={:.4} max={:.4} | main_kv_cache[0..{}] rms={:.4} max={:.4}",
+                rms(&swa_host), max(&swa_host), n_compressed, rms(main_view), max(main_view));
+        }
     }
 
     // 3. Final norm + LM head.
