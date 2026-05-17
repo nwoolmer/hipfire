@@ -90,8 +90,35 @@ separate `attn.indexer.*` sub-module on alternating layers
 (compress_ratio=4) with its own wq_b, weights_proj, AND a separate
 Compressor with gated pooling + APE.
 
-See `inference/model.py:Indexer` and `Compressor` in the HF cache
-for the algorithm. Without indexer, ppl ~2x'es beyond ctx=128.
+### Progress this session
+- **Phase 1 (weights)**: 955e6db — added compressor.ape +
+  indexer.{wq_b, weights_proj, compressor.{wkv,wgate,norm,ape}}
+  slots + load_weights upload. Host walk validates presence.
+- **Phase 2 (state)**: fec24dd — added IndexerLayerState slots
+  for main_kv_cache/kv_state/score_state, indexer equivalents,
+  per-step q_idx/idx_weights/index_score/topk_idx_indices.
+  All None; lazy-alloc when forward runs.
+
+### Phases pending
+- **Phase 3 (Compressor.forward decode)**: per-step kv=wkv(x),
+  score=wgate(x), store in kv_state[ratio+pos%ratio], score_state
+  +ape[pos%ratio]; every ratio steps run overlap_transform +
+  softmax(score) along window-dim + weighted sum into kv_cache
+  [pos//ratio]. Needs new kernels: window-softmax,
+  weighted-pool, possibly overlap_transform copy.
+- **Phase 4 (Indexer.forward)**: q = wq_b @ qr; tail RoPE with
+  compress_rope_theta=160000; FWHT rotate; weights = weights_proj
+  @ x; index_score[t] = relu(Q·K_idx_cache[t]^T) · weights summed
+  across heads; top_K (= index_topk = 512) per head; dedup union.
+  Needs einsum-style kernel + indexer_top_k already exists.
+- **Phase 5 (modified main attention)**: extend v4f_attn_swa to
+  also gather K/V from main_kv_cache at top_K positions, append
+  to SWA window for softmax. Needs new gather+attend or indexed
+  attention kernel.
+
+Sees `inference/model.py:Indexer` and `Compressor`. Approximate
+effort: 4-8 hours for the full pipeline. Without it ppl 2x's
+beyond ctx=128 (40k vs 21k at ctx=256 vs 128).
 
 ## Test inventory
 
