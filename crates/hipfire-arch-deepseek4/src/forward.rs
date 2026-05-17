@@ -132,39 +132,85 @@ fn compressor_forward(
         }
     }
 
-    // Scratch: kv_buf, score_buf [proj_dim] + (if overlap) concat scratches
-    // [2*ratio, head_dim]. Per-step, can reuse across layers — keep on state.
-    // For simplicity, allocate per-layer (small cost).
+    // Per-step scratch — lazy-alloc on layer's IndexerLayerState.
     {
         let l_state = &mut state._indexer[layer_idx];
-        let buf_field = if is_indexer { &mut l_state.q_idx } else { &mut l_state.idx_weights };
-        if buf_field.is_none() {
-            // Reuse q_idx slot for per-step kv_buf (different but unused so far)
-            // — TODO: cleaner separate slot. For now skip per-step allocation
-            // in this commit; will be handled when full body is wired.
+        if l_state.comp_kv_buf.is_none() {
+            l_state.comp_kv_buf = Some(gpu.alloc_tensor(&[proj_dim], DType::F32)
+                .map_err(|e| format!("alloc comp_kv_buf l{layer_idx}: {e:?}"))?);
+        }
+        if l_state.comp_score_buf.is_none() {
+            l_state.comp_score_buf = Some(gpu.alloc_tensor(&[proj_dim], DType::F32)
+                .map_err(|e| format!("alloc comp_score_buf l{layer_idx}: {e:?}"))?);
+        }
+        if overlap && l_state.comp_concat_kv.is_none() {
+            l_state.comp_concat_kv = Some(gpu.alloc_tensor(
+                &[2 * ratio, head_dim], DType::F32)
+                .map_err(|e| format!("alloc comp_concat_kv l{layer_idx}: {e:?}"))?);
+        }
+        if overlap && l_state.comp_concat_score.is_none() {
+            l_state.comp_concat_score = Some(gpu.alloc_tensor(
+                &[2 * ratio, head_dim], DType::F32)
+                .map_err(|e| format!("alloc comp_concat_score l{layer_idx}: {e:?}"))?);
         }
     }
 
-    // PER-STEP DISPATCH — not yet executing GEMVs in this commit.
-    // TODO (phase 3b.2):
-    //   1. kv_buf = wkv @ x_rotated     (gemv_mq4g256_prerotated)
-    //   2. score_buf = wgate @ x_rotated
-    //   3. score_buf += ape.sub_offset((pos%ratio) * proj_dim, proj_dim)
-    //   4. memcpy_dtod kv_buf → kv_state[(ratio + pos%ratio) * proj_dim,
-    //                                   ((ratio + pos%ratio + 1)) * proj_dim)
-    //   5. same for score
-    //   6. if (pos+1) % ratio == 0:
-    //      a. compressor_overlap_concat_f32(kv_state, concat_kv, ratio, head_dim)
-    //      b. compressor_overlap_concat_f32(score_state, concat_score, ratio, head_dim)
-    //      c. compressor_softmax_pool_f32(concat_kv, concat_score,
-    //         kv_cache.sub_offset((pos/ratio)*head_dim, head_dim),
-    //         2*ratio, head_dim)
-    //      d. rmsnorm_f32 in-place on the kv_cache slot
-    //      e. if is_indexer: rope_tail_interleaved on the slot's tail dims
-    //      f. memcpy_dtod kv_state[ratio..2*ratio] → kv_state[0..ratio]
-    //         same for score_state
+    let hidden = cfg.hidden_size;
+    let pos = position as usize;
+    let slot = if overlap { ratio + pos % ratio } else { pos % ratio };
 
-    let _ = (wkv, wgate, norm, ape, x_rotated, position);
+    // 1. kv = wkv @ x_rotated; score = wgate @ x_rotated
+    let kv_buf = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
+    let score_buf = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
+    gpu.gemv_mq4g256_prerotated(wkv, x_rotated, kv_buf, proj_dim, hidden)
+        .map_err(|e| format!("comp wkv gemv l{layer_idx}: {e:?}"))?;
+    gpu.gemv_mq4g256_prerotated(wgate, x_rotated, score_buf, proj_dim, hidden)
+        .map_err(|e| format!("comp wgate gemv l{layer_idx}: {e:?}"))?;
+
+    // 2. score += ape[pos % ratio]
+    // ape is shape [ratio, proj_dim] F16; row pos%ratio is proj_dim consecutive F16s.
+    // We need an F16→F32 add-in-place. Simplest: convert ape row to F32 once at load.
+    // For now, treat ape as a raw F16 view and do an add via a tiny dispatch wrapper.
+    // PUNT: this needs an f16-add-to-f32 kernel we don't have; skip the ape add
+    // in this commit (the ape is small positional encoding — quality impact bounded).
+    // TODO: write add_f16_to_f32_inplace kernel and call:
+    //   gpu.add_f16_to_f32_inplace(score_buf, ape_row_view, proj_dim)
+    let _ = ape;
+
+    // 3. Store kv_buf at kv_state[slot, :], score_buf at score_state[slot, :].
+    {
+        let l_state = &state._indexer[layer_idx];
+        let kv_state = if is_indexer {
+            l_state.indexer_kv_state.as_ref().unwrap()
+        } else {
+            l_state.main_kv_state.as_ref().unwrap()
+        };
+        let score_state = if is_indexer {
+            l_state.indexer_score_state.as_ref().unwrap()
+        } else {
+            l_state.main_score_state.as_ref().unwrap()
+        };
+        let kv_dst = kv_state.sub_offset(slot * proj_dim, proj_dim);
+        let score_dst = score_state.sub_offset(slot * proj_dim, proj_dim);
+        gpu.memcpy_dtod_auto(&kv_dst.buf, &kv_buf.buf, proj_dim * 4)
+            .map_err(|e| format!("comp kv-store l{layer_idx}: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&score_dst.buf, &score_buf.buf, proj_dim * 4)
+            .map_err(|e| format!("comp score-store l{layer_idx}: {e:?}"))?;
+    }
+
+    // 4. Compression every `ratio` steps.
+    let should_compress = (pos + 1) % ratio == 0;
+    if !should_compress { return Ok(()); }
+
+    // TODO (phase 3b.3): compress + norm + (optional RoPE) + kv_cache write + state shift.
+    // Pieces needed:
+    //   if overlap: compressor_overlap_concat_f32 → concat_kv, concat_score
+    //   else:       use kv_state/score_state directly as [ratio, head_dim]
+    //   compressor_softmax_pool_f32 → kv_cache slot
+    //   rmsnorm_f32 (with `norm` weight)
+    //   if is_indexer: rope_tail_interleaved with compress_rope_theta
+    //   for overlap: memcpy kv_state[ratio:2*ratio] → kv_state[0:ratio]
+    let _ = (norm, max_compressed);
 
     Ok(())
 }

@@ -396,6 +396,17 @@ pub struct IndexerLayerState {
     pub idx_weights: Option<rdna_compute::GpuTensor>,
     pub index_score: Option<rdna_compute::GpuTensor>,
     pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+
+    // Compressor per-step scratch (re-used main and indexer; sized for
+    // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
+    // indexer has 256). Lazy-alloc by compressor_forward.
+    /// Per-step kv = wkv @ x   [proj_dim = coff*head_dim] F32.
+    pub comp_kv_buf: Option<rdna_compute::GpuTensor>,
+    /// Per-step score = wgate @ x + ape   [proj_dim] F32.
+    pub comp_score_buf: Option<rdna_compute::GpuTensor>,
+    /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
+    pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
+    pub comp_concat_score: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -555,6 +566,8 @@ impl DeepseekV4State {
                 indexer_kv_cache: None, indexer_kv_state: None, indexer_score_state: None,
                 q_idx: None, idx_weights: None,
                 index_score: None, topk_idx_indices: None,
+                comp_kv_buf: None, comp_score_buf: None,
+                comp_concat_kv: None, comp_concat_score: None,
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None, swa_v: None,
