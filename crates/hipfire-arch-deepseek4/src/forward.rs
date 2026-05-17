@@ -107,11 +107,15 @@ pub fn decode_step(
         // Optional magnitude diagnostic, gated on HIPFIRE_V4F_DUMP_MAG.
         if std::env::var("HIPFIRE_V4F_DUMP_MAG").ok().as_deref() == Some("1") {
             let streams = state.residual_streams.as_ref().unwrap();
+            let attn_out = state.attn_out.as_ref().unwrap();
+            let ffn_out = state.ffn_out.as_ref().unwrap();
             let host = gpu.download_f32(streams).unwrap_or_default();
-            let sum_sq: f64 = host.iter().map(|&v| (v as f64).powi(2)).sum();
-            let rms = (sum_sq / host.len() as f64).sqrt();
-            let max = host.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
-            eprintln!("[layer {layer_idx:>2}] streams rms={rms:.4} max={max:.4}");
+            let host_attn = gpu.download_f32(attn_out).unwrap_or_default();
+            let host_ffn = gpu.download_f32(ffn_out).unwrap_or_default();
+            let rms = |v: &[f32]| (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+            let max = |v: &[f32]| v.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+            eprintln!("[layer {layer_idx:>2}] streams rms={:.4} max={:.4} | attn_out rms={:.4} max={:.4} | ffn_out rms={:.4} max={:.4}",
+                rms(&host), max(&host), rms(&host_attn), max(&host_attn), rms(&host_ffn), max(&host_ffn));
         }
     }
 
@@ -911,7 +915,9 @@ fn mhc_pre(
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&post_view, 2.0)
+    let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 
     // COMB (16-dim → 4x4): cross-stream combining matrix, Sinkhorn-
