@@ -876,6 +876,17 @@ fn ffn_hash_routed(
     if std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() != Some("1") {
         return Ok(());
     }
+    // Bisection knob: disable hash routing on layers 0..num_hash_layers.
+    // Existing v4f.mq2lloyd-fp4fix shipped without tid2eid → hash routing
+    // was silently no-op (returned at tid2eid empty check). The new HFQ
+    // (v4f.mq2lloyd-f16compress.hfq) includes tid2eid so the path runs
+    // for the first time. If the static-routing math has a bug (e.g.
+    // wrong score normalisation vs upstream's pre-softplus gather), this
+    // flag bisects: HIPFIRE_V4F_NO_HASH=1 reproduces the old shared-only
+    // behaviour on hash layers.
+    if std::env::var("HIPFIRE_V4F_NO_HASH").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
     let layer = &weights.layers[layer_idx];
     if layer.expert_w1_blob.is_none() || layer.expert_w2_blob.is_none()
         || layer.expert_w3_blob.is_none()
@@ -1399,15 +1410,15 @@ fn moe_route(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    if layer_idx < cfg.num_hash_layers {
-        // Hash-routed layer — skip score-routing (tid2eid table not loaded).
-        return Ok(());
-    }
+    // Hash-routed and score-routed layers BOTH need router_scores for the
+    // per-token expert weights (upstream V4F gathers unbiased scores at
+    // tid2eid indices for hash layers, top-K for score layers). The split
+    // was: score layers ALSO use gate.bias for bias-aware selection. So
+    // gate.weight + sqrt_softplus is shared; gate.bias is optional.
     let layer = &weights.layers[layer_idx];
     let gate_w = layer.gate_weight.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
-    let gate_b = layer.gate_bias.as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} gate.bias missing (score-routed)"))?;
+    let _gate_b = layer.gate_bias.as_ref();  // None for hash layers; unused here
 
     let n_exp = cfg.n_routed_experts;
     let k = cfg.num_experts_per_tok;
@@ -1436,7 +1447,7 @@ fn moe_route(
 
     // logits += gate.bias (bias is F16, scores is F32 — need a kernel
     // for f16-bias-add. Skip for now; bias is small magnitude).
-    let _ = gate_b;
+    let _ = _gate_b;
 
     // scores = sqrt(softplus(logits))
     gpu.sqrt_softplus_f32(scores)
