@@ -253,8 +253,33 @@ fn compressor_forward(
     gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
         .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
 
-    // TODO (phase 3b.4): if is_indexer, apply tail RoPE on kv_cache_slot
-    //   with cfg.compress_rope_theta and position (pos // ratio) * ratio.
+    // Phase 3b.4: indexer compressor applies tail RoPE on its compressed entry
+    // with `compress_rope_theta` (160000). Position = start-of-window
+    // (pos // ratio) * ratio. n_heads_q = 1, n_heads_k = 0 (single tensor;
+    // re-use rope_tail_interleaved by routing only the q-loop).
+    //
+    // Main compressor (is_indexer=false) does NOT apply RoPE to its compressed
+    // entries — those go into the K/V cache for sparse attention and rely on
+    // the standard tail-RoPE already applied during decode's apply_tail_rope.
+    if is_indexer {
+        if state.pos_buf.is_none() {
+            state.pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("alloc comp pos_buf l{layer_idx}: {e:?}"))?);
+        }
+        let pos_buf = state.pos_buf.as_ref().unwrap();
+        let rope_pos = ((position as usize) / ratio * ratio) as i32;
+        let pos_bytes = rope_pos.to_le_bytes();
+        gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
+            .map_err(|e| format!("htod comp pos_buf l{layer_idx}: {e:?}"))?;
+
+        gpu.rope_tail_interleaved(
+            &kv_cache_slot, &kv_cache_slot, pos_buf,
+            1, 0,
+            head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            cfg.compress_rope_theta,
+        ).map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
+    }
 
     // State shift for overlap: kv_state[:ratio] = kv_state[ratio:].
     if overlap {
