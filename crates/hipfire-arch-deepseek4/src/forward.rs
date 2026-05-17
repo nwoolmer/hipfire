@@ -95,11 +95,6 @@ pub fn decode_step(
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
         // ── 2b. FFN block ─────────────────────────────────────────────
-        //
-        // FFN computation (router + experts + shared + scaling) is
-        // STUB: ffn_out = stream0 (no-op). HC FFN mix wired with the
-        // same kernel sequence as HC attn mix. Real FFN expert
-        // dispatch lands in a follow-up (MoE routing complexity).
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
         ffn_stub(cfg, weights, state, gpu, layer_idx)?;
         if layer_idx < cfg.num_hash_layers {
@@ -108,6 +103,16 @@ pub fn decode_step(
             ffn_routed(cfg, weights, state, gpu, layer_idx)?;
         }
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+
+        // Optional magnitude diagnostic, gated on HIPFIRE_V4F_DUMP_MAG.
+        if std::env::var("HIPFIRE_V4F_DUMP_MAG").ok().as_deref() == Some("1") {
+            let streams = state.residual_streams.as_ref().unwrap();
+            let host = gpu.download_f32(streams).unwrap_or_default();
+            let sum_sq: f64 = host.iter().map(|&v| (v as f64).powi(2)).sum();
+            let rms = (sum_sq / host.len() as f64).sqrt();
+            let max = host.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+            eprintln!("[layer {layer_idx:>2}] streams rms={rms:.4} max={max:.4}");
+        }
     }
 
     // 3. Final norm + LM head.
