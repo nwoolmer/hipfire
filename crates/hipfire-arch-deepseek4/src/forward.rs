@@ -298,6 +298,123 @@ fn compressor_forward(
     Ok(())
 }
 
+/// V4F indexer scoring + top-K selection (phase 4b).
+///
+/// Run after `compressor_forward(is_indexer=true)` for layers with
+/// `compress_ratio == 4`. Produces `state._indexer[l].topk_idx_indices`,
+/// the indices into `indexer_kv_cache` that the modified main attention
+/// (phase 5) will gather K/V from.
+///
+/// Pipeline:
+///   q_idx     = indexer_wq_b @ q_lat_rot                  → [H, D]
+///   tail-rope on q_idx (compress_rope_theta, current pos) → [H, D]
+///   idx_w     = indexer_weights_proj @ state.tmp          → [H]
+///   scores[n] = sum_h relu(q_idx[h] · K_cache[n]) * idx_w[h]
+///   topk      = top-K(scores) — combined, not per-head
+///
+/// Returns the actual number of compressed slots scored (0 means no
+/// scoring possible because the cache is still empty at this pos).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn indexer_forward(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    position: u32,
+) -> Result<usize, String> {
+    let layer = &weights.layers[layer_idx];
+    if layer.compress_ratio != 4 { return Ok(0); }
+
+    let h = cfg.index_n_heads;
+    let d = cfg.index_head_dim;
+    let k = cfg.index_topk;
+    let pos = position as usize;
+    let ratio = 4usize;
+
+    // Compressed-slot count = number of writes already committed.
+    // Writes happen when `(pos+1) % ratio == 0`. Just-finished pos:
+    //   n_filled = (pos + 1) / ratio  (integer)
+    let n_filled = (pos + 1) / ratio;
+    if n_filled == 0 { return Ok(0); }
+    let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let n = n_filled.min(max_compressed);
+
+    let wq_b = layer.indexer_wq_b.as_ref()
+        .ok_or_else(|| format!("idx_wq_b l{layer_idx}"))?;
+    let weights_proj = layer.indexer_weights_proj.as_ref()
+        .ok_or_else(|| format!("idx_weights_proj l{layer_idx}"))?;
+
+    // Lazy-alloc scratch on this layer's indexer state.
+    {
+        let l_state = &mut state._indexer[layer_idx];
+        if l_state.q_idx.is_none() {
+            l_state.q_idx = Some(gpu.alloc_tensor(&[h, d], DType::F32)
+                .map_err(|e| format!("alloc q_idx l{layer_idx}: {e:?}"))?);
+        }
+        if l_state.idx_weights.is_none() {
+            l_state.idx_weights = Some(gpu.alloc_tensor(&[h], DType::F32)
+                .map_err(|e| format!("alloc idx_weights l{layer_idx}: {e:?}"))?);
+        }
+        if l_state.index_score.is_none() {
+            l_state.index_score = Some(gpu.alloc_tensor(&[max_compressed], DType::F32)
+                .map_err(|e| format!("alloc index_score l{layer_idx}: {e:?}"))?);
+        }
+        if l_state.topk_idx_indices.is_none() {
+            l_state.topk_idx_indices = Some(gpu.alloc_tensor(&[k], DType::F32)
+                .map_err(|e| format!("alloc topk_idx l{layer_idx}: {e:?}"))?);
+        }
+    }
+
+    // 1. q_idx = wq_b @ q_lat_rot   (MQ4 prerotated GEMV: M = H*D, K = q_lora_rank)
+    let q_lat_rot = state.q_lat_rot.as_ref()
+        .ok_or_else(|| "indexer: q_lat_rot not allocated".to_string())?;
+    let q_idx = state._indexer[layer_idx].q_idx.as_ref().unwrap();
+    gpu.gemv_mq4g256_prerotated(wq_b, q_lat_rot, q_idx, h * d, cfg.q_lora_rank)
+        .map_err(|e| format!("idx wq_b gemv l{layer_idx}: {e:?}"))?;
+
+    // 2. Tail RoPE on q_idx with compress_rope_theta (matching is_indexer=true
+    //    K-side compressor's RoPE). Use main `pos_buf` (already holds current
+    //    position from apply_tail_rope). qk_rope_head_dim applies on each head.
+    let pos_buf = state.pos_buf.as_ref()
+        .ok_or_else(|| "indexer: pos_buf missing".to_string())?;
+    gpu.rope_tail_interleaved(
+        q_idx, q_idx, pos_buf,
+        h as i32, 0,
+        d as i32,
+        cfg.qk_rope_head_dim as i32,
+        cfg.compress_rope_theta,
+    ).map_err(|e| format!("idx rope l{layer_idx}: {e:?}"))?;
+
+    // 3. idx_w = weights_proj @ state.tmp  → [H]
+    let tmp = state.tmp.as_ref()
+        .ok_or_else(|| "indexer: state.tmp missing".to_string())?;
+    let idx_w = state._indexer[layer_idx].idx_weights.as_ref().unwrap();
+    gpu.gemv_mq4g256_prerotated(weights_proj, tmp, idx_w, h, cfg.hidden_size)
+        .map_err(|e| format!("idx weights_proj gemv l{layer_idx}: {e:?}"))?;
+
+    // 4. Score: combined relu-weighted dot products.
+    let kv_cache = state._indexer[layer_idx].indexer_kv_cache.as_ref()
+        .ok_or_else(|| "indexer: kv_cache missing".to_string())?;
+    // Sub-view K_cache to just the filled slots.
+    let k_cache_view = kv_cache.sub_offset(0, n * d);
+    let scores = state._indexer[layer_idx].index_score.as_ref().unwrap();
+    let scores_view = scores.sub_offset(0, n);
+    gpu.indexer_relu_score_f32(q_idx, &k_cache_view, idx_w, &scores_view,
+        h as i32, d as i32, n as i32)
+        .map_err(|e| format!("idx score l{layer_idx}: {e:?}"))?;
+
+    // 5. Top-K: combined scores [N], single "head".
+    let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
+    let k_take = k.min(n);
+    gpu.indexer_top_k(&scores_view, topk,
+        /*n_idx_heads=*/1, n as i32, k_take as i32)
+        .map_err(|e| format!("idx top_k l{layer_idx}: {e:?}"))?;
+
+    Ok(n)
+}
+
 /// Single-token decode step. Takes the token id of the previous
 /// position, returns the logits over `vocab_size`.
 ///
@@ -381,6 +498,13 @@ pub fn decode_step(
             if layer.compress_ratio == 4 {
                 compressor_forward(cfg, weights, state, gpu, layer_idx,
                     &tmp_view, position, /*is_indexer=*/true)?;
+                // Phase 4b: indexer scoring + top-K selection.
+                // Output → state._indexer[l].topk_idx_indices (consumed by
+                // phase 5's modified attention). Currently dead in the
+                // pipeline because phase 5 is not yet wired.
+                if std::env::var("HIPFIRE_V4F_RUN_INDEXER").ok().as_deref() == Some("1") {
+                    let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+                }
             }
         }
 
