@@ -1,4 +1,101 @@
-# DeepSeek V4 Flash — next session
+# DeepSeek V4 Flash — next session (2026-05-17 update)
+
+## Session-end state
+
+Antirez/ds4 cross-reference completed. Identified and corrected several
+real bugs in our forward pass, plus filled in missing structural pieces.
+PPL hasn't yet matched antirez's level — remaining gap traced to a
+single un-implemented structural piece: compressor-aware mixed attention.
+
+### Bugs fixed this session (antirez-verified)
+
+1. **HC residual init**: `[embed, 0, 0, 0]` → `[embed, embed, embed, embed]`
+   to match upstream `model.py:805` (`.repeat(1, 1, hc_mult, 1)`) and
+   antirez `hc_from_plain_embedding` (ds4.c:4358).
+2. **Per-layer RoPE base**: dense layers use `rope_theta=10000`,
+   compressed layers use `compress_rope_theta=160000`. Matches
+   antirez `layer_rope_freq_base` (ds4.c:4745).
+3. **YaRN scaling**: implemented matching `rope_tail_ext_inplace`
+   (ds4.c:4694) with attn_factor cancellation in the mscale multiply.
+   Currently OFF by default (`HIPFIRE_V4F_NO_YARN=1` flips back to
+   single-theta) because at ctx=128 it regresses PPL relative to
+   no-YaRN — root cause unclear (likely a corr_dim sign/index issue).
+4. **HC POST scale**: hardcoded 2× factor (matches `2.0 / (1+exp(-z))`
+   in ds4.c:4205). Env override default 0.75 → 2.0.
+5. **Routed expert scale**: matches `DS4_EXPERT_WEIGHT_SCALE=1.5`
+   (ds4.c:54). Env override default 1.0 → 1.5.
+6. **drop_mmap after weight upload**: stops the 1.4 GB/s sustained
+   NVMe re-fault traffic on unified-memory APUs (matches qwen35 path).
+
+### New quantization recipe
+
+`v4f.antirezQ8.hfq` (80 GB, /data/hipfire-models/) matches antirez Q2:
+- Routed experts: MQ2-Lloyd (~2.25 bpw, similar to IQ2_XXS+Q2_K avg)
+- Attention projections + shared experts: Q8_0
+- Compressor + indexer + HC: F16
+- Output (lm_head): Q8
+- Norms: F16
+
+Q8 dispatch correctness confirmed via runtime dump (dtype=Q8_0, m=1024,
+k=4096, weight_bytes=4456448).
+
+### The remaining structural gap
+
+After all of the above, our best ctx=128 PPL is ~34k (post=1.2 rs=1.0).
+Antirez achieves much lower. The difference is **task #56 phase 5** —
+`layer_attention_mixed_one` (ds4.c:7559) in antirez:
+
+```c
+if (ratio != 0) {
+    layer_attention_mixed_one(heads, model, layer, q,
+        cache->raw_kv, cache->n_raw,        // SWA window
+        cache->attn_comp_kv, cache->n_comp, // compressor cache
+        comp_allowed,                        // indexer mask
+        scratch);
+} else {
+    layer_attention_rows_one(heads, model, layer, q,
+        cache->raw_kv, cache->n_raw);
+}
+```
+
+Compressed layers (ratio>0) attend to BOTH the raw SWA window AND the
+compressor cache (with indexer mask selecting which compressed entries).
+Even within the SWA window's positional span, the compressor cache
+contains additional signal the model expects.
+
+Ours currently: SWA-only attention for ALL layers. Missing the
+compressor cache contribution.
+
+### Why prior tuning gave 8999 ppl with [e, 0, 0, 0] init
+
+The buggy init concentrated the residual stream signal into stream 0's
+4096 dims (out of 16384). The hc_attn_fn weight matrix was trained for
+unit-magnitude across all 16384 dims, but our buggy init gave
+high-magnitude in first 4096, zero elsewhere. Tuned post_scale=0.75 +
+route_scale=0.7 + hash on found a noise-floor minimum at 9k ppl — a
+COMPENSATION for the structural mismatch, not real quality.
+
+With correct init, the residual flows as the model expects but our
+SWA-only attention loses the compressor contribution. Hence regression
+to 34k at best. The right fix is finishing #56, not re-tuning.
+
+### Suggested next-session priority
+
+Implement `layer_attention_mixed_one` (file kernel + dispatch + wire
+into attn_stub for ratio>0 layers). Pieces already present:
+- compressor cache write path (commits 92b5577..714abbc)
+- indexer scoring + top-K (ce77981, ff85dbd)
+- gather kernel + joint attention kernel (9f2cd2f, 1104229) but BROKEN
+  per K-space mismatch + softmax dilution (commits 1043fc3, 416e098)
+
+The phase-5 joint attention as implemented adds zero-magnitude
+contribution to softmax → dilutes SWA probabilities → catastrophic
+ppl. Antirez uses `comp_allowed` mask to GATE which compressed
+entries participate — entries flagged 0 are EXCLUDED from softmax,
+not given exp(0)=1 weight. Our kernel needs the same masking
+treatment.
+
+
 
 V4F is end-to-end chat-testable + MoE-active. ~50 commits across two
 sessions drove ppl from 119k → 18.0k at ctx=128. Phase 5
