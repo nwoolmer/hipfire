@@ -347,7 +347,11 @@ fn ffn_routed(
         gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
             .map_err(|e| format!("gemv expert_w2 l{layer_idx} e{expert_id}: {e:?}"))?;
         // ffn_out += routing_weight[k] * routed_scaling_factor * expert_out
-        let coef = wts[k_idx] * cfg.routed_scaling_factor;
+        // Default route_scale=1.0 (empirical optimum) vs upstream's
+        // routed_scaling_factor=1.5. See post_scale comment.
+        let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
     }
@@ -453,7 +457,11 @@ fn ffn_hash_routed(
             .map_err(|e| format!("rotate hash silu l{layer_idx} e{expert_id}: {e:?}"))?;
         gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
             .map_err(|e| format!("gemv hash w2 l{layer_idx} e{expert_id}: {e:?}"))?;
-        let coef = wts[k_idx] * cfg.routed_scaling_factor;
+        // Default route_scale=1.0 (empirical optimum) vs upstream's
+        // routed_scaling_factor=1.5. See post_scale comment.
+        let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add hash l{layer_idx} e{expert_id}: {e:?}"))?;
     }
@@ -922,15 +930,15 @@ fn mhc_pre(
 
     // POST (4-dim, scale·sigmoid): per-stream OUTPUT scaling — used in
     //   hc_mix_4stream's `post.unsqueeze(-1) * x.unsqueeze(-2)` term.
-    // Upstream V4F uses `2*sigmoid(...)` but empirically post_scale=1.0
-    // gives lower ppl (41k vs 68k @ ctx=128 on wikitext2-test). The 2x
-    // mismatch suggests a magnitude bug we haven't isolated; for now use
-    // empirical optimum as default, env-overridable.
+    // Upstream V4F uses `2*sigmoid(...)` but 2D sweep at ctx=128 shows
+    // empirical optimum is post=0.5 + route_scale=1.0 (ppl=19k vs
+    // upstream-faithful 2.0×1.5 giving 68k). The mismatch likely
+    // reflects an accumulated magnitude error in our quantized forward.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
     let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
     gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 
