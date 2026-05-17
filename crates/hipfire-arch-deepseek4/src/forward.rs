@@ -449,35 +449,20 @@ fn hc_ffn_mix(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
-    let hc_fn   = layer.hc_ffn_fn.as_ref().unwrap();
-    let hc_base = layer.hc_ffn_base.as_ref().unwrap();
+    let _ = (weights, layer_idx);
     let streams = state.residual_streams.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
 
-    let n_ctrl = 24;
-    let x_dim = cfg.hidden_size * cfg.hc_mult;
-    let c_view = state.hc_c.as_ref().unwrap().sub_offset(0, n_ctrl);
-
-    gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
-        n_ctrl as i32, x_dim as i32)
-        .map_err(|e| format!("hc_compute_control ffn layer {layer_idx}: {e:?}"))?;
-
-    // V4F-faithful segment offsets: [pre(4), post(4), comb(16)] at [0, 4, 8].
+    // Same reasoning as hc_attn_mix: mhc_pre(is_attn=false) has
+    // already populated state.hc_c with the FFN block's post and comb
+    // (α-scaled, sigmoid'd, sinkhorn'd). Just consume them.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
-    gpu.sigmoid_f32(&post_view)
-        .map_err(|e| format!("sigmoid post ffn layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&post_view, 2.0)
-        .map_err(|e| format!("scale post ffn layer {layer_idx}: {e:?}"))?;
-
     let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
-        .map_err(|e| format!("hc_sinkhorn_4x4 ffn layer {layer_idx}: {e:?}"))?;
 
     let streams_out = state.q.as_ref().unwrap();
     gpu.hc_mix_4stream(streams, &comb_view, &post_view, ffn_out, streams_out,
         cfg.hidden_size as i32)
-        .map_err(|e| format!("hc_mix_4stream ffn layer {layer_idx}: {e:?}"))?;
+        .map_err(|e| format!("hc_mix_4stream ffn: {e:?}"))?;
 
     let bytes = cfg.hc_mult * cfg.hidden_size * 4;
     gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
@@ -962,47 +947,23 @@ fn hc_attn_mix(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
-    let hc_fn    = layer.hc_attn_fn.as_ref().unwrap();
-    let hc_base  = layer.hc_attn_base.as_ref().unwrap();
+    let _ = weights;  // post/comb already in state.hc_c from mhc_pre
+    let _ = layer_idx;
     let streams = state.residual_streams.as_ref().unwrap();
     let attn_out = state.attn_out.as_ref().unwrap();
 
-    let n_ctrl = 24;
-    let x_dim = cfg.hidden_size * cfg.hc_mult;
-
-    let c_view = state.hc_c.as_ref().unwrap().sub_offset(0, n_ctrl);
-
-    // 1. c = X · W_fn + base. (α scaling not yet applied.)
-    gpu.hc_compute_control(streams, hc_fn, hc_base, &c_view,
-        n_ctrl as i32, x_dim as i32)
-        .map_err(|e| format!("hc_compute_control layer {layer_idx}: {e:?}"))?;
-
-    // V4F-faithful segment offsets: [pre(4), post(4), comb(16)] at
-    // offsets [0, 4, 8] (matches upstream hc_split_sinkhorn).
-    // Note: hc_attn_mix re-computes the control vector but does NOT
-    // call hc_apply_alpha — α scaling is technically wrong here. The
-    // upstream-faithful path is to save post/comb from mhc_pre and
-    // reuse, but the redundant α-less recompute is what shipped at
-    // scaffold time. TODO: factor out and cache.
-
-    // POST (4-dim, 2·sigmoid) at offset 4
+    // Reuse the post and comb values that mhc_pre already computed
+    // and saved into state.hc_c (with the correct α scaling applied
+    // via hc_apply_alpha + sigmoid + sinkhorn). No need to recompute
+    // — same input, same weights, no intervening writes to hc_c.
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
-    gpu.sigmoid_f32(&post_view)
-        .map_err(|e| format!("sigmoid post attn layer {layer_idx}: {e:?}"))?;
-    gpu.scale_f32(&post_view, 2.0)
-        .map_err(|e| format!("scale post attn layer {layer_idx}: {e:?}"))?;
-
-    // COMB (16-dim, Sinkhorn 4x4) at offset 8
     let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-    gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
-        .map_err(|e| format!("hc_sinkhorn_4x4 attn layer {layer_idx}: {e:?}"))?;
 
-    // X_{l+1} = COMB · X_l + POST · attn_out.
+    // X_{l+1} = comb · X_l + post · attn_out
     let streams_out = state.q.as_ref().unwrap();
     gpu.hc_mix_4stream(streams, &comb_view, &post_view, attn_out, streams_out,
         cfg.hidden_size as i32)
-        .map_err(|e| format!("hc_mix_4stream layer {layer_idx}: {e:?}"))?;
+        .map_err(|e| format!("hc_mix_4stream layer: {e:?}"))?;
 
     let bytes = cfg.hc_mult * cfg.hidden_size * 4;
     gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
