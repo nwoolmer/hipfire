@@ -258,9 +258,13 @@ fn compressor_forward(
     // (pos // ratio) * ratio. n_heads_q = 1, n_heads_k = 0 (single tensor;
     // re-use rope_tail_interleaved by routing only the q-loop).
     //
-    // Main compressor (is_indexer=false) does NOT apply RoPE to its compressed
-    // entries — those go into the K/V cache for sparse attention and rely on
-    // the standard tail-RoPE already applied during decode's apply_tail_rope.
+    // Main compressor (is_indexer=false): tried adding RoPE with
+    // `rope_theta=10000` to align main_kv_cache with SWA K, but it made
+    // zero difference to phase 5 attention output (bit-identical PPL).
+    // Likely the joint-attention regression is upstream of K-RoPE — the
+    // gathered-K softmax contribution is poisoned by something else (maybe
+    // magnitude mismatch between compressor.norm output and kv_norm output,
+    // or the top-K indices are degenerate at small n_compressed).
     if is_indexer {
         if state.comp_pos_buf.is_none() {
             state.comp_pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
