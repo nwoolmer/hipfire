@@ -231,10 +231,22 @@ pub struct DeepseekV4LayerWeights {
     pub wo_a:   Option<rdna_compute::GpuTensor>,
     pub wo_b:   Option<rdna_compute::GpuTensor>,
 
-    // Indexer (compressor) — present only when compress_ratio > 0.
+    // Main-attention compressor (compress_ratio > 0). Stores compressed
+    // KV at slot pos//ratio for later main-attention gather. Distinct
+    // from indexer's own compressor below.
     pub compressor_wkv:   Option<rdna_compute::GpuTensor>,
     pub compressor_wgate: Option<rdna_compute::GpuTensor>,
     pub compressor_norm:  Option<rdna_compute::GpuTensor>,
+    pub compressor_ape:   Option<rdna_compute::GpuTensor>,  // [ratio, coff*head_dim]
+
+    // Indexer sub-module — only on layers with compress_ratio == 4.
+    // Selects top-k positions for sparse attention beyond SWA window.
+    pub indexer_wq_b:           Option<rdna_compute::GpuTensor>,  // [idx_n_heads * idx_head_dim, q_lora_rank]
+    pub indexer_weights_proj:   Option<rdna_compute::GpuTensor>,  // [idx_n_heads, hidden]
+    pub indexer_compressor_wkv: Option<rdna_compute::GpuTensor>,  // [coff*idx_head_dim, hidden]
+    pub indexer_compressor_wgate: Option<rdna_compute::GpuTensor>,
+    pub indexer_compressor_norm: Option<rdna_compute::GpuTensor>, // [idx_head_dim]
+    pub indexer_compressor_ape: Option<rdna_compute::GpuTensor>,  // [ratio, coff*idx_head_dim]
 
     // Hyper-Connections (F16 small matrices).
     pub hc_attn_base:  Option<rdna_compute::GpuTensor>,
@@ -293,6 +305,10 @@ impl DeepseekV4LayerWeights {
             attn_sink: None,
             wq_a: None, wq_b: None, wkv: None, wo_a: None, wo_b: None,
             compressor_wkv: None, compressor_wgate: None, compressor_norm: None,
+            compressor_ape: None,
+            indexer_wq_b: None, indexer_weights_proj: None,
+            indexer_compressor_wkv: None, indexer_compressor_wgate: None,
+            indexer_compressor_norm: None, indexer_compressor_ape: None,
             hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
             gate_weight: None, gate_bias: None,

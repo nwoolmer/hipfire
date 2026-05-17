@@ -119,8 +119,8 @@ impl DeepseekV4 {
                 }
             }
 
-            // Indexer (compressor) tensors — present only when
-            // compress_ratio[l] > 0. V4F config records the ratio array;
+            // Main compressor — ratio > 0. Indexer sub-module — only on
+            // ratio == 4 layers. V4F config records the ratio array;
             // layers 0, 1, and 43 (MTP) have ratio = 0.
             let ratio = *cfg.compress_ratios.get(l).unwrap_or(&0);
             if ratio > 0 {
@@ -128,11 +128,29 @@ impl DeepseekV4 {
                     "attn.compressor.wkv.weight",
                     "attn.compressor.wgate.weight",
                     "attn.compressor.norm.weight",
+                    "attn.compressor.ape",
                 ] {
                     let name = format!("layers.{l}.{suffix}");
                     if hfq.find_tensor_info(&name).is_none() {
                         return Err(format!(
                             "deepseek4: layer {l} (ratio={ratio}) missing '{suffix}'"
+                        ));
+                    }
+                }
+            }
+            if ratio == 4 {
+                for suffix in &[
+                    "attn.indexer.wq_b.weight",
+                    "attn.indexer.weights_proj.weight",
+                    "attn.indexer.compressor.wkv.weight",
+                    "attn.indexer.compressor.wgate.weight",
+                    "attn.indexer.compressor.norm.weight",
+                    "attn.indexer.compressor.ape",
+                ] {
+                    let name = format!("layers.{l}.{suffix}");
+                    if hfq.find_tensor_info(&name).is_none() {
+                        return Err(format!(
+                            "deepseek4: layer {l} (ratio=4) missing indexer '{suffix}'"
                         ));
                     }
                 }
@@ -306,7 +324,7 @@ impl Architecture for DeepseekV4 {
             layer.wo_b = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.attn.wo_b.weight"))?);
 
-            // Indexer (compressor) — only when ratio > 0.
+            // Main-attention compressor — only when ratio > 0.
             if layer.compress_ratio > 0 {
                 layer.compressor_wkv   = Some(Self::upload_global_raw(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.wkv.weight"))?);
@@ -314,6 +332,27 @@ impl Architecture for DeepseekV4 {
                     &format!("layers.{l}.attn.compressor.wgate.weight"))?);
                 layer.compressor_norm  = Some(Self::upload_global_raw(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.norm.weight"))?);
+                layer.compressor_ape   = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.compressor.ape"))?);
+            }
+
+            // Indexer sub-module — only on layers with compress_ratio == 4
+            // (V4F: layers 2, 4, 6, ..., 42 — alternating with ratio=128 layers).
+            // ratio=128 layers have the main compressor (above) but not the
+            // indexer's Q-projection / weights_proj / separate compressor.
+            if layer.compress_ratio == 4 {
+                layer.indexer_wq_b = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.wq_b.weight"))?);
+                layer.indexer_weights_proj = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.weights_proj.weight"))?);
+                layer.indexer_compressor_wkv = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.wkv.weight"))?);
+                layer.indexer_compressor_wgate = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.wgate.weight"))?);
+                layer.indexer_compressor_norm = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.norm.weight"))?);
+                layer.indexer_compressor_ape = Some(Self::upload_global_raw(hfq, gpu,
+                    &format!("layers.{l}.attn.indexer.compressor.ape"))?);
             }
 
             // Hyper-Connections (F16 small matrices).
