@@ -19675,6 +19675,53 @@ impl Gpu {
         }
     }
 
+    /// V4F indexer-extended attention K/V gather. Reads from
+    /// `main_kv_cache` [N_compressed, head_dim] at the indices given by
+    /// `topk_idx` [K] and writes [head_dim, K] (n_kv=1 implicit) into
+    /// `out` — matching the layout expected by the modified SWA kernel.
+    /// Sentinel `topk_idx[k] = -1` (or out-of-range) writes zeros.
+    pub fn v4f_topk_kv_gather_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] F32
+        topk_idx: &GpuTensor,    // [K] i32
+        out: &GpuTensor,         // [head_dim, K] F32 (n_kv=1)
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather",
+            kernels::V4F_TOPK_KV_GATHER_SRC,
+            "v4f_topk_kv_gather_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F head HC mix — compute the per-stream `pre` weights for the
     /// 4-stream → hidden projection before lm_head. Matches upstream
     /// `ParallelHead.hc_head`.

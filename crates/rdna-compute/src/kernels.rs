@@ -1637,3 +1637,9 @@ pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
 /// like the older indexer_compressed_k_score variant).
 pub const INDEXER_RELU_SCORE_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score.hip");
+
+/// V4F indexer-extended attention: gather K/V from main_kv_cache at
+/// top-K compressed-slot indices into a [n_kv, head_dim, K] buffer
+/// that matches the v4f_attn_swa K layout for downstream concat.
+pub const V4F_TOPK_KV_GATHER_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather.hip");
