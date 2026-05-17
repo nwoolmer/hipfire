@@ -366,12 +366,36 @@ pub struct IndexerLayerState {
     /// `compress_ratios[layer]` — stride of the compressed cache.
     /// `0` means this layer doesn't use the indexer (full SWA only).
     pub compress_ratio: u32,
-    /// `[n_idx_heads, idx_head_dim, n_compressed_capacity]`
-    /// Stub: real impl is a GPU tensor.
-    pub _k_idx_compressed: (),
-    /// `[n_idx_heads, index_topk]` of i32 position indices. Filled by
-    /// `indexer_top_k`; consumed by `kv_gather`.
-    pub _top_k_indices: (),
+
+    // ── Main-attention compressor state (ratio > 0) ────────────────
+    /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
+    /// gated-pooled compressed values at slot pos//ratio. Used by main
+    /// attention's gather step to extend SWA window.
+    pub main_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Per-position kv state buffer `[coff*ratio, coff*head_dim]` F32.
+    /// Holds raw kv values within the current and (for overlap=true)
+    /// previous compress window.
+    pub main_kv_state: Option<rdna_compute::GpuTensor>,
+    /// Per-position score buffer `[coff*ratio, coff*head_dim]` F32 with
+    /// hc_*.ape positional bias added. Pooled via softmax to compress kv.
+    pub main_score_state: Option<rdna_compute::GpuTensor>,
+
+    // ── Indexer state (ratio == 4 only) ────────────────────────────
+    /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
+    /// F32. Built by indexer's separate compressor. Used by Q · K_idx
+    /// scoring step.
+    pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
+    pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
+    pub indexer_score_state: Option<rdna_compute::GpuTensor>,
+    /// Per-step indexer scratch:
+    ///   q_idx [n_idx_heads, idx_head_dim] = [64, 128]
+    ///   weights [n_idx_heads] = [64]
+    ///   index_score [n_compressed] (per current step)
+    ///   topk_indices [index_topk = 512]
+    pub q_idx: Option<rdna_compute::GpuTensor>,
+    pub idx_weights: Option<rdna_compute::GpuTensor>,
+    pub index_score: Option<rdna_compute::GpuTensor>,
+    pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -527,8 +551,10 @@ impl DeepseekV4State {
             let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
             indexer.push(IndexerLayerState {
                 compress_ratio: ratio,
-                _k_idx_compressed: (),
-                _top_k_indices: (),
+                main_kv_cache: None, main_kv_state: None, main_score_state: None,
+                indexer_kv_cache: None, indexer_kv_state: None, indexer_score_state: None,
+                q_idx: None, idx_weights: None,
+                index_score: None, topk_idx_indices: None,
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None, swa_v: None,
