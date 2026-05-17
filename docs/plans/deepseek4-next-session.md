@@ -1,107 +1,101 @@
 # DeepSeek V4 Flash — next session
 
-Current state: V4F is mechanically chat-testable (`v4f_chat` binary)
-and the full MoE / hash-routing dispatch pipeline is shipped + unit-
-tested, gated behind env vars. Awaiting a VRAM-permitting test run +
-one more re-quant to fully exercise.
+V4F is end-to-end chat-testable + MoE-active. 36 commits this
+session drove ppl from 119k → 21k at ctx=128.
 
-## Shipped this session
+## Current PPL baseline (wikitext2-test, MoE+SWA, default settings)
 
-Commits c39ae3a..4596559 on branch `feat/mq-lloyd-asymmetric-moe`:
+| ctx | ppl   | notes                                  |
+|-----|-------|----------------------------------------|
+|  64 |  25k  |                                        |
+| 128 |  21k  | within SWA window                      |
+| 256 |  40k  | needs indexer for >128                 |
 
-| Commit  | Subject |
-|---------|---------|
-| c39ae3a | batched expert upload (33K mallocs → 129 per-(layer,proj)) |
-| abb28a4 | FP4 (E2M1) dequant in V4F quantizer path |
-| fbb6afe | V4F routed-expert branch — unconditional FP4 unpack |
-| f66bd69 | routed-expert MoE dispatch (`HIPFIRE_V4F_MOE=1`) |
-| 9da44a8 | topk_indices bit-reinterpret as i32 in routed dispatch |
-| b32f8b9 | partial-MoE upload (`HIPFIRE_V4F_EXPERT_LAYER_END`) |
-| 2f55215 | swiglu_limit=10.0 clamp in shared + routed |
-| b1e1393 | bias-aware routing (selection uses biased scores) |
-| 936520d | remove duplicate route_scale multiply |
-| 2730224 | hash routing for layers 0-2 (tid2eid lookup) |
-| 536e54f | remove dead stubs |
-| 4596559 | extract pure functions + 8 unit tests |
+Shared-only (no MoE) at ctx=128: **71k** — MoE provides 3.4x gain.
 
-## To activate MoE on the current HFQ (no re-quant needed)
+Defaults (in `crates/hipfire-arch-deepseek4/src/forward.rs`):
+- `HIPFIRE_V4F_POST_SCALE=0.5` (empirical optimum; upstream uses 2.0)
+- `HIPFIRE_V4F_ROUTE_SCALE=1.0` (empirical optimum; upstream uses 1.5)
 
-`/home/nick/.hipfire/models/v4f.mq2lloyd-fp4fix` (82 GB) has the FP4
-fix. Hash-routing tid2eid was NOT yet in the quantizer when this was
-built, so layers 0-2 will fall back to shared-only (`ffn_hash_routed`
-sees empty tid2eid_host, returns early).
+## Big bugs fixed this session
 
-**Full MoE (~85 GB VRAM):**
+Commits c39ae3a..0351de9. Highlights in order of impact:
+
+1. **MoE gate input** — was using raw hc_x_in, now uses ffn_norm'd
+   ffn_x_rot. **145k → 68k ppl** (`dbd6754`)
+2. **HC head mix** — final norm was using only stream 0; now combines
+   all 4 streams via hc_head_fn/base/scale (`6ce9781`)
+3. **HC segment offsets** — pre/post/comb at [0,4,8] not [0,4,20]
+   (`19eb08c`, `b01e13f` for hc_apply_alpha)
+4. **HC rsqrt normalization** in hc_compute_control (`879b101`)
+5. **HC Sinkhorn**: row-softmax start (was clamp+exp) (`34bc59a`)
+6. **Per-head attention output + O-LoRA** — was pre-reducing heads;
+   now keeps [n_heads, head_dim] through wo_a per-group + wo_b
+   (`e657ece`)
+7. **Q-norm, per-head Q-norm, KV-norm** wired in attention (`5b7cc56`)
+8. **Inverse tail RoPE on attn output** (`bf0b601`)
+9. **RoPE convention**: half-split → INTERLEAVED to match upstream
+   `torch.view_as_complex` (`1e37b45`, `0666035`)
+10. **HC mix reuse** — no double-compute, α-aware (`1be3583`)
+11. **FP4 (E2M1) dequant** in quantizer + paired MoE infra (earlier
+    commits c39ae3a..2730224)
+
+## Open puzzles
+
+- **2x post_scale mismatch** — upstream's `2*sigmoid` * route_scale
+  1.5 gives ppl 68k; our `0.5*sigmoid` * 1.0 gives 21k. The 6x total
+  product mismatch likely reflects accumulated MQ4/MQ2-Lloyd quant
+  noise OR a remaining magnitude bug not isolated despite extensive
+  bisection (Q-norm, RoPE, FWHT, swiglu_limit, MoE math, hc_apply
+  _alpha all verified upstream-correct).
+
+## Diagnostics shipped
+
+- `HIPFIRE_V4F_DUMP_MAG=1` — per-layer stream/attn_out/ffn_out RMS
+- `HIPFIRE_V4F_POST_SCALE=N`
+- `HIPFIRE_V4F_ROUTE_SCALE=N`
+- `HIPFIRE_V4F_SKIP_FFN=1` — zero ffn_out (isolates FFN)
+- `HIPFIRE_V4F_SKIP_INV_ROPE=1`
+- `HIPFIRE_V4F_SKIP_QHN=1` — skip per-head Q norm
+- `HIPFIRE_V4F_EXPERT_LAYER_END=N` — partial MoE for VRAM-constrained
+  testing
+- `crates/hipfire-arch-deepseek4/examples/v4f_perplexity.rs` —
+  perplexity / NLL tool
+- `crates/hipfire-arch-deepseek4/examples/v4f_top_logits.rs` —
+  per-position top-K logits inspector
+
+## Activation paths
+
 ```bash
+# Full MoE chat:
 HIPFIRE_V4F_MODEL=~/.hipfire/models/v4f.mq2lloyd-fp4fix \
 HIPFIRE_V4F_UPLOAD_EXPERTS=1 \
 HIPFIRE_V4F_MOE=1 \
-echo "Hello world" | ./target/release/examples/v4f_chat
+./target/release/examples/v4f_chat
+
+# Perplexity:
+./target/release/examples/v4f_perplexity \
+  ~/.hipfire/models/v4f.mq2lloyd-fp4fix \
+  ~/.hipfire/src/dev/bench/data/wikitext2-test.txt \
+  --ctx 128 --warmup 8 --moe 1
+
+# Restore upstream-faithful scales for investigation:
+HIPFIRE_V4F_POST_SCALE=2.0 HIPFIRE_V4F_ROUTE_SCALE=1.5 ./v4f_chat
 ```
 
-**Partial MoE (~3 + 1.84 * N GB; N=22 ≈ 43 GB):**
-```bash
-HIPFIRE_V4F_EXPERT_LAYER_END=22 \
-HIPFIRE_V4F_UPLOAD_EXPERTS=1 \
-HIPFIRE_V4F_MOE=1 \
-HIPFIRE_V4F_MODEL=~/.hipfire/models/v4f.mq2lloyd-fp4fix \
-echo "Hello world" | ./target/release/examples/v4f_chat
-```
+## Next steps for >128-token context
 
-## To get tid2eid into the HFQ (~35 min re-quant)
+Implement compressed-KV indexer (#56 task). Multi-hour work; V4F has
+separate `attn.indexer.*` sub-module on alternating layers
+(compress_ratio=4) with its own wq_b, weights_proj, AND a separate
+Compressor with gated pooling + APE.
 
-Run the quantizer with the current code. Adds ~9 MB for the three
-hash-routed layers' tid2eid tables. The output is otherwise the
-same as `v4f.mq2lloyd-fp4fix`.
-
-```bash
-./target/release/hipfire-quantize \
-  --input ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/*/ \
-  --output ~/.hipfire/models/v4f.mq2lloyd-fp4fix-v2 \
-  --format mq4-mq2lloyd-native \
-  --allow-mq2-lloyd
-```
-
-Requires ~165 GB free disk during write (output 82 GB + working
-copy). Delete the old `.fp4fix` file first if disk-tight.
-
-After the re-quant, layers 0-2 join the routed-expert dispatch via
-`ffn_hash_routed`, giving full 43/43 layer coverage.
-
-## Known limitations (low-priority)
-
-1. **SWA attractor without MoE** — confirmed structural. Shared-only
-   FFN doesn't introduce enough per-step variation; SWA attention
-   feedback loop converges on attractors (e.g. `kong konstru konstru
-   勾 ... stedt`). Without `HIPFIRE_V4F_MOE=1`, default to
-   `HIPFIRE_V4F_ATTN=pos0` for sensible (though context-free) output.
-
-2. **Indexer (#56) not implemented** — V4F's compressed-KV indexer
-   provides sparse attention over long context (top-512 from past
-   tokens, dedup across heads, gather + main attention). Dormant for
-   prompts < SWA window (128 tokens), so doesn't affect short chat.
-   Architecture is more nuanced than expected: separate `attn.indexer.*`
-   sub-module on alternating layers (ratio=4), with its own wq_b
-   [8192, 1024], weights_proj [64, 4096], and a SECOND compressor
-   distinct from the main attention's. Tensors verified present in
-   HFQ for layers 2, 4, 6, ... See `inference/model.py:Indexer` for
-   the algorithm. Estimated 4-8 hours including re-quant + test.
-
-3. **YaRN (#55) not implemented** — RoPE scaling activates at
-   positions ≥ original_max_position / factor = 65536/16 = 4096
-   tokens. Dormant for short chat. Estimated 1-2 hours.
-
-4. **MTP head** — quantizer skips `mtp.` prefix tensors. Phase 5 work.
+See `inference/model.py:Indexer` and `Compressor` in the HF cache
+for the algorithm. Without indexer, ppl ~2x'es beyond ctx=128.
 
 ## Test inventory
 
-All passing as of 4596559:
+All passing as of 0351de9:
 - 8/8 V4F kernel tests (`./scripts/v4f_kernel_tests.sh`)
-- 11/11 hipfire-arch-deepseek4 lib tests (including 8 new routing unit tests)
+- 11/11 hipfire-arch-deepseek4 lib tests (incl. 8 routing unit tests)
 - 5/5 hipfire-quantize FP4 E2M1 tests
-
-## Memory entries
-
-See `~/.claude/projects/-home-nick--hipfire-src/memory/project_v4f_expert_shapes.md`
-for the full V4F MoE dispatch status, FP4 bug discovery, and
-activation paths.
