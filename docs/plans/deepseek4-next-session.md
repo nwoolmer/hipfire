@@ -47,15 +47,19 @@ clean. ctx=256 regression is contained at 133k (vs 35.5k baseline, vs
 1080k unfiltered).
 
 **Next-session fixes to try:**
-1. **Re-quantize `compressor.norm` with FP16 passthrough** — MQ2-Lloyd
-   rounds small RMSNorm weights toward 0, killing the compressor's K
-   magnitude. Pin compressor.norm.weight to FP16 in the HFQ converter.
-2. **Multiply gathered K/V by a per-layer scale at gather time** —
-   normalize gathered values up to match SWA K RMS. Quick test:
-   `scale = (swa_k_rms / main_kv_cache_rms)` computed once per layer.
-3. **Bypass main compressor entirely** — use a full positional K cache
-   instead. Phase 5 then gathers raw K (post-RoPE, post-kv_norm) at
-   indexer-selected positions. Larger but architecturally cleaner.
+1. **Re-quantize `compressor.norm` AND `compressor.wkv` with FP16
+   passthrough** — MQ2-Lloyd likely damages small-magnitude weights.
+   Pin both to FP16 in the HFQ converter. Re-quant takes ~30 min and
+   adds maybe 200 MB to the model.
+2. **Bypass main compressor entirely** — keep a full positional K cache
+   (n_kv=1, head_dim=512, max_ctx=4096 → 8 MB/layer × 43 layers ≈ 350 MB).
+   Phase 5 gathers raw K (post-RoPE, post-kv_norm) at indexer-selected
+   positions translated from compressed slots → absolute positions
+   (c * ratio + ratio/2). Larger memory but architecturally cleaner.
+3. **Tried & failed**: `HIPFIRE_V4F_TOPK_K_SCALE` (commit 416e098) —
+   multiply gathered K/V by a constant. Best K_SCALE=8 gives 103k @
+   ctx=256, still 3× worse than 35.5k baseline. Confirms it's not just
+   magnitude — content is also wrong.
 
 ## Big bugs fixed this session
 
