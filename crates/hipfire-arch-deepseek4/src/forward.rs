@@ -1102,10 +1102,24 @@ fn attn_stub(
         // populated topk_idx_indices this step, and (b) this layer is an
         // indexer-active layer (compress_ratio == 4). Joint softmax over the
         // SWA window K/V AND the top-K K rows gathered from main_kv_cache.
+        //
+        // Filter: phase 5 only matters when there are compressed slots that
+        // represent positions BEFORE the SWA window. Compressed slot c (with
+        // ratio=4 overlap) covers token positions [c*ratio - ratio, c*ratio +
+        // ratio - 1]. For SWA window [pos-win, pos] to NOT cover slot c, we
+        // need c*ratio + ratio - 1 < pos - win, i.e., c < (pos - win) / ratio.
+        // The number of "pre-window" slots = max(0, (pos - win + 1) / ratio).
+        // If 0, fall through to plain SWA — no need to gather from main_kv_cache.
+        let ratio = 4usize;
+        let n_pre_window_slots = if pos >= win {
+            ((pos - win + 1) / ratio).min(cfg.index_topk)
+        } else { 0 };
+
         let layer_indexer_active = layer.compress_ratio == 4
             && std::env::var("HIPFIRE_V4F_USE_INDEXER_ATTN").ok().as_deref() == Some("1")
             && state._indexer[layer_idx].topk_idx_indices.is_some()
-            && state._indexer[layer_idx].main_kv_cache.is_some();
+            && state._indexer[layer_idx].main_kv_cache.is_some()
+            && n_pre_window_slots > 0;
 
         if layer_indexer_active {
             let topk_max = cfg.index_topk;
@@ -1120,8 +1134,12 @@ fn attn_stub(
             // separate slot pointing to the same allocation. The
             // v4f_attn_swa_topk_f32 kernel reads two pointers but we can
             // pass the same one for both since K==V on V4F.
-            let n_compressed = (pos + 1) / 4;  // ratio=4 layers
-            let k_active = n_compressed.min(topk_max);
+            let n_compressed = (pos + 1) / ratio;
+            // Cap k_active by both topk_max and the count of pre-window slots —
+            // top-K may include in-window slots that we don't want to attend to
+            // (they'd double-count with SWA). Conservative: take only as many
+            // gathered slots as we have pre-window compressed slots.
+            let k_active = n_pre_window_slots.min(n_compressed);
             let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
             let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
             let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
