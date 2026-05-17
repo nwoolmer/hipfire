@@ -22,6 +22,49 @@
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// V4F Compressor decode step (phase 3b scaffold — not yet wired).
+///
+/// Implements the upstream `Compressor.forward` decode case
+/// (start_pos != 0):
+///
+///   kv = wkv @ x_rotated     [coff * head_dim]
+///   score = wgate @ x_rotated [coff * head_dim]
+///   score += ape[pos % ratio]
+///   kv_state[ratio + pos%ratio]    = kv     (overlap=true)
+///   score_state[ratio + pos%ratio] = score
+///   if (pos+1) % ratio == 0:
+///     overlap_concat → [2*ratio, head_dim]  for kv and score
+///     softmax_pool   → [head_dim] compressed
+///     rmsnorm (compressor.norm)
+///     if is_indexer: tail RoPE (compress_rope_theta = 160000)
+///     kv_cache[pos // ratio] = compressed
+///     shift kv_state[:ratio] = kv_state[ratio:]  (and score_state)
+///
+/// Parameterized by `is_indexer`:
+///   - false → main attn compressor; head_dim = cfg.head_dim = 512;
+///     no RoPE on output; targets `state._indexer[l].main_*`
+///   - true  → indexer's sub-compressor; head_dim = idx_head_dim = 128;
+///     applies tail RoPE with cfg.compress_rope_theta;
+///     targets `state._indexer[l].indexer_*`
+///
+/// TODO: implement (kernels ready: compressor_softmax_pool_f32 +
+/// compressor_overlap_concat_f32). See `docs/plans/deepseek4-next-
+/// session.md` for the precise step-by-step.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn compressor_forward(
+    _cfg: &DeepseekV4Config,
+    _weights: &DeepseekV4Weights,
+    _state: &mut DeepseekV4State,
+    _gpu: &mut Gpu,
+    _layer_idx: usize,
+    _x_rotated: &GpuTensor,
+    _position: u32,
+    _is_indexer: bool,
+) -> Result<(), String> {
+    // Phase 3b: TBD. Kernels ready; needs Rust orchestration.
+    Ok(())
+}
+
 /// Single-token decode step. Takes the token id of the previous
 /// position, returns the logits over `vocab_size`.
 ///
