@@ -96,11 +96,22 @@ pub fn decode_step(
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
-        ffn_stub(cfg, weights, state, gpu, layer_idx)?;
-        if layer_idx < cfg.num_hash_layers {
-            ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
+        if std::env::var("HIPFIRE_V4F_SKIP_FFN").ok().as_deref() != Some("1") {
+            ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+            if layer_idx < cfg.num_hash_layers {
+                ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
+            } else {
+                ffn_routed(cfg, weights, state, gpu, layer_idx)?;
+            }
         } else {
-            ffn_routed(cfg, weights, state, gpu, layer_idx)?;
+            // Diagnostic: zero ffn_out to isolate attn contribution to growth.
+            if state.ffn_out.is_none() {
+                state.ffn_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc ffn_out: {e:?}"))?);
+            }
+            let ffn_out = state.ffn_out.as_ref().unwrap();
+            gpu.hip.memset(&ffn_out.buf, 0, ffn_out.byte_size())
+                .map_err(|e| format!("memset ffn_out: {e:?}"))?;
         }
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
 
