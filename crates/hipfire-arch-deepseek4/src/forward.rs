@@ -1954,15 +1954,19 @@ fn init_residual_streams(
     gpu.embedding_lookup_q8(token_embd, embed_scratch, token_id, hidden)
         .map_err(|e| format!("embedding_lookup_q8: {e:?}"))?;
 
-    // Copy embed_scratch → residual_streams[0, :], zero streams 1..hc_mult.
+    // **HC init**: per antirez ds4 `hc_from_plain_embedding` (ds4.c:4358),
+    // ALL `hc_mult` streams are initialised with a COPY of the embedding,
+    // NOT `[embed, 0, 0, 0]` as our prior comment claimed. The "0 streams"
+    // pattern would have forced HC pre/post/comb to propagate signal from
+    // stream 0 across layers, producing wrong magnitudes throughout the
+    // forward.
     let streams = state.residual_streams.as_ref().unwrap();
     let bytes_per_stream = hidden * 4;  // F32 = 4 bytes
-    gpu.memcpy_dtod_auto(&streams.buf, &embed_scratch.buf, bytes_per_stream)
-        .map_err(|e| format!("d2d copy stream 0: {e:?}"))?;
-    // Zero streams 1..hc_mult.
-    let dst_view = streams.sub_offset(hidden, hidden * (hc_mult - 1));
-    gpu.hip.memset(&dst_view.buf, 0, dst_view.byte_size())
-        .map_err(|e| format!("memset streams 1..: {e:?}"))?;
+    for h in 0..hc_mult {
+        let dst_view = streams.sub_offset(h * hidden, hidden);
+        gpu.memcpy_dtod_auto(&dst_view.buf, &embed_scratch.buf, bytes_per_stream)
+            .map_err(|e| format!("d2d copy stream {h}: {e:?}"))?;
+    }
 
     Ok(())
 }
