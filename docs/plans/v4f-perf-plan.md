@@ -1,7 +1,9 @@
 # V4F performance plan (2026-05-18)
 
-Status: A / C / D shipped. B / E / F still open. See git for current execution
-state.
+Status: A / B / C / D / E shipped. F (MQ2-GPTQ vs Lloyd) measured negative —
+GPTQ-all is 1.9-3.3× worse PPL than Lloyd-f16compress on wikitext2-test, do
+not switch defaults. See `project_v4f_mq2_gptq_lloyd_falsified` memory for
+the full PPL sweep and the build provenance.
 
 ## Session results (2026-05-18, branch feat/deepseek4-v4f)
 
@@ -15,6 +17,8 @@ Cumulative perf delta from baseline at the start of the session:
 
 Commits this session (newest first):
 
+- 1050031 — Phase E: GPU bias-aware top-K + scaled normalize (+1.7-1.9%)
+- 2158047 — Phase B: drop_mmap before routed-expert upload (load 83s → 56s)
 - 1e33ed2 — batched rotate for wo_a per-group loop (+6% ctx=128)
 - b3e4332 — batched silu_clamp + rotate in MoE expert loop (+8% ctx=128)
 - b5279f2 — MQ2 MoE K4-unroll + LDS codebook port from MQ3 gfx1100 (+7–14%)
