@@ -1422,6 +1422,12 @@ fn attn_stub(
     let per_group_wa_bytes_raw = (per_group_elems / 256) * 136;
     let per_group_wa_bytes_q8  = (per_group_elems / 32) * 34;
 
+    // FWHT-rotate all 8 group slices in one batched launch. attn_out_raw
+    // is contiguous [n_groups, per_group_in] so grid.y=n_groups indexes
+    // each group at stride per_group_in.
+    gpu.rotate_x_mq_batched(attn_out_raw, attn_out_raw_rot, per_group_in, n_groups)
+        .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
+
     for g in 0..n_groups {
         let raw_view = attn_out_raw.sub_offset(g * per_group_in, per_group_in);
         let rot_view = attn_out_raw_rot.sub_offset(g * per_group_in, per_group_in);
@@ -1442,12 +1448,7 @@ fn attn_stub(
             }
         };
         let out_view = wo_a_out.sub_offset(g * o_lora_rank, o_lora_rank);
-        // FWHT-rotate input. Only the MQ4 path actually consumes the
-        // rotated view (gemv_f32 / gemv_q8_0 use plain input), but the
-        // rotation is cheap and we always have raw_view available.
-        gpu.rotate_x_mq(&raw_view, &rot_view, per_group_in)
-            .map_err(|e| format!("rotate attn_out g{g} l{layer_idx}: {e:?}"))?;
-        // Dispatch per dtype with the correct input.
+        // Dispatch per dtype. F32/Q8 use plain raw_view; MQ4 uses rot_view.
         gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
                   o_lora_rank, per_group_in)?;
     }
