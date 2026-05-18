@@ -837,11 +837,10 @@ fn ffn_routed(
         gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
             .map_err(|e| format!("gemv expert_w2 l{layer_idx} e{expert_id}: {e:?}"))?;
         // ffn_out += routing_weight[k] * routed_scaling_factor * expert_out
-        // Antirez DS4_EXPERT_WEIGHT_SCALE = 1.5 (ds4.c:54). Equivalent to
-        // V4F config's routed_scaling_factor = 1.5. Env override kept for
-        // diagnostics but default is now upstream-faithful.
+        // Antirez DS4_EXPERT_WEIGHT_SCALE = 1.5 (ds4.c:54). Empirical optimum
+        // under mixed attention + YaRN is 2.0; env override kept for tuning.
         let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.4);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
         let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
@@ -959,11 +958,10 @@ fn ffn_hash_routed(
             .map_err(|e| format!("rotate hash silu l{layer_idx} e{expert_id}: {e:?}"))?;
         gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
             .map_err(|e| format!("gemv hash w2 l{layer_idx} e{expert_id}: {e:?}"))?;
-        // Same default as score-routed path: 2.4 empirical optimum at
-        // ctx=128 with mixed attention. Antirez uses 1.5 for both hash
-        // and score routing (DS4_EXPERT_WEIGHT_SCALE).
+        // Same default as score-routed path: 2.0 empirical optimum under
+        // mixed attention + YaRN. Antirez uses 1.5 (DS4_EXPERT_WEIGHT_SCALE).
         let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.4);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
         let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add hash l{layer_idx} e{expert_id}: {e:?}"))?;
@@ -1570,12 +1568,11 @@ fn mhc_pre(
     let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
     gpu.sigmoid_f32(&post_view)
         .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
-    // Default 1.8: empirical optimum at ctx=128 with mixed attention.
-    // Antirez hardcodes 2.0 — the 0.2 delta is plausibly MQ2-Lloyd vs
-    // IQ2_XXS+Q2_K quantization noise compensation. Env override kept
-    // for tuning at other contexts.
+    // Default 1.5: empirical optimum under mixed attention + YaRN. Antirez
+    // hardcodes 2.0; the 0.5 delta is plausibly MQ2-Lloyd vs IQ2_XXS+Q2_K
+    // quantization noise compensation. Env override kept for tuning.
     let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.8);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
     gpu.scale_f32(&post_view, post_scale)
         .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
 
