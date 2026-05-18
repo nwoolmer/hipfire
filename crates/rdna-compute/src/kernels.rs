@@ -978,6 +978,11 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 /// L = swiglu_limit (V4F config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str = include_str!("../../../kernels/src/v4f_silu_mul_clamp.hip");
 
+/// V4F MoE router: bias-aware top-K + normalized scaled weights, fully
+/// GPU-side. Replaces the per-layer D2H/CPU/H2D round-trip.
+pub const V4F_MOE_TOPK_BIAS_AWARE_SRC: &str =
+    include_str!("../../../kernels/src/v4f_moe_topk_bias_aware.hip");
+
 
 /// Fused SiLU(gate) * up: out[i] = silu(gate[i]) * up[i]
 /// Saves one kernel launch + one intermediate buffer.

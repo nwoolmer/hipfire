@@ -800,36 +800,37 @@ fn ffn_routed(
         return Ok(());  // experts not uploaded; nothing to dispatch
     }
 
-    // 1. Run router: compute unbiased scores on-device. We do top-K on
-    //    CPU below because V4F's selection uses BIASED scores while the
-    //    routing weights use UNBIASED scores (per upstream model.py:
-    //    Gate.forward). On-device top_k would mix these up.
+    // 1. Run router: compute unbiased scores on-device. V4F's selection
+    //    uses BIASED scores while the routing weights use UNBIASED scores
+    //    (per upstream model.py: Gate.forward). The GPU top-K kernel
+    //    `v4f_moe_topk_bias_aware_f32` handles this two-score semantic in
+    //    one launch, eliminating the per-layer D2H/CPU/H2D round-trip
+    //    used by the legacy fallback below (HIPFIRE_V4F_CPU_TOPK=1).
     moe_route(cfg, weights, state, gpu, layer_idx)?;
-
-    // 2. d2h the unbiased score vector (256 f32 = 1 KB per layer).
-    let scores = state.router_scores.as_ref().unwrap();
-    let scores_host = gpu.download_f32(scores)
-        .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
 
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
-
-    // 3. CPU top-K with bias-shifted scores → normalized weights.
-    let (topk_ids, wts) = match bias_aware_topk_weights(
-        &scores_host[..n_exp], &layer.gate_bias_host, k)
-    {
-        Some(x) => x,
-        None => return Ok(()),  // degenerate router output (sum <= 0)
-    };
-
-    // 3. Per-expert SwiGLU dispatch. Reuse shared scratch (ffn_gate,
-    //    ffn_up, ffn_silu_rot) — by the time we get here, the shared
-    //    expert path has finished consuming them.
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
+    let cpu_topk = std::env::var("HIPFIRE_V4F_CPU_TOPK")
+        .ok().as_deref() == Some("1");
+
+    // Legacy CPU top-K (kept for parity testing under HIPFIRE_V4F_CPU_TOPK=1).
+    let (topk_ids, wts): (Vec<u32>, Vec<f32>) = if cpu_topk {
+        let scores_dev = state.router_scores.as_ref().unwrap();
+        let scores_host = gpu.download_f32(scores_dev)
+            .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
+        match bias_aware_topk_weights(&scores_host[..n_exp], &layer.gate_bias_host, k)
+        {
+            Some(x) => x,
+            None => return Ok(()),  // degenerate router output (sum <= 0)
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     if std::env::var("HIPFIRE_V4F_NO_FUSED_MOE").ok().as_deref() != Some("1")
         && layer.expert_gate_up_blob.is_some()
@@ -839,7 +840,7 @@ fn ffn_routed(
         // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
         // The bigger win is GPU utilisation: grid Y dim spans all k_top
         // experts so the GEMVs run in parallel rather than serially.
-        let k_top = topk_ids.len();
+        let k_top = k;
         // Lazy-alloc scratch.
         if state.moe_topk_indices.is_none() {
             state.moe_topk_indices = Some(gpu.alloc_tensor(&[k_top], DType::F32)
@@ -861,17 +862,29 @@ fn ffn_routed(
             state.moe_rot_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
                 .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?);
         }
-        // Write top-K indices + (pre-scaled) weights to device.
         let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
         let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
-        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
-            .map_err(|e| format!("htod topk_indices l{layer_idx}: {e:?}"))?;
-        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
-            .map_err(|e| format!("htod topk_weights l{layer_idx}: {e:?}"))?;
+        if cpu_topk {
+            // Legacy CPU/H2D path. topk_ids and wts populated above.
+            let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+            let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+            gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
+                .map_err(|e| format!("htod topk_indices l{layer_idx}: {e:?}"))?;
+            let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
+            let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+            gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
+                .map_err(|e| format!("htod topk_weights l{layer_idx}: {e:?}"))?;
+        } else {
+            // GPU top-K: bias-aware select + normalize + route_scale in one
+            // launch, outputs straight into topk_idx_dev / topk_w_dev.
+            let scores_dev = state.router_scores.as_ref().unwrap();
+            let bias_dev = layer.gate_bias.as_ref()
+                .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
+            gpu.v4f_moe_topk_bias_aware_f32(
+                scores_dev, bias_dev, topk_idx_dev, topk_w_dev,
+                n_exp as i32, k_top as i32, route_scale_override,
+            ).map_err(|e| format!("v4f_moe_topk_bias_aware l{layer_idx}: {e:?}"))?;
+        }
 
         let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
         let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();

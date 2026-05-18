@@ -19747,6 +19747,57 @@ impl Gpu {
         result
     }
 
+    /// V4F MoE router: GPU-side bias-aware top-K + normalized weights.
+    /// Replaces the per-layer D2H scores → CPU top-K → H2D
+    /// indices+weights round trip. `bias` may be a zero buffer for
+    /// hash-routed layers. `indices` is written as i32 (its GpuTensor
+    /// dtype is F32 because hipfire's tensor-shape machinery only carries
+    /// f32 buffers, but kernels see the raw i32 bytes).
+    pub fn v4f_moe_topk_bias_aware_f32(
+        &mut self,
+        scores: &GpuTensor,    // [n_exp] fp32
+        bias: &GpuTensor,      // [n_exp] fp32 (zero if hash-routed)
+        indices: &GpuTensor,   // [k_top] i32 (typed as F32; raw bytes)
+        weights: &GpuTensor,   // [k_top] fp32
+        n_exp: i32,
+        k_top: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_moe_topk_bias_aware",
+            kernels::V4F_MOE_TOPK_BIAS_AWARE_SRC,
+            "v4f_moe_topk_bias_aware_f32",
+        )?;
+        let func = &self.functions["v4f_moe_topk_bias_aware_f32"];
+        let sp = scores.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let ip = indices.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kt = k_top;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [n_exp as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched V4F SwiGLU+clamp. `gate`, `up`, `out` each hold `batch`
     /// independent streams of length `n` laid out contiguously (stride =
     /// n). Per-stream math is byte-identical to `v4f_silu_mul_clamp_f32`;
