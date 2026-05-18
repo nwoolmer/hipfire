@@ -20806,6 +20806,120 @@ impl Gpu {
         }
     }
 
+    /// V4F fused MoE gate_up GEMV — one launch dispatches all top-K
+    /// experts via per-layer expert pointer table + per-token topk
+    /// indices. K_top is parameterised (V4F uses 6; kernel name's "_k8_"
+    /// is from the Qwen35 sibling — the kernel body uses `krank =
+    /// blockIdx.y` and accepts any k_top).
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,    // [n_exp] u64 device pointers
+        topk_indices: &GpuTensor,   // [k_top] i32
+        x_rot: &GpuTensor,          // [K] FWHT-rotated
+        y_gate: &GpuTensor,         // [k_top × M/2]
+        y_up:   &GpuTensor,         // [k_top × M/2]
+        m: usize, k: usize, k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_gate_up_indexed",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // MQ2-Lloyd: 72 bytes / 256-weight group.
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+            [m as u32, k_top as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
+                b.push_ptr(ygp); b.push_ptr(yup);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// V4F fused MoE down GEMV with scaled residual add. Atomically
+    /// accumulates Σ_k topk_weights[k] * (W_down · rot_batch[k]) into
+    /// x_residual. One launch replaces k_top per-expert calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,      // [k_top × K]
+        x_residual: &GpuTensor,     // [M]
+        m: usize, k: usize, k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_down_indexed",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+        )?;
+        let pp  = expert_ptrs.buf.as_ptr();
+        let ip  = topk_indices.buf.as_ptr();
+        let wp  = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp  as *const _ as *mut c_void,
+            &ip  as *const _ as *mut c_void,
+            &wp  as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // MQ2-Lloyd: 72 bytes / 256-weight group.
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+            [m as u32, k_top as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_ptr(rbp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════

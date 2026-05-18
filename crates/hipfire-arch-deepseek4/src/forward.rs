@@ -795,8 +795,7 @@ fn ffn_routed(
         return Ok(());
     }
     let layer = &weights.layers[layer_idx];
-    if layer.expert_w1_blob.is_none() || layer.expert_w2_blob.is_none()
-        || layer.expert_w3_blob.is_none()
+    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none()
     {
         return Ok(());  // experts not uploaded; nothing to dispatch
     }
@@ -827,61 +826,103 @@ fn ffn_routed(
     //    ffn_up, ffn_silu_rot) — by the time we get here, the shared
     //    expert path has finished consuming them.
     let im = cfg.moe_intermediate_size;
-    let stride_w1 = layer.expert_w1_stride;
-    let stride_w2 = layer.expert_w2_stride;
-    let stride_w3 = layer.expert_w3_stride;
-    let blob_w1 = layer.expert_w1_blob.as_ref().unwrap();
-    let blob_w2 = layer.expert_w2_blob.as_ref().unwrap();
-    let blob_w3 = layer.expert_w3_blob.as_ref().unwrap();
-
-    if state.routed_expert_out.is_none() {
-        state.routed_expert_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
-            .map_err(|e| format!("alloc routed_expert_out: {e:?}"))?);
-    }
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
-    let gate = state.ffn_gate.as_ref().unwrap();
-    let up   = state.ffn_up.as_ref().unwrap();
-    let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
-    let expert_out = state.routed_expert_out.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
+    let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
 
-    for (k_idx, &expert_id) in topk_ids.iter().enumerate() {
-        let off_w1 = expert_id as usize * stride_w1;
-        let off_w2 = expert_id as usize * stride_w2;
-        let off_w3 = expert_id as usize * stride_w3;
-        let w1_view = blob_w1.sub_offset(off_w1, stride_w1);
-        let w2_view = blob_w2.sub_offset(off_w2, stride_w2);
-        let w3_view = blob_w3.sub_offset(off_w3, stride_w3);
+    if std::env::var("HIPFIRE_V4F_NO_FUSED_MOE").ok().as_deref() != Some("1")
+        && layer.expert_gate_up_blob.is_some()
+    {
+        // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
+        // k_top per-expert silu_clamp+rotate. Replaces the per-expert
+        // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
+        // The bigger win is GPU utilisation: grid Y dim spans all k_top
+        // experts so the GEMVs run in parallel rather than serially.
+        let k_top = topk_ids.len();
+        // Lazy-alloc scratch.
+        if state.moe_topk_indices.is_none() {
+            state.moe_topk_indices = Some(gpu.alloc_tensor(&[k_top], DType::F32)
+                .map_err(|e| format!("alloc moe_topk_indices: {e:?}"))?);
+        }
+        if state.moe_topk_weights.is_none() {
+            state.moe_topk_weights = Some(gpu.alloc_tensor(&[k_top], DType::F32)
+                .map_err(|e| format!("alloc moe_topk_weights: {e:?}"))?);
+        }
+        if state.moe_gate_batch.is_none() {
+            state.moe_gate_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_gate_batch: {e:?}"))?);
+        }
+        if state.moe_up_batch.is_none() {
+            state.moe_up_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_up_batch: {e:?}"))?);
+        }
+        if state.moe_rot_batch.is_none() {
+            state.moe_rot_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+                .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?);
+        }
+        // Write top-K indices + (pre-scaled) weights to device.
+        let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
+        let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
+        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
+            .map_err(|e| format!("htod topk_indices l{layer_idx}: {e:?}"))?;
+        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
+        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
+            .map_err(|e| format!("htod topk_weights l{layer_idx}: {e:?}"))?;
 
-        gpu.gemv_mq2g256_lloyd(&w1_view, ffn_x_rot, gate, im, cfg.hidden_size)
-            .map_err(|e| format!("gemv expert_w1 l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.gemv_mq2g256_lloyd(&w3_view, ffn_x_rot, up, im, cfg.hidden_size)
-            .map_err(|e| format!("gemv expert_w3 l{layer_idx} e{expert_id}: {e:?}"))?;
-        // V4F SwiGLU with swiglu_limit clamp (config = 10.0). silu(min
-        // (gate, L)) * clamp(up, ±L) → gate (in-place). Per-expert
-        // routing weight applied AFTER SwiGLU and BEFORE w2 per upstream
-        // model.py:603-606. Clamp is part of V4F's faithful math; without
-        // it, FP4 × FP32 × 4096-dim dots can drive silu(gate) into a
-        // regime that feeds attractors.
-        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
-            .map_err(|e| format!("v4f_silu_mul_clamp expert l{layer_idx} e{expert_id}: {e:?}"))?;
-        // Routing-weight scale done via scaled_add at accumulate step
-        // (more efficient than a separate scale_f32 pass over [im]).
-        gpu.rotate_x_mq(gate, silu_rot, im)
-            .map_err(|e| format!("rotate expert silu l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
-            .map_err(|e| format!("gemv expert_w2 l{layer_idx} e{expert_id}: {e:?}"))?;
-        // ffn_out += routing_weight[k] * routed_scaling_factor * expert_out
-        // Antirez DS4_EXPERT_WEIGHT_SCALE = 1.5 (ds4.c:54). Empirical optimum
-        // under mixed attention + YaRN is 2.0; env override kept for tuning.
-        let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
-        let coef = wts[k_idx] * route_scale_override;
-        gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
-            .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
+        let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
+        let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
+        let gate_batch = state.moe_gate_batch.as_ref().unwrap();
+        let up_batch = state.moe_up_batch.as_ref().unwrap();
+        let rot_batch = state.moe_rot_batch.as_ref().unwrap();
+
+        // 1. Fused gate_up GEMV: one launch dispatches all k_top experts'
+        //    gate and up halves in parallel. M = 2*intermediate; the
+        //    kernel splits output rows by r<im → gate, r>=im → up.
+        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            gate_up_ptrs, topk_idx_dev,
+            ffn_x_rot, gate_batch, up_batch,
+            2 * im, cfg.hidden_size, k_top,
+        ).map_err(|e| format!("fused gate_up l{layer_idx}: {e:?}"))?;
+
+        // 2. Per-expert silu_clamp + FWHT rotate (k_top launches each;
+        //    k_top=6 so 12 small launches total, dominated by the GEMVs
+        //    above and below).
+        for k_idx in 0..k_top {
+            let g_view = gate_batch.sub_offset(k_idx * im, im);
+            let u_view = up_batch.sub_offset(k_idx * im, im);
+            let r_view = rot_batch.sub_offset(k_idx * im, im);
+            gpu.v4f_silu_mul_clamp_f32(&g_view, &u_view, &g_view, cfg.swiglu_limit)
+                .map_err(|e| format!("v4f_silu_mul_clamp fused l{layer_idx} k{k_idx}: {e:?}"))?;
+            gpu.rotate_x_mq(&g_view, &r_view, im)
+                .map_err(|e| format!("rotate fused l{layer_idx} k{k_idx}: {e:?}"))?;
+        }
+
+        // 3. Fused down GEMV: one launch atomicAdds
+        //      Σ_k topk_weights[k] * (W_down[expert_k] · rot_batch[k])
+        //    into ffn_out. Replaces k_top per-expert GEMV + scaled_add
+        //    pairs. The route_scale_override is baked into topk_weights.
+        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            w2_ptrs, topk_idx_dev, topk_w_dev,
+            rot_batch, ffn_out,
+            cfg.hidden_size, im, k_top,
+        ).map_err(|e| format!("fused down l{layer_idx}: {e:?}"))?;
+
+        return Ok(());
     }
 
-    Ok(())
+    // Per-expert fallback path is no longer reachable: separate w1/w3
+    // blobs are no longer uploaded (only the combined gate_up blob).
+    // HIPFIRE_V4F_NO_FUSED_MOE=1 yields a hard error rather than silent
+    // shared-only fallback.
+    let _ = (wts, topk_ids, route_scale_override);
+    Err(format!(
+        "deepseek4: HIPFIRE_V4F_NO_FUSED_MOE=1 but layer {layer_idx} \
+         has no separate w1/w3 blobs (only combined gate_up). Unset the \
+         env var or rebuild the loader with separate-blob uploads."))
 }
 
 /// Hash-routed FFN dispatch (V4F layers 0..num_hash_layers = 0..3).
@@ -922,8 +963,7 @@ fn ffn_hash_routed(
         return Ok(());
     }
     let layer = &weights.layers[layer_idx];
-    if layer.expert_w1_blob.is_none() || layer.expert_w2_blob.is_none()
-        || layer.expert_w3_blob.is_none()
+    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none()
     {
         return Ok(());
     }
@@ -958,49 +998,76 @@ fn ffn_hash_routed(
         None => return Ok(()),
     };
 
-    // Per-expert dispatch (identical to ffn_routed body).
+    // Fused MoE dispatch — same body as ffn_routed but with static
+    // tid2eid-derived top-K indices.
     let im = cfg.moe_intermediate_size;
-    let stride_w1 = layer.expert_w1_stride;
-    let stride_w2 = layer.expert_w2_stride;
-    let stride_w3 = layer.expert_w3_stride;
-    let blob_w1 = layer.expert_w1_blob.as_ref().unwrap();
-    let blob_w2 = layer.expert_w2_blob.as_ref().unwrap();
-    let blob_w3 = layer.expert_w3_blob.as_ref().unwrap();
-
-    if state.routed_expert_out.is_none() {
-        state.routed_expert_out = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
-            .map_err(|e| format!("alloc routed_expert_out: {e:?}"))?);
-    }
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
-    let gate = state.ffn_gate.as_ref().unwrap();
-    let up   = state.ffn_up.as_ref().unwrap();
-    let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
-    let expert_out = state.routed_expert_out.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
+    let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
+    let k_top = topk_ids.len();
 
-    for (k_idx, &expert_id) in topk_ids.iter().enumerate() {
-        let w1_view = blob_w1.sub_offset(expert_id as usize * stride_w1, stride_w1);
-        let w2_view = blob_w2.sub_offset(expert_id as usize * stride_w2, stride_w2);
-        let w3_view = blob_w3.sub_offset(expert_id as usize * stride_w3, stride_w3);
-
-        gpu.gemv_mq2g256_lloyd(&w1_view, ffn_x_rot, gate, im, cfg.hidden_size)
-            .map_err(|e| format!("gemv hash w1 l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.gemv_mq2g256_lloyd(&w3_view, ffn_x_rot, up, im, cfg.hidden_size)
-            .map_err(|e| format!("gemv hash w3 l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
-            .map_err(|e| format!("v4f_silu_mul_clamp hash l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.rotate_x_mq(gate, silu_rot, im)
-            .map_err(|e| format!("rotate hash silu l{layer_idx} e{expert_id}: {e:?}"))?;
-        gpu.gemv_mq2g256_lloyd(&w2_view, silu_rot, expert_out, cfg.hidden_size, im)
-            .map_err(|e| format!("gemv hash w2 l{layer_idx} e{expert_id}: {e:?}"))?;
-        // Same default as score-routed path: 2.0 empirical optimum under
-        // mixed attention + YaRN. Antirez uses 1.5 (DS4_EXPERT_WEIGHT_SCALE).
-        let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
-        let coef = wts[k_idx] * route_scale_override;
-        gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
-            .map_err(|e| format!("scaled_add hash l{layer_idx} e{expert_id}: {e:?}"))?;
+    // Lazy-alloc moe scratch (shared with ffn_routed via state).
+    if state.moe_topk_indices.is_none() {
+        state.moe_topk_indices = Some(gpu.alloc_tensor(&[k_top], DType::F32)
+            .map_err(|e| format!("alloc moe_topk_indices hash: {e:?}"))?);
     }
+    if state.moe_topk_weights.is_none() {
+        state.moe_topk_weights = Some(gpu.alloc_tensor(&[k_top], DType::F32)
+            .map_err(|e| format!("alloc moe_topk_weights hash: {e:?}"))?);
+    }
+    if state.moe_gate_batch.is_none() {
+        state.moe_gate_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+            .map_err(|e| format!("alloc moe_gate_batch hash: {e:?}"))?);
+    }
+    if state.moe_up_batch.is_none() {
+        state.moe_up_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+            .map_err(|e| format!("alloc moe_up_batch hash: {e:?}"))?);
+    }
+    if state.moe_rot_batch.is_none() {
+        state.moe_rot_batch = Some(gpu.alloc_tensor(&[k_top, im], DType::F32)
+            .map_err(|e| format!("alloc moe_rot_batch hash: {e:?}"))?);
+    }
+
+    let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
+    let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
+    let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+    let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+    gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
+        .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
+    let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
+    let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+    gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
+        .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
+
+    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
+    let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
+    let gate_batch = state.moe_gate_batch.as_ref().unwrap();
+    let up_batch = state.moe_up_batch.as_ref().unwrap();
+    let rot_batch = state.moe_rot_batch.as_ref().unwrap();
+
+    gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        gate_up_ptrs, topk_idx_dev,
+        ffn_x_rot, gate_batch, up_batch,
+        2 * im, cfg.hidden_size, k_top,
+    ).map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
+
+    for k_idx in 0..k_top {
+        let g_view = gate_batch.sub_offset(k_idx * im, im);
+        let u_view = up_batch.sub_offset(k_idx * im, im);
+        let r_view = rot_batch.sub_offset(k_idx * im, im);
+        gpu.v4f_silu_mul_clamp_f32(&g_view, &u_view, &g_view, cfg.swiglu_limit)
+            .map_err(|e| format!("v4f_silu_mul_clamp hash fused l{layer_idx} k{k_idx}: {e:?}"))?;
+        gpu.rotate_x_mq(&g_view, &r_view, im)
+            .map_err(|e| format!("rotate hash fused l{layer_idx} k{k_idx}: {e:?}"))?;
+    }
+
+    gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+        w2_ptrs, topk_idx_dev, topk_w_dev,
+        rot_batch, ffn_out,
+        cfg.hidden_size, im, k_top,
+    ).map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
+
     Ok(())
 }
 

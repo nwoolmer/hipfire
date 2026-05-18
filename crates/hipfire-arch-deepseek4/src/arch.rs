@@ -482,19 +482,30 @@ impl Architecture for DeepseekV4 {
                 && expert_layer_end.map_or(true, |end| l < end);
             if upload_this_layer {
                 let n_exp = cfg.n_routed_experts;
-                for (proj_idx, proj) in ["w1", "w2", "w3"].iter().enumerate() {
-                    // Find per-expert byte size from expert 0 (uniform across
-                    // experts within a (layer, projection)).
-                    let name0 = format!("layers.{l}.ffn.experts.0.{proj}.weight");
+
+                // Phase 1 perf: upload w2 (down) separately, and a
+                // COMBINED gate_up blob (w1 ‖ w3 per expert) instead of
+                // separate w1 and w3 blobs. The indexed MoE GEMV reads
+                // gate_up as a [2*intermediate, hidden] weight per
+                // expert, splitting output rows r<intermediate → y_gate,
+                // r>=intermediate → y_up. Memory cost is the same as
+                // uploading w1+w3 separately (~52 GB per layer-pair),
+                // but a single contiguous buffer per expert enables one
+                // fused kernel launch instead of two per-expert GEMVs.
+                //
+                // Total VRAM for routed experts: ~26 GB w2 + ~52 GB
+                // gate_up = ~78 GB (was 26+26+26 = 78 GB pre-change).
+                {
+                    // w2 (down): standard single-projection upload.
+                    let name0 = format!("layers.{l}.ffn.experts.0.w2.weight");
                     let (info0, _) = hfq.tensor_data(&name0)
                         .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
                     let stride = info0.data_size;
                     let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
 
-                    // Concat all 256 expert byte slices into one host buffer.
                     let mut blob = Vec::with_capacity(stride * n_exp);
                     for e in 0..n_exp {
-                        let name = format!("layers.{l}.ffn.experts.{e}.{proj}.weight");
+                        let name = format!("layers.{l}.ffn.experts.{e}.w2.weight");
                         let (info, bytes) = hfq.tensor_data(&name)
                             .ok_or_else(|| format!("deepseek4: missing {name}"))?;
                         if info.data_size != stride {
@@ -503,36 +514,62 @@ impl Architecture for DeepseekV4 {
                         }
                         blob.extend_from_slice(bytes);
                     }
-
-                    // One upload. Shape carries n_experts as the leading dim.
                     let mut blob_shape = vec![n_exp];
                     blob_shape.extend_from_slice(&shape0);
                     let blob_tensor = gpu.upload_raw(&blob, &blob_shape)
-                        .map_err(|e| format!("deepseek4: upload blob l{l}.{proj}: {e:?}"))?;
-
-                    // Build the device-side pointer table consumed by the
-                    // indexed MoE GEMV (qwen35 convention: u64 ptr packed
-                    // into 2 F32 slots per expert).
+                        .map_err(|e| format!("deepseek4: upload blob l{l}.w2: {e:?}"))?;
                     let base_ptr = blob_tensor.buf.as_ptr() as u64;
                     let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
                     let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
                     let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
-                        .map_err(|e| format!("deepseek4: alloc ptr table l{l}.{proj}: {e:?}"))?;
+                        .map_err(|e| format!("deepseek4: alloc ptr table l{l}.w2: {e:?}"))?;
                     gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
-                        .map_err(|e| format!("deepseek4: copy ptr table l{l}.{proj}: {e:?}"))?;
-
-                    match proj_idx {
-                        0 => { layer.expert_w1_blob = Some(blob_tensor);
-                               layer.expert_w1_ptrs = Some(ptr_tensor);
-                               layer.expert_w1_stride = stride; }
-                        1 => { layer.expert_w2_blob = Some(blob_tensor);
-                               layer.expert_w2_ptrs = Some(ptr_tensor);
-                               layer.expert_w2_stride = stride; }
-                        2 => { layer.expert_w3_blob = Some(blob_tensor);
-                               layer.expert_w3_ptrs = Some(ptr_tensor);
-                               layer.expert_w3_stride = stride; }
-                        _ => unreachable!(),
+                        .map_err(|e| format!("deepseek4: copy ptr table l{l}.w2: {e:?}"))?;
+                    layer.expert_w2_blob = Some(blob_tensor);
+                    layer.expert_w2_ptrs = Some(ptr_tensor);
+                    layer.expert_w2_stride = stride;
+                }
+                {
+                    // Combined gate_up: stream w1 then w3 bytes per expert
+                    // into a single host buffer, upload once.
+                    let w1_0 = format!("layers.{l}.ffn.experts.0.w1.weight");
+                    let w3_0 = format!("layers.{l}.ffn.experts.0.w3.weight");
+                    let (w1_info0, _) = hfq.tensor_data(&w1_0)
+                        .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
+                    let (w3_info0, _) = hfq.tensor_data(&w3_0)
+                        .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
+                    let stride_w1 = w1_info0.data_size;
+                    let stride_w3 = w3_info0.data_size;
+                    if stride_w1 != stride_w3 {
+                        return Err(format!(
+                            "deepseek4: l{l} w1/w3 stride mismatch: w1={} w3={}",
+                            stride_w1, stride_w3));
                     }
+                    let combined_stride = stride_w1 + stride_w3;
+                    let mut combined = Vec::with_capacity(combined_stride * n_exp);
+                    for e in 0..n_exp {
+                        let w1_name = format!("layers.{l}.ffn.experts.{e}.w1.weight");
+                        let w3_name = format!("layers.{l}.ffn.experts.{e}.w3.weight");
+                        let (_, w1_bytes) = hfq.tensor_data(&w1_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                        let (_, w3_bytes) = hfq.tensor_data(&w3_name)
+                            .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                        combined.extend_from_slice(w1_bytes);
+                        combined.extend_from_slice(w3_bytes);
+                    }
+                    let combined_tensor = gpu.upload_raw(
+                        &combined, &[n_exp, combined_stride])
+                        .map_err(|e| format!("deepseek4: upload gate_up l{l}: {e:?}"))?;
+                    let base_ptr = combined_tensor.buf.as_ptr() as u64;
+                    let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * combined_stride) as u64).collect();
+                    let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+                    let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                        .map_err(|e| format!("deepseek4: alloc gate_up ptr table l{l}: {e:?}"))?;
+                    gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                        .map_err(|e| format!("deepseek4: copy gate_up ptr table l{l}: {e:?}"))?;
+                    layer.expert_gate_up_blob = Some(combined_tensor);
+                    layer.expert_gate_up_ptrs = Some(ptr_tensor);
+                    layer.expert_gate_up_stride = combined_stride;
                 }
             }
         }

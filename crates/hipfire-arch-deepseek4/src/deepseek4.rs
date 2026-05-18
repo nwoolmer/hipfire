@@ -295,6 +295,17 @@ pub struct DeepseekV4LayerWeights {
     pub expert_w1_stride: usize,
     pub expert_w2_stride: usize,
     pub expert_w3_stride: usize,
+
+    /// Phase 1 perf: fused MoE indexed GEMV dispatch.
+    /// `expert_gate_up_blob` is a single contiguous device buffer
+    /// `[n_routed_experts × (stride_w1 + stride_w3)]` where each
+    /// expert's region holds the gate rows immediately followed by the
+    /// up rows. The `_indexed` MQ2-Lloyd MoE kernel reads from this as
+    /// a [2*intermediate, hidden] weight and splits the output by row.
+    /// `expert_gate_up_ptrs` is the per-expert pointer table.
+    pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_gate_up_stride: usize,
 }
 
 impl DeepseekV4LayerWeights {
@@ -317,6 +328,8 @@ impl DeepseekV4LayerWeights {
             expert_w1_blob: None, expert_w2_blob: None, expert_w3_blob: None,
             expert_w1_ptrs: None, expert_w2_ptrs: None, expert_w3_ptrs: None,
             expert_w1_stride: 0, expert_w2_stride: 0, expert_w3_stride: 0,
+            expert_gate_up_blob: None, expert_gate_up_ptrs: None,
+            expert_gate_up_stride: 0,
         }
     }
 }
@@ -554,8 +567,20 @@ pub struct DeepseekV4State {
     pub topk_indices: Option<rdna_compute::GpuTensor>,
     /// Per-routed-expert output scratch `[hidden]` F32. Reused for
     /// each of the K=6 selected experts; weighted-accumulated into
-    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`.
+    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Only used by
+    /// the non-fused fallback path (HIPFIRE_V4F_NO_FUSED_MOE=1).
     pub routed_expert_out: Option<rdna_compute::GpuTensor>,
+
+    /// Phase 1 perf: fused MoE dispatch scratch.
+    /// `moe_topk_indices` [k_top] i32, `moe_topk_weights` [k_top] f32
+    /// (pre-multiplied by route_scale_override). Filled per-token from
+    /// CPU top-K result.
+    pub moe_topk_indices: Option<rdna_compute::GpuTensor>,
+    pub moe_topk_weights: Option<rdna_compute::GpuTensor>,
+    /// Per-expert SwiGLU intermediate buffers `[k_top × intermediate]`.
+    pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_up_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
     /// to the per-head Q RMSNorm (upstream V4F has NO learnable scale
@@ -636,6 +661,11 @@ impl DeepseekV4State {
             router_scores: None,
             topk_indices: None,
             routed_expert_out: None,
+            moe_topk_indices: None,
+            moe_topk_weights: None,
+            moe_gate_batch: None,
+            moe_up_batch: None,
+            moe_rot_batch: None,
             q_head_ones: None,
             attn_out_raw: None,
             attn_out_raw_rot: None,
