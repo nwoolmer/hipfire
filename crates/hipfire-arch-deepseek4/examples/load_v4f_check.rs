@@ -58,6 +58,12 @@ fn main() {
     eprintln!("  index_topk              = {}", cfg.index_topk);
     eprintln!("  sliding_window          = {}", cfg.sliding_window);
     eprintln!("  compress_ratios.len()   = {}", cfg.compress_ratios.len());
+    eprintln!("  rope_theta              = {}", cfg.rope_theta);
+    eprintln!("  compress_rope_theta     = {}", cfg.compress_rope_theta);
+    eprintln!("  rope_scaling_factor     = {}", cfg.rope_scaling_factor);
+    eprintln!("  rope_scaling_original_max_position_embeddings = {}", cfg.rope_scaling_original_max_position_embeddings);
+    eprintln!("  rope_scaling_beta_fast  = {}", cfg.rope_scaling_beta_fast);
+    eprintln!("  rope_scaling_beta_slow  = {}", cfg.rope_scaling_beta_slow);
 
     // And `new_state` should succeed on the parsed config (no GPU).
     // Skip — `new_state` takes &mut Gpu which we don't have here.

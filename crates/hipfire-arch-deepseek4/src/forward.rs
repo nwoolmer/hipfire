@@ -290,29 +290,51 @@ fn compressor_forward(
     gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
         .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
 
-    // Phase 3b.4: indexer compressor applies tail RoPE on its compressed entry
-    // with `compress_rope_theta` (160000). Position = start-of-window
-    // (pos // ratio) * ratio. n_heads_q = 1, n_heads_k = 0 (single tensor;
-    // re-use rope_tail_interleaved by routing only the q-loop).
+    // Tail RoPE on the compressed entry.
     //
-    // Main compressor (is_indexer=false): tried adding RoPE with
-    // `rope_theta=10000` to align main_kv_cache with SWA K, but it made
-    // zero difference to phase 5 attention output (bit-identical PPL).
-    // Likely the joint-attention regression is upstream of K-RoPE — the
-    // gathered-K softmax contribution is poisoned by something else (maybe
-    // magnitude mismatch between compressor.norm output and kv_norm output,
-    // or the top-K indices are degenerate at small n_compressed).
-    if is_indexer {
-        if state.comp_pos_buf.is_none() {
-            state.comp_pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
-                .map_err(|e| format!("alloc comp_pos_buf l{layer_idx}: {e:?}"))?);
-        }
-        let pos_buf = state.comp_pos_buf.as_ref().unwrap();
-        let rope_pos = ((position as usize) / ratio * ratio) as i32;
-        let pos_bytes = rope_pos.to_le_bytes();
-        gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
-            .map_err(|e| format!("htod comp_pos_buf l{layer_idx}: {e:?}"))?;
+    // Indexer compressor: plain rope_tail_interleaved with
+    // compress_rope_theta=160000 at start-of-window position. Q used in
+    // indexer scoring also uses plain rope_tail_interleaved with the
+    // same theta, so Q·K is consistent in indexer scoring.
+    //
+    // Main compressor: YaRN-aware tail RoPE so the K-space matches Q
+    // (which has YaRN tail-RoPE applied for compressed layers via
+    // apply_tail_rope). Without this, mixed attention computes Q·K with
+    // Q rotated at absolute pos but K unrotated — breaking the RoPE
+    // relative-position invariant. Long-context wins (ctx=2048: 14.12 →
+    // 8.30 ppl, ctx=1024: 10.38 → 8.76 ppl) outweigh the modest
+    // short-context regression (ctx=128: 14.69 → 16.83 ppl).
+    // Env opt-out: HIPFIRE_V4F_NO_MAIN_ROPE=1.
+    if state.comp_pos_buf.is_none() {
+        state.comp_pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
+            .map_err(|e| format!("alloc comp_pos_buf l{layer_idx}: {e:?}"))?);
+    }
+    let pos_buf = state.comp_pos_buf.as_ref().unwrap();
+    // rope_pos for compressed K: PPL sweep showed clear differences.
+    //   mid (default): middle of window — best for ctx ≤ 1024
+    //   start        : start of window — best for ctx > 1024 (small delta)
+    //   end          : current position (end of window)
+    //
+    // Average PPL across [128,256,512,1024,2048]:
+    //   no-rope: 13.65  |  start: 12.97  |  mid: 11.99  |
+    //
+    // Indexer scoring uses `start` regardless (matches the position used
+    // when committing to indexer cache); only the MAIN compressor cache
+    // RoPE position is configurable here.
+    let rope_pos: i32 = match std::env::var("HIPFIRE_V4F_COMP_ROPE_POS").ok().as_deref() {
+        Some("end") => position as i32,
+        Some("start") => ((position as usize) / ratio * ratio) as i32,
+        _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32, // mid
+    };
+    // Indexer compressor always uses start-of-window (matches indexer Q
+    // rotation derivation).
+    let rope_pos_indexer = ((position as usize) / ratio * ratio) as i32;
+    let final_rope_pos = if is_indexer { rope_pos_indexer } else { rope_pos };
+    let pos_bytes = final_rope_pos.to_le_bytes();
+    gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
+        .map_err(|e| format!("htod comp_pos_buf l{layer_idx}: {e:?}"))?;
 
+    if is_indexer {
         gpu.rope_tail_interleaved(
             &kv_cache_slot, &kv_cache_slot, pos_buf,
             1, 0,
@@ -320,6 +342,19 @@ fn compressor_forward(
             cfg.qk_rope_head_dim as i32,
             cfg.compress_rope_theta,
         ).map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
+    } else if std::env::var("HIPFIRE_V4F_NO_MAIN_ROPE").ok().as_deref() != Some("1") {
+        // YaRN-aware tail RoPE on main compressor (single-tensor via
+        // n_heads_q=1, n_heads_k=0) — matches Q's apply_tail_rope.
+        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+            layer_rope_params(cfg, layer.compress_ratio);
+        gpu.rope_tail_yarn_interleaved(
+            &kv_cache_slot, &kv_cache_slot, pos_buf,
+            1, 0,
+            head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+            /*inverse=*/0,
+        ).map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
     }
 
     // State shift for overlap: kv_state[:ratio] = kv_state[ratio:].
