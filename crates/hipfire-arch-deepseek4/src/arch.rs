@@ -483,41 +483,53 @@ impl Architecture for DeepseekV4 {
             if upload_this_layer {
                 let n_exp = cfg.n_routed_experts;
 
-                // Phase 1 perf: upload w2 (down) separately, and a
-                // COMBINED gate_up blob (w1 ‖ w3 per expert) instead of
-                // separate w1 and w3 blobs. The indexed MoE GEMV reads
-                // gate_up as a [2*intermediate, hidden] weight per
-                // expert, splitting output rows r<intermediate → y_gate,
-                // r>=intermediate → y_up. Memory cost is the same as
-                // uploading w1+w3 separately (~52 GB per layer-pair),
-                // but a single contiguous buffer per expert enables one
-                // fused kernel launch instead of two per-expert GEMVs.
+                // Per-layer batched pread + single GPU upload.
                 //
-                // Total VRAM for routed experts: ~26 GB w2 + ~52 GB
-                // gate_up = ~78 GB (was 26+26+26 = 78 GB pre-change).
+                // The OLD `tensor_data()` mmap path triggered >1 GB/s
+                // sustained page-fault thrash on Strix Halo because the
+                // 13 GB+ accumulated host blob competed with the model's
+                // 78 GB of GPU allocations under unified memory.
+                //
+                // Per-expert streaming (one pread + one memcpy_htod per
+                // expert) bounded the host buffer but multiplied syscalls
+                // and tiny GPU transfers — 30k+ ops total, dominated by
+                // per-call overhead.
+                //
+                // This pattern: build ONE host Vec<u8> per (layer,
+                // projection), filling it via `tensor_data_pread` per
+                // expert (so file pages get fadvise(DONTNEED)'d after
+                // each read, no page-cache buildup), then ONE
+                // `upload_raw` per layer-projection. Host peak per
+                // layer ≈ stride_w1 × n_exp + stride_w2 × n_exp ≈
+                // 600 MB + 600 MB = 1.2 GB — bounded, well below the
+                // pressure threshold. Syscalls/uploads drop to 82 per
+                // model (2 per layer × 41 layers).
                 {
-                    // w2 (down): standard single-projection upload.
+                    // w2 (down): pread each expert into a layer-local
+                    // host Vec, then one upload.
                     let name0 = format!("layers.{l}.ffn.experts.0.w2.weight");
-                    let (info0, _) = hfq.tensor_data(&name0)
+                    let (info0, _b0) = hfq.tensor_data_pread(&name0)
                         .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
                     let stride = info0.data_size;
                     let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
+                    drop(_b0);
 
                     let mut blob = Vec::with_capacity(stride * n_exp);
                     for e in 0..n_exp {
                         let name = format!("layers.{l}.ffn.experts.{e}.w2.weight");
-                        let (info, bytes) = hfq.tensor_data(&name)
+                        let (info, bytes) = hfq.tensor_data_pread(&name)
                             .ok_or_else(|| format!("deepseek4: missing {name}"))?;
                         if info.data_size != stride {
                             return Err(format!(
                                 "deepseek4: {name} size {} != stride {}", info.data_size, stride));
                         }
-                        blob.extend_from_slice(bytes);
+                        blob.extend_from_slice(&bytes);
                     }
                     let mut blob_shape = vec![n_exp];
                     blob_shape.extend_from_slice(&shape0);
                     let blob_tensor = gpu.upload_raw(&blob, &blob_shape)
                         .map_err(|e| format!("deepseek4: upload blob l{l}.w2: {e:?}"))?;
+                    drop(blob);
                     let base_ptr = blob_tensor.buf.as_ptr() as u64;
                     let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
                     let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -530,16 +542,18 @@ impl Architecture for DeepseekV4 {
                     layer.expert_w2_stride = stride;
                 }
                 {
-                    // Combined gate_up: stream w1 then w3 bytes per expert
-                    // into a single host buffer, upload once.
+                    // gate_up (combined w1 ‖ w3): per-expert pread, build
+                    // one layer-local host Vec, single upload.
                     let w1_0 = format!("layers.{l}.ffn.experts.0.w1.weight");
                     let w3_0 = format!("layers.{l}.ffn.experts.0.w3.weight");
-                    let (w1_info0, _) = hfq.tensor_data(&w1_0)
+                    let (w1_info0, _b1) = hfq.tensor_data_pread(&w1_0)
                         .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
-                    let (w3_info0, _) = hfq.tensor_data(&w3_0)
-                        .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
                     let stride_w1 = w1_info0.data_size;
+                    drop(_b1);
+                    let (w3_info0, _b3) = hfq.tensor_data_pread(&w3_0)
+                        .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
                     let stride_w3 = w3_info0.data_size;
+                    drop(_b3);
                     if stride_w1 != stride_w3 {
                         return Err(format!(
                             "deepseek4: l{l} w1/w3 stride mismatch: w1={} w3={}",
@@ -549,17 +563,19 @@ impl Architecture for DeepseekV4 {
                     let mut combined = Vec::with_capacity(combined_stride * n_exp);
                     for e in 0..n_exp {
                         let w1_name = format!("layers.{l}.ffn.experts.{e}.w1.weight");
-                        let w3_name = format!("layers.{l}.ffn.experts.{e}.w3.weight");
-                        let (_, w1_bytes) = hfq.tensor_data(&w1_name)
+                        let (_, w1_bytes) = hfq.tensor_data_pread(&w1_name)
                             .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                        let (_, w3_bytes) = hfq.tensor_data(&w3_name)
+                        combined.extend_from_slice(&w1_bytes);
+                        drop(w1_bytes);
+                        let w3_name = format!("layers.{l}.ffn.experts.{e}.w3.weight");
+                        let (_, w3_bytes) = hfq.tensor_data_pread(&w3_name)
                             .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                        combined.extend_from_slice(w1_bytes);
-                        combined.extend_from_slice(w3_bytes);
+                        combined.extend_from_slice(&w3_bytes);
                     }
                     let combined_tensor = gpu.upload_raw(
                         &combined, &[n_exp, combined_stride])
                         .map_err(|e| format!("deepseek4: upload gate_up l{l}: {e:?}"))?;
+                    drop(combined);
                     let base_ptr = combined_tensor.buf.as_ptr() as u64;
                     let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * combined_stride) as u64).collect();
                     let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
