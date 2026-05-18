@@ -379,12 +379,47 @@ pub struct IndexerLayerState {
     /// `compress_ratios[layer]` — stride of the compressed cache.
     /// `0` means this layer doesn't use the indexer (full SWA only).
     pub compress_ratio: u32,
-    /// `[n_idx_heads, idx_head_dim, n_compressed_capacity]`
-    /// Stub: real impl is a GPU tensor.
-    pub _k_idx_compressed: (),
-    /// `[n_idx_heads, index_topk]` of i32 position indices. Filled by
-    /// `indexer_top_k`; consumed by `kv_gather`.
-    pub _top_k_indices: (),
+
+    // ── Main-attention compressor state (ratio > 0) ────────────────
+    /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
+    /// gated-pooled compressed values at slot pos//ratio. Used by main
+    /// attention's gather step to extend SWA window.
+    pub main_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Per-position kv state buffer `[coff*ratio, coff*head_dim]` F32.
+    /// Holds raw kv values within the current and (for overlap=true)
+    /// previous compress window.
+    pub main_kv_state: Option<rdna_compute::GpuTensor>,
+    /// Per-position score buffer `[coff*ratio, coff*head_dim]` F32 with
+    /// hc_*.ape positional bias added. Pooled via softmax to compress kv.
+    pub main_score_state: Option<rdna_compute::GpuTensor>,
+
+    // ── Indexer state (ratio == 4 only) ────────────────────────────
+    /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
+    /// F32. Built by indexer's separate compressor. Used by Q · K_idx
+    /// scoring step.
+    pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
+    pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
+    pub indexer_score_state: Option<rdna_compute::GpuTensor>,
+    /// Per-step indexer scratch:
+    ///   q_idx [n_idx_heads, idx_head_dim] = [64, 128]
+    ///   weights [n_idx_heads] = [64]
+    ///   index_score [n_compressed] (per current step)
+    ///   topk_indices [index_topk = 512]
+    pub q_idx: Option<rdna_compute::GpuTensor>,
+    pub idx_weights: Option<rdna_compute::GpuTensor>,
+    pub index_score: Option<rdna_compute::GpuTensor>,
+    pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+
+    // Compressor per-step scratch (re-used main and indexer; sized for
+    // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
+    // indexer has 256). Lazy-alloc by compressor_forward.
+    /// Per-step kv = wkv @ x   [proj_dim = coff*head_dim] F32.
+    pub comp_kv_buf: Option<rdna_compute::GpuTensor>,
+    /// Per-step score = wgate @ x + ape   [proj_dim] F32.
+    pub comp_score_buf: Option<rdna_compute::GpuTensor>,
+    /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
+    pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
+    pub comp_concat_score: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -393,28 +428,186 @@ pub struct IndexerLayerState {
 /// positions per step: a bounded ring of the last 128 raw KV rows
 /// (SWA window) plus 512 rows gathered from the indexer's top-k.
 pub struct MainAttentionLayerState {
-    /// SWA ring buffer for raw K (last `sliding_window = 128` positions).
-    pub _k_swa: (),
-    /// SWA ring buffer for raw V.
-    pub _v_swa: (),
-    /// K rows gathered from the indexer's top-k indices, max
-    /// `index_topk = 512` rows.
-    pub _k_gathered: (),
-    /// V rows gathered from the indexer's top-k indices.
-    pub _v_gathered: (),
+    /// SWA ring K cache `[n_kv_heads, head_dim, sliding_window]` F32.
+    /// `None` until `decode_step` allocates on first call.
+    pub swa_k: Option<rdna_compute::GpuTensor>,
+    /// SWA ring V cache. V4F has tied K=V so this is a copy of swa_k.
+    pub swa_v: Option<rdna_compute::GpuTensor>,
+
+    /// Full positional K/V cache for indexer-gathered attention. Layout:
+    /// `[max_ctx, n_kv_heads * head_dim]` F32. Written at each decode
+    /// step (after tail-RoPE). Used by the modified main attention when
+    /// the indexer's top-K points to positions outside the SWA window.
+    ///
+    /// V4F has tied K=V so we keep one buffer; `full_v_cache` is None
+    /// in practice and we re-use `full_k_cache` for both. Field kept for
+    /// future-proofing models with untied K/V.
+    pub full_k_cache: Option<rdna_compute::GpuTensor>,
+    pub full_v_cache: Option<rdna_compute::GpuTensor>,
+
+    /// Gather scratch — concat of SWA-window K/V + indexer-gathered K/V
+    /// for the modified attention pass. `[n_kv_heads, head_dim,
+    /// sliding_window + index_topk]` F32, lazy-alloc.
+    pub gathered_k: Option<rdna_compute::GpuTensor>,
+    pub gathered_v: Option<rdna_compute::GpuTensor>,
 }
 
-/// V4F state — scaffold. Real impl will hold:
-/// - 4 residual streams (Hyper-Connections, see Phase 3)
-/// - per-layer `MainAttentionLayerState` (SWA + gathered)
-/// - per-layer `IndexerLayerState` (compressed-K cache, top-k scratch)
-/// - per-arch sampler/embedding scratch reused across decode steps
+/// V4F per-decode state. Held on the daemon's per-session struct,
+/// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
-    /// One entry per layer (43 + 1 MTP = 44). Layers with
-    /// `compress_ratio == 0` skip the indexer; that variant of the
-    /// scaffold sets `compress_ratio = 0` and leaves the cache empty.
+    /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
+    /// skip the indexer.
     pub _indexer: Vec<IndexerLayerState>,
     pub _attention: Vec<MainAttentionLayerState>,
+
+    /// Hyper-Connections residual streams `[hc_mult = 4, hidden = 4096]`.
+    /// Stored as F32 to match hipfire's standard residual convention
+    /// (llama / qwen35 use f32 residuals + f32 RMSNorm). Quantized
+    /// kernels handle the f32 input directly.
+    /// `None` until `decode_step` allocates on first call.
+    pub residual_streams: Option<rdna_compute::GpuTensor>,
+
+    /// Single-row embedding scratch `[hidden]` for the current decode
+    /// step's token lookup. F32 to match residual_streams convention.
+    pub embed_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// Per-step scratch `[hidden]` F32 — used for RMSNorm output,
+    /// FWHT-rotated input to first GEMV, etc. Reused across layers.
+    pub tmp: Option<rdna_compute::GpuTensor>,
+
+    /// Plain RMSNorm'd attention-side input `[hidden]` F32 — no FWHT.
+    /// Mirrors `tmp` but skips the rotation step. Consumed by F32 (F16-
+    /// source) non-expert GEMVs (`--non-expert-f16` antirez recipe) since
+    /// `gemv_f32` expects un-rotated input. Computed once per layer in
+    /// `q_lora` alongside `tmp`.
+    pub tmp_plain: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
+    /// `wq_a @ x`, input to `wq_b`. Reused across layers.
+    pub q_lat: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck rotated `[q_lora_rank]` F32. FWHT-rotated
+    /// view of q_lat, input to the MQ4 GEMV against wq_b.
+    pub q_lat_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Full Q `[n_heads * head_dim = 64 * 512 = 32768]` F32. Output
+    /// of `wq_b @ q_lat_rot`. Tail-only RoPE applied in place.
+    pub q: Option<rdna_compute::GpuTensor>,
+
+    /// Joint KV stream `[n_kv_heads * head_dim = 1 * 512 = 512]` F32.
+    /// Output of `wkv @ x`. V4F uses tied K=V via this single vector
+    /// (MQA with V tied to K — see project memory for the layout
+    /// open question; revisit during numerical-correctness gate).
+    /// Tail-only RoPE applied to last `qk_rope_head_dim = 64` dims.
+    pub kv: Option<rdna_compute::GpuTensor>,
+
+    /// Position counter for RoPE. Stored as a 1-element F32 GpuTensor
+    /// where we write the i32 position bits via memcpy_htod (the
+    /// rope_tail kernel reinterprets the bytes as int via cast).
+    pub pos_buf: Option<rdna_compute::GpuTensor>,
+
+    /// Separate position buffer for the indexer compressor's tail-RoPE
+    /// step. Distinct from `pos_buf` because the compressor uses a
+    /// start-of-window position `(pos / ratio) * ratio`, while the main
+    /// attention's inverse-rope (called after the compressor) needs the
+    /// current `position`. Sharing one buffer would clobber the value
+    /// the main-attn inverse rope reads.
+    pub comp_pos_buf: Option<rdna_compute::GpuTensor>,
+
+    /// Per-token attention output `[hidden]` F32, fed to HC attn mix
+    /// as the `transform_out` arg. Currently a stub: holds a sliced
+    /// view of `q` until real attention + O-LoRA lands.
+    pub attn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Per-token FFN output `[hidden]` F32, fed to HC FFN mix as
+    /// `transform_out`. Currently = shared expert output (real),
+    /// routed experts pending.
+    pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
+    /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
+    pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Plain RMSNorm'd FFN-side input `[hidden]` F32 — no FWHT. Mirror of
+    /// `ffn_x_rot` for F32 (F16-source) non-expert GEMVs (antirez recipe).
+    pub ffn_x_plain: Option<rdna_compute::GpuTensor>,
+
+    /// Shared expert SwiGLU gate scratch `[moe_intermediate=2048]` F32.
+    pub ffn_gate: Option<rdna_compute::GpuTensor>,
+    /// Shared expert SwiGLU up scratch `[moe_intermediate]` F32.
+    pub ffn_up:   Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated silu(gate)*up for the down GEMV.
+    pub ffn_silu_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Final pre-lm_head normalized residual `[hidden]` F32. Output
+    /// of the global RMSNorm against `output_norm`.
+    pub final_norm: Option<rdna_compute::GpuTensor>,
+
+    /// LM head output logits `[vocab_size = 129280]` F32. Output of
+    /// `head_weight @ final_norm`.
+    pub logits: Option<rdna_compute::GpuTensor>,
+
+    /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
+    pub final_norm_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Input-mapping output: `x_in = A · X`. Fed to the transform (attn
+    /// or FFN) as its [hidden] input.
+    pub hc_x_in: Option<rdna_compute::GpuTensor>,
+
+    /// mHC control vector `[24]` F32, set by `hc_compute_control` and
+    /// consumed by `hc_mix_4stream`. Allocated once per session.
+    /// Layout: c[0..4]=Ã, c[4..20]=B̃, c[20..24]=C̃.
+    pub hc_c: Option<rdna_compute::GpuTensor>,
+
+    /// MoE router scores `[n_routed_experts = 256]` F32, set by the
+    /// router step (gate.weight @ ffn_input + bias → sqrt_softplus).
+    pub router_scores: Option<rdna_compute::GpuTensor>,
+    /// Top-K expert indices, allocated as F32 view but interpreted
+    /// as i32. Shape `[num_experts_per_tok = 6]`.
+    pub topk_indices: Option<rdna_compute::GpuTensor>,
+    /// Per-routed-expert output scratch `[hidden]` F32. Reused for
+    /// each of the K=6 selected experts; weighted-accumulated into
+    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Only used by
+    /// the non-fused fallback path (HIPFIRE_V4F_NO_FUSED_MOE=1).
+    pub routed_expert_out: Option<rdna_compute::GpuTensor>,
+
+    /// Phase 1 perf: fused MoE dispatch scratch.
+    /// `moe_topk_indices` [k_top] i32, `moe_topk_weights` [k_top] f32
+    /// (pre-multiplied by route_scale_override). Filled per-token from
+    /// CPU top-K result.
+    pub moe_topk_indices: Option<rdna_compute::GpuTensor>,
+    pub moe_topk_weights: Option<rdna_compute::GpuTensor>,
+    /// Per-expert SwiGLU intermediate buffers `[k_top × intermediate]`.
+    pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_up_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
+
+    /// Buffer of all-ones, length `head_dim`, used as the weight arg
+    /// to the per-head Q RMSNorm (upstream V4F has NO learnable scale
+    /// on the post-wq_b Q-norm, just rsqrt(mean(sq)+eps)). Allocated
+    /// once on first attention layer.
+    pub q_head_ones: Option<rdna_compute::GpuTensor>,
+
+    /// Raw attention output `[n_heads, head_dim]` F32 = 32768 elems.
+    /// Fed into the O-LoRA projection (wo_a + wo_b → state.attn_out).
+    pub attn_out_raw: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated `attn_out_raw` for wo_a GEMV input.
+    pub attn_out_raw_rot: Option<rdna_compute::GpuTensor>,
+    /// wo_a output `[n_groups * o_lora_rank]` F32 = 8192 elems.
+    pub wo_a_out: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated wo_a_out for the wo_b GEMV input.
+    pub wo_a_out_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Head HC pre-weights `[hc_mult=4]` F32 from hc_head_compute_pre.
+    pub head_hc_pre: Option<rdna_compute::GpuTensor>,
+    /// Head HC combined-streams output `[hidden]` F32 → output_norm → lm_head.
+    pub head_hc_out: Option<rdna_compute::GpuTensor>,
+
+    /// Monotonic position counter — how many tokens this session has
+    /// processed. Used to compute the SWA cache slot (`pos % window`)
+    /// and number of valid cached positions.
+    pub n_tokens: u64,
+
     pub _scaffold: (),
 }
 
@@ -427,15 +620,62 @@ impl DeepseekV4State {
             let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
             indexer.push(IndexerLayerState {
                 compress_ratio: ratio,
-                _k_idx_compressed: (),
-                _top_k_indices: (),
+                main_kv_cache: None, main_kv_state: None, main_score_state: None,
+                indexer_kv_cache: None, indexer_kv_state: None, indexer_score_state: None,
+                q_idx: None, idx_weights: None,
+                index_score: None, topk_idx_indices: None,
+                comp_kv_buf: None, comp_score_buf: None,
+                comp_concat_kv: None, comp_concat_score: None,
             });
             attention.push(MainAttentionLayerState {
-                _k_swa: (), _v_swa: (),
-                _k_gathered: (), _v_gathered: (),
+                swa_k: None, swa_v: None,
+                full_k_cache: None, full_v_cache: None,
+                gathered_k: None, gathered_v: None,
             });
         }
-        Ok(DeepseekV4State { _indexer: indexer, _attention: attention, _scaffold: () })
+        Ok(DeepseekV4State {
+            _indexer: indexer,
+            _attention: attention,
+            residual_streams: None,  // allocated on first `decode_step` (needs Gpu).
+            embed_scratch: None,
+            tmp: None,
+            tmp_plain: None,
+            q_lat: None,
+            q_lat_rot: None,
+            q: None,
+            kv: None,
+            pos_buf: None,
+            comp_pos_buf: None,
+            attn_out: None,
+            ffn_out: None,
+            ffn_x_rot: None,
+            ffn_x_plain: None,
+            ffn_gate: None,
+            ffn_up: None,
+            ffn_silu_rot: None,
+            final_norm: None,
+            logits: None,
+            final_norm_rot: None,
+            hc_x_in: None,
+            hc_c: None,
+            router_scores: None,
+            topk_indices: None,
+            routed_expert_out: None,
+            moe_topk_indices: None,
+            moe_topk_weights: None,
+            moe_gate_batch: None,
+            moe_up_batch: None,
+            moe_rot_batch: None,
+            q_head_ones: None,
+            attn_out_raw: None,
+            attn_out_raw_rot: None,
+            wo_a_out: None,
+            wo_a_out_rot: None,
+            head_hc_pre: None,
+            head_hc_out: None,
+            n_tokens: 0,
+            _scaffold: (),
+        })
     }
 }
 
