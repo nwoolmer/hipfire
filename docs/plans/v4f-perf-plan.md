@@ -1,6 +1,39 @@
 # V4F performance plan (2026-05-18)
 
-Status: active. See git for current execution state.
+Status: A / C / D shipped. B / E / F still open. See git for current execution
+state.
+
+## Session results (2026-05-18, branch feat/deepseek4-v4f)
+
+Cumulative perf delta from baseline at the start of the session:
+
+| ctx  | tok/s pre | tok/s post | tok/s Δ | PPL pre | PPL post | PPL Δ |
+|------|-----------|------------|---------|---------|----------|-------|
+| 128  |  12.07    |  15.94     |  +32%   |  14.03  |  11.58   | −17%  |
+| 1024 |  10.00    |  12.21     |  +22%   |   9.01  |   7.32   | −19%  |
+| 2048 |   6.33    |   7.18     |  +13%   |   8.49  |   6.28   | −26%  |
+
+Commits this session (newest first):
+
+- 1e33ed2 — batched rotate for wo_a per-group loop (+6% ctx=128)
+- b3e4332 — batched silu_clamp + rotate in MoE expert loop (+8% ctx=128)
+- b5279f2 — MQ2 MoE K4-unroll + LDS codebook port from MQ3 gfx1100 (+7–14%)
+- 4d8c757 — **grid bug + parallel softmax rewrite, PPL −17%/−19%/−26%**
+- 01eb2a7 — parallel softmax in v4f_attn_swa_topk (prior to grid-fix session)
+- 4cf6aff — per-layer batched pread for routed expert upload (150s+ → 75s)
+
+The PPL win in 4d8c757 was a latent dispatch-grid bug (heads 8..63 not
+computing) dating to commit e657ece on 2026-05-17 — not a quantization or
+training-side improvement. See feedback_v4f_dispatch_grid_axis memory.
+
+Tried-and-rejected this session:
+- V-transpose for swa_v cache (commit reverted): bit-identical PPL but a
+  wash on tok/s — head_dim=512 already coalesces well from L1 even without
+  the layout flip, and the extra write-side transpose cost cancels the gain.
+- Batch-aware blockIdx.y in default `gemv_hfq4g256` (reverted): introduced
+  enough register pressure to regress the non-batched callers by ~5%.
+  Cleaner path forward: separate `gemv_hfq4g256_strided_batched` kernel file
+  rather than modifying the shared default. Not pursued this session.
 
 ## What we measured (gfx1151 / Strix Halo, 137 GB unified memory, /data NVMe)
 
