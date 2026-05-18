@@ -3994,8 +3994,12 @@ fn main() {
     let use_mq4_mq2lloyd_gptq_all = format == "mq4-mq2lloyd-gptq-all"
         || format == "mq4-mq2lloyd-gptq"
         || format == "all-mq2-gptq";
-    if use_mq4_mq2lloyd_gptq_all && imatrix_path.is_none() {
+    if use_mq4_mq2lloyd_gptq_all && imatrix_path.is_none() &&
+        std::env::var("HIPFIRE_ALLOW_UNIT_IMATRIX").ok().as_deref() != Some("1")
+    {
         eprintln!("error: --format mq4-mq2lloyd-gptq-all requires --imatrix <PATH>");
+        eprintln!("       (V4F: set HIPFIRE_ALLOW_UNIT_IMATRIX=1 to use unit column weights —");
+        eprintln!("        captures GPTQ sequential error-feedback win without imatrix calibration.)");
         std::process::exit(2);
     }
     if use_mq4_mq2lloyd_gptq_all {
