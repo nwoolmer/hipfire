@@ -133,7 +133,7 @@ fn compressor_forward(
     };
 
     let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
 
     // Lazy-allocate state buffers per (layer, compressor-type).
     {
@@ -414,7 +414,7 @@ fn indexer_forward(
     let n_filled = (pos + 1) / ratio;
     if n_filled == 0 { return Ok(0); }
     let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
     let n = n_filled.min(max_compressed);
 
     let wq_b = layer.indexer_wq_b.as_ref()
@@ -875,7 +875,7 @@ fn ffn_routed(
         // Antirez DS4_EXPERT_WEIGHT_SCALE = 1.5 (ds4.c:54). Empirical optimum
         // under mixed attention + YaRN is 2.0; env override kept for tuning.
         let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
         let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add expert l{layer_idx} e{expert_id}: {e:?}"))?;
@@ -996,7 +996,7 @@ fn ffn_hash_routed(
         // Same default as score-routed path: 2.0 empirical optimum under
         // mixed attention + YaRN. Antirez uses 1.5 (DS4_EXPERT_WEIGHT_SCALE).
         let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
         let coef = wts[k_idx] * route_scale_override;
         gpu.scaled_add_inplace_cpu_scalar_f32(ffn_out, expert_out, coef)
             .map_err(|e| format!("scaled_add hash l{layer_idx} e{expert_id}: {e:?}"))?;
