@@ -14,6 +14,9 @@
 // atomicAdd into x_residual accumulates topk_weights[krank] * (W_down · rot_batch[krank])
 // across all top-k experts and rows. One launch replaces 8 per-expert
 // scaled-gemv-residual launches.
+//
+// 2026-05-18: K4-unrolled + LDS-resident codebook port from MQ3 gfx1100
+// pattern. See gemv_mq2g256_lloyd_moe_gate_up_indexed.hip for design notes.
 
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed(
@@ -37,39 +40,83 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
     const int groups_per_row = K / 256;
     const int row_bytes = groups_per_row * 72;
     const char* row_ptr = A + (long long)row * row_bytes;
+    const int boff = tid * 2;
 
-    float acc = 0.0f;
+    __shared__ float cb_lds[16];
 
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gptr = row_ptr + g * 72;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
 
-        const __half* cb_h = reinterpret_cast<const __half*>(gptr);
-        float cb0 = __half2float(cb_h[0]);
-        float cb1 = __half2float(cb_h[1]);
-        float cb2 = __half2float(cb_h[2]);
-        float cb3 = __half2float(cb_h[3]);
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 72;
+        const char* gp1 = gp0 + 72;
+        const char* gp2 = gp1 + 72;
+        const char* gp3 = gp2 + 72;
 
-        const unsigned char* data = (const unsigned char*)(gptr + 8);
-        int base_idx = g * 256 + tid * 8;
-        int byte_off = tid * 2;
+        if (tid < 16) {
+            const __half* cb_h =
+                (const __half*)(gp0 + (long long)(tid >> 2) * 72);
+            cb_lds[tid] = __half2float(cb_h[tid & 3]);
+        }
+        __syncthreads();
 
-        unsigned char b0 = data[byte_off];
-        unsigned char b1 = data[byte_off + 1];
+        const unsigned char* d0 = (const unsigned char*)(gp0 + 8) + boff;
+        const unsigned char* d1 = (const unsigned char*)(gp1 + 8) + boff;
+        const unsigned char* d2 = (const unsigned char*)(gp2 + 8) + boff;
+        const unsigned char* d3 = (const unsigned char*)(gp3 + 8) + boff;
 
-        #define CB_LOOKUP(q) ((q) == 0 ? cb0 : ((q) == 1 ? cb1 : ((q) == 2 ? cb2 : cb3)))
+        unsigned int pk0 = (unsigned int)d0[0] | ((unsigned int)d0[1] << 8);
+        unsigned int pk1 = (unsigned int)d1[0] | ((unsigned int)d1[1] << 8);
+        unsigned int pk2 = (unsigned int)d2[0] | ((unsigned int)d2[1] << 8);
+        unsigned int pk3 = (unsigned int)d3[0] | ((unsigned int)d3[1] << 8);
 
-        acc += CB_LOOKUP(b0 & 3)        * x[base_idx]
-             + CB_LOOKUP((b0 >> 2) & 3) * x[base_idx + 1]
-             + CB_LOOKUP((b0 >> 4) & 3) * x[base_idx + 2]
-             + CB_LOOKUP(b0 >> 6)       * x[base_idx + 3]
-             + CB_LOOKUP(b1 & 3)        * x[base_idx + 4]
-             + CB_LOOKUP((b1 >> 2) & 3) * x[base_idx + 5]
-             + CB_LOOKUP((b1 >> 4) & 3) * x[base_idx + 6]
-             + CB_LOOKUP(b1 >> 6)       * x[base_idx + 7];
+        int base = g * 256 + tid * 8;
 
-        #undef CB_LOOKUP
+        #define DOG2_LDS(pk, lds, b, a)                              \
+            (a) += cb_lds[(lds) + ( (pk)        & 3u)] * x[(b)]      \
+                 + cb_lds[(lds) + (((pk) >>  2) & 3u)] * x[(b) + 1]  \
+                 + cb_lds[(lds) + (((pk) >>  4) & 3u)] * x[(b) + 2]  \
+                 + cb_lds[(lds) + (((pk) >>  6) & 3u)] * x[(b) + 3]  \
+                 + cb_lds[(lds) + (((pk) >>  8) & 3u)] * x[(b) + 4]  \
+                 + cb_lds[(lds) + (((pk) >> 10) & 3u)] * x[(b) + 5]  \
+                 + cb_lds[(lds) + (((pk) >> 12) & 3u)] * x[(b) + 6]  \
+                 + cb_lds[(lds) + (((pk) >> 14) & 3u)] * x[(b) + 7]
+
+        DOG2_LDS(pk0,  0, base,        acc0);
+        DOG2_LDS(pk1,  4, base + 256,  acc1);
+        DOG2_LDS(pk2,  8, base + 512,  acc2);
+        DOG2_LDS(pk3, 12, base + 768,  acc3);
+        #undef DOG2_LDS
     }
 
+    #define TAIL_LOAD_AND_DOT(g_expr, acc) do {                                 \
+        const int g = (g_expr);                                                  \
+        const char* gp = row_ptr + g * 72;                                       \
+        if (tid < 4) {                                                           \
+            cb_lds[tid] = __half2float(((const __half*)gp)[tid]);                \
+        }                                                                        \
+        __syncthreads();                                                         \
+        const unsigned char* d = (const unsigned char*)(gp + 8) + boff;          \
+        unsigned int pk = (unsigned int)d[0] | ((unsigned int)d[1] << 8);        \
+        int base = g * 256 + tid * 8;                                            \
+        (acc) += cb_lds[ (pk)        & 3u] * x[base]                             \
+               + cb_lds[((pk) >>  2) & 3u] * x[base + 1]                         \
+               + cb_lds[((pk) >>  4) & 3u] * x[base + 2]                         \
+               + cb_lds[((pk) >>  6) & 3u] * x[base + 3]                         \
+               + cb_lds[((pk) >>  8) & 3u] * x[base + 4]                         \
+               + cb_lds[((pk) >> 10) & 3u] * x[base + 5]                         \
+               + cb_lds[((pk) >> 12) & 3u] * x[base + 6]                         \
+               + cb_lds[((pk) >> 14) & 3u] * x[base + 7];                        \
+    } while (0)
+
+    if (tail >= 1) TAIL_LOAD_AND_DOT( quads << 2,       acc0);
+    if (tail >= 2) TAIL_LOAD_AND_DOT((quads << 2) + 1,  acc1);
+    if (tail >= 3) TAIL_LOAD_AND_DOT((quads << 2) + 2,  acc2);
+    #undef TAIL_LOAD_AND_DOT
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
