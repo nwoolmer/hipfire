@@ -20255,7 +20255,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [o_groups as u32, 1, 1],
+                [n_heads as u32, 1, 1],
                 [head_dim as u32, 1, 1],
                 0,
                 self.stream_ref(),
@@ -20300,7 +20300,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [o_groups as u32, 1, 1],
+                [n_heads as u32, 1, 1],
                 [head_dim as u32, 1, 1],
                 0,
                 self.stream_ref(),
