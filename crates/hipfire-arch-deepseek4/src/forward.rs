@@ -1169,7 +1169,9 @@ fn attn_stub(
             .map_err(|e| format!("alloc wo_a_out_rot: {e:?}"))?);
     }
 
-    let use_swa = std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() == Some("swa");
+    // SWA is now the production default. Pos-0 path retained only as a
+    // diagnostic/regression-check escape hatch via HIPFIRE_V4F_ATTN=pos0.
+    let use_swa = std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() != Some("pos0");
 
     let q = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();

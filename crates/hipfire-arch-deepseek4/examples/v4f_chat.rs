@@ -7,7 +7,7 @@
 //!   echo "Hello" | v4f_chat
 //!
 //! ENV:
-//!   HIPFIRE_V4F_ATTN=swa     use SWA attention (default pos0)
+//!   HIPFIRE_V4F_ATTN=pos0    fall back to pos-0 attention (default: SWA)
 //!   HIPFIRE_V4F_GEN_TOKENS=N max tokens per turn (default 50)
 //!   HIPFIRE_V4F_MODEL=PATH   V4F HFQ path
 
@@ -39,7 +39,7 @@ fn main() -> Result<(), String> {
     eprintln!("Config: layers={} hidden={} vocab={} window={}",
         cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.sliding_window);
     eprintln!("Generation: max_tokens={} attention={}", max_gen,
-        std::env::var("HIPFIRE_V4F_ATTN").unwrap_or_else(|_| "pos0".to_string()));
+        std::env::var("HIPFIRE_V4F_ATTN").unwrap_or_else(|_| "swa".to_string()));
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
