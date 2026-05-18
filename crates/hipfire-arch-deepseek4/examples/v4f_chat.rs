@@ -13,6 +13,9 @@
 //!   HIPFIRE_V4F_GEN_TOKENS=N   max tokens per turn (default 200)
 //!   HIPFIRE_V4F_MODEL=PATH     V4F HFQ path
 //!   HIPFIRE_V4F_CHAT_RAW=1     disable chat template (base-completion mode)
+//!   HIPFIRE_V4F_TEMP=F         sampling temperature (default 0.7; 0 = greedy argmax)
+//!   HIPFIRE_V4F_TOP_K=N        top-K filter before softmax (default 40; 0 = full vocab)
+//!   HIPFIRE_V4F_SEED=N         PRNG seed (default: time-based)
 
 use hipfire_arch_deepseek4::{forward::decode_step, DeepseekV4, DeepseekV4State};
 use hipfire_runtime::arch::Architecture;
@@ -20,6 +23,57 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::io::{self, BufRead, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Xorshift64* PRNG — tiny, deterministic, no deps.
+struct Xorshift { s: u64 }
+impl Xorshift {
+    fn new(seed: u64) -> Self { Self { s: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed } } }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.s;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        self.s = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / ((1u64 << 24) as f32)
+    }
+}
+
+/// Sample next token from logits.
+/// - temp == 0.0: greedy argmax
+/// - top_k > 0: keep only K largest logits before softmax
+/// - else: temperature-scaled softmax over (filtered) logits, multinomial draw
+fn sample_token(logits: &[f32], temp: f32, top_k: usize, rng: &mut Xorshift) -> u32 {
+    if temp <= 0.0 {
+        return logits.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+    }
+    let n = logits.len();
+    let k = if top_k == 0 || top_k >= n { n } else { top_k };
+    // Indices of top-k logits by value.
+    let mut idx: Vec<usize> = (0..n).collect();
+    if k < n {
+        idx.select_nth_unstable_by(k - 1, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        idx.truncate(k);
+    }
+    // Softmax over selected logits with temperature.
+    let max_l = idx.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = idx.iter().map(|&i| ((logits[i] - max_l) / temp).exp()).collect();
+    let sum: f32 = weights.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return idx.iter().max_by(|&&a, &&b| logits[a].partial_cmp(&logits[b]).unwrap()).copied().unwrap_or(0) as u32;
+    }
+    for w in weights.iter_mut() { *w /= sum; }
+    // Multinomial draw via inverse CDF.
+    let r = rng.next_f32();
+    let mut acc = 0.0;
+    for (j, &w) in weights.iter().enumerate() {
+        acc += w;
+        if r <= acc { return idx[j] as u32; }
+    }
+    idx[idx.len() - 1] as u32
+}
 
 fn main() -> Result<(), String> {
     let path = std::env::var("HIPFIRE_V4F_MODEL")
@@ -27,6 +81,14 @@ fn main() -> Result<(), String> {
     let max_gen: u32 = std::env::var("HIPFIRE_V4F_GEN_TOKENS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     let raw_mode = std::env::var("HIPFIRE_V4F_CHAT_RAW").ok().as_deref() == Some("1");
+    let temp: f32 = std::env::var("HIPFIRE_V4F_TEMP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.7);
+    let top_k: usize = std::env::var("HIPFIRE_V4F_TOP_K")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let seed: u64 = std::env::var("HIPFIRE_V4F_SEED")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0xC0FFEE));
+    let mut rng = Xorshift::new(seed);
 
     eprintln!("Loading V4F from {path}...");
     let mut hfq = HfqFile::open(std::path::Path::new(&path))
@@ -54,9 +116,9 @@ fn main() -> Result<(), String> {
     eprintln!("V4F ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
     eprintln!("Config: layers={} hidden={} vocab={} window={}",
         cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.sliding_window);
-    eprintln!("Generation: max_tokens={} attention={} mode={}", max_gen,
+    eprintln!("Generation: max_tokens={} attention={} mode={} temp={} top_k={} seed={}", max_gen,
         std::env::var("HIPFIRE_V4F_ATTN").unwrap_or_else(|_| "swa".to_string()),
-        if raw_mode { "raw" } else { "chat" });
+        if raw_mode { "raw" } else { "chat" }, temp, top_k, seed);
     if !raw_mode {
         eprintln!("Chat tokens: bos={:?} user={:?} assistant={:?} eos={}",
             bos_tok, user_tok, asst_tok, eos_tok);
@@ -105,18 +167,15 @@ fn main() -> Result<(), String> {
             pos += 1;
         }
 
-        // Greedy decode.
-        let mut tok = last_logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        // Sample (temp/top_k; temp=0 → greedy argmax).
+        let mut tok = sample_token(&last_logits, temp, top_k, &mut rng);
         let mut generated: Vec<u32> = Vec::with_capacity(max_gen as usize);
         for _ in 0..max_gen {
             if !raw_mode && tok == eos_tok { break; }
             generated.push(tok);
             let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos)?;
             pos += 1;
-            let argmax = logits.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
-            tok = argmax.0 as u32;
+            tok = sample_token(&logits, temp, top_k, &mut rng);
         }
 
         let text = tokenizer.decode(&generated);
