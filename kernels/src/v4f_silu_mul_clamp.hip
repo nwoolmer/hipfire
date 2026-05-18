@@ -15,6 +15,12 @@
 //
 // Drop-in replacement for `silu_mul_f32` when the layer has swiglu_limit
 // > 0. Shared expert and each routed expert both benefit.
+//
+// Batched mode (2026-05-18): callers can dispatch with grid.y = batch_size
+// to process `batch_size` independent streams in one launch. Each stream
+// occupies `n` consecutive elements at stride `n` in the gate / up / out
+// buffers. When the dispatch passes grid.y = 1 the kernel runs in its
+// original single-stream mode (batch_off = 0, byte-identical).
 
 #include <hip/hip_runtime.h>
 
@@ -27,12 +33,13 @@ extern "C" __global__ void v4f_silu_mul_clamp_f32(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = gate[i];
-    float u = up[i];
+    const long long batch_off = (long long)blockIdx.y * n;
+    float g = gate[batch_off + i];
+    float u = up[batch_off + i];
     // V4F asymmetric clamp.
     if (g > swiglu_limit) g = swiglu_limit;
     if (u >  swiglu_limit) u =  swiglu_limit;
     if (u < -swiglu_limit) u = -swiglu_limit;
     float silu_g = g / (1.0f + __expf(-g));
-    out[i] = silu_g * u;
+    out[batch_off + i] = silu_g * u;
 }

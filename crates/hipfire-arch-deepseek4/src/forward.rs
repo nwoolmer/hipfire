@@ -888,18 +888,15 @@ fn ffn_routed(
             2 * im, cfg.hidden_size, k_top,
         ).map_err(|e| format!("fused gate_up l{layer_idx}: {e:?}"))?;
 
-        // 2. Per-expert silu_clamp + FWHT rotate (k_top launches each;
-        //    k_top=6 so 12 small launches total, dominated by the GEMVs
-        //    above and below).
-        for k_idx in 0..k_top {
-            let g_view = gate_batch.sub_offset(k_idx * im, im);
-            let u_view = up_batch.sub_offset(k_idx * im, im);
-            let r_view = rot_batch.sub_offset(k_idx * im, im);
-            gpu.v4f_silu_mul_clamp_f32(&g_view, &u_view, &g_view, cfg.swiglu_limit)
-                .map_err(|e| format!("v4f_silu_mul_clamp fused l{layer_idx} k{k_idx}: {e:?}"))?;
-            gpu.rotate_x_mq(&g_view, &r_view, im)
-                .map_err(|e| format!("rotate fused l{layer_idx} k{k_idx}: {e:?}"))?;
-        }
+        // 2. Batched silu_clamp + batched FWHT rotate. Each kernel handles
+        //    all k_top streams in one launch (grid.y = k_top), replacing
+        //    2*k_top = 12 small launches with 2.
+        gpu.v4f_silu_mul_clamp_f32_batched(
+            gate_batch, up_batch, gate_batch,
+            im, k_top, cfg.swiglu_limit,
+        ).map_err(|e| format!("v4f_silu_mul_clamp batched l{layer_idx}: {e:?}"))?;
+        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+            .map_err(|e| format!("rotate batched l{layer_idx}: {e:?}"))?;
 
         // 3. Fused down GEMV: one launch atomicAdds
         //      Σ_k topk_weights[k] * (W_down[expert_k] · rot_batch[k])
@@ -1052,15 +1049,12 @@ fn ffn_hash_routed(
         2 * im, cfg.hidden_size, k_top,
     ).map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
 
-    for k_idx in 0..k_top {
-        let g_view = gate_batch.sub_offset(k_idx * im, im);
-        let u_view = up_batch.sub_offset(k_idx * im, im);
-        let r_view = rot_batch.sub_offset(k_idx * im, im);
-        gpu.v4f_silu_mul_clamp_f32(&g_view, &u_view, &g_view, cfg.swiglu_limit)
-            .map_err(|e| format!("v4f_silu_mul_clamp hash fused l{layer_idx} k{k_idx}: {e:?}"))?;
-        gpu.rotate_x_mq(&g_view, &r_view, im)
-            .map_err(|e| format!("rotate hash fused l{layer_idx} k{k_idx}: {e:?}"))?;
-    }
+    gpu.v4f_silu_mul_clamp_f32_batched(
+        gate_batch, up_batch, gate_batch,
+        im, k_top, cfg.swiglu_limit,
+    ).map_err(|e| format!("v4f_silu_mul_clamp batched hash l{layer_idx}: {e:?}"))?;
+    gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+        .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
 
     gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         w2_ptrs, topk_idx_dev, topk_w_dev,

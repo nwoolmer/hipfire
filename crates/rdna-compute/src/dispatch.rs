@@ -19747,6 +19747,59 @@ impl Gpu {
         result
     }
 
+    /// Batched V4F SwiGLU+clamp. `gate`, `up`, `out` each hold `batch`
+    /// independent streams of length `n` laid out contiguously (stride =
+    /// n). Per-stream math is byte-identical to `v4f_silu_mul_clamp_f32`;
+    /// the kernel reads `batch_off = blockIdx.y * n` and indexes within
+    /// the stream. Used by the V4F MoE expert loop to collapse a
+    /// k_top-sized launch sequence into one.
+    pub fn v4f_silu_mul_clamp_f32_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        batch: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_silu_mul_clamp",
+            kernels::V4F_SILU_MUL_CLAMP_SRC, "v4f_silu_mul_clamp_f32")?;
+
+        let n_i32 = n as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n_i32;
+        let mut limit_val = swiglu_limit;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut limit_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n_i32 as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n) * batch;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "v4f_silu_mul_clamp_f32_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "v4f_silu_mul_clamp_f32",
+            [grid, batch as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(limit_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Phase 3 — `c = W_fn · x_flat + base`. Small GEMV producing the
     /// control vector that feeds Sinkhorn normalisation.
     #[allow(dead_code, clippy::too_many_arguments)]
