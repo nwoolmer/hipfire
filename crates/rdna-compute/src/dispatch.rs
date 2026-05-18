@@ -19694,6 +19694,1119 @@ impl Gpu {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // DeepSeek V4 Flash (arch_id = 7) — stub dispatch wrappers
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // These call the stub HIP kernels added in commits acfe377 / 79488aa.
+    // Each wrapper's signature is the contract the V4F forward path will
+    // bind to; the kernel bodies are placeholder reference impls until
+    // forward bring-up lands. Replace `unimplemented!` once the underlying
+    // arch crate is wired.
+
+
+    /// V4F SwiGLU with swiglu_limit clamp.
+    /// out[i] = silu(min(gate[i], L)) * clamp(up[i], -L, +L), where L = swiglu_limit.
+    pub fn v4f_silu_mul_clamp_f32(
+        &mut self, gate: &GpuTensor, up: &GpuTensor, out: &GpuTensor, swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_silu_mul_clamp",
+            kernels::V4F_SILU_MUL_CLAMP_SRC, "v4f_silu_mul_clamp_f32")?;
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+        let mut limit_val = swiglu_limit;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut limit_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "v4f_silu_mul_clamp_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "v4f_silu_mul_clamp_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(limit_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Phase 3 — `c = W_fn · x_flat + base`. Small GEMV producing the
+    /// control vector that feeds Sinkhorn normalisation.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hc_compute_control(
+        &mut self,
+        x_flat: &GpuTensor,    // [x_dim] fp16
+        w_fn: &GpuTensor,      // [n_ctrl, x_dim] fp16
+        base: &GpuTensor,      // [n_ctrl] fp16
+        c_out: &GpuTensor,     // [n_ctrl] fp32
+        n_ctrl: i32,
+        x_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_compute_control",
+            kernels::HC_COMPUTE_CONTROL_SRC, "hc_compute_control")?;
+        let func = &self.functions["hc_compute_control"];
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut xd = x_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_ctrl as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F Compressor overlap-transform concat (overlap=true / ratio=4).
+    /// Reads [2*ratio, 2*head_dim] kv_state and writes [2*ratio, head_dim]
+    /// dst by taking first half-cols for old window rows and second
+    /// half-cols for current window rows.
+    pub fn compressor_overlap_concat_f32(
+        &mut self,
+        src: &GpuTensor,  // [2*ratio, 2*head_dim] F32
+        dst: &GpuTensor,  // [2*ratio, head_dim] F32
+        ratio: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_overlap_concat",
+            kernels::COMPRESSOR_OVERLAP_CONCAT_SRC,
+            "compressor_overlap_concat_f32",
+        )?;
+        let func = &self.functions["compressor_overlap_concat_f32"];
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut rv = ratio;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut rv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(2 * ratio) as u32, 1, 1], [head_dim as u32, 1, 1],
+                0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F Compressor softmax-weighted pool. Compresses `T` window
+    /// positions of (kv_state, score_state) into one `head_dim` output:
+    ///   output[d] = sum_t softmax_t(score_state[:, d])[t] * kv_state[t, d]
+    pub fn compressor_softmax_pool_f32(
+        &mut self,
+        kv_state: &GpuTensor,     // [T, head_dim] F32
+        score_state: &GpuTensor,  // [T, head_dim] F32
+        output: &GpuTensor,       // [head_dim] F32
+        t: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_softmax_pool",
+            kernels::COMPRESSOR_SOFTMAX_POOL_SRC,
+            "compressor_softmax_pool_f32",
+        )?;
+        let func = &self.functions["compressor_softmax_pool_f32"];
+        let kp = kv_state.buf.as_ptr();
+        let sp = score_state.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let mut tv = t;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut tv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((head_dim as u32) + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid, 1, 1], [block, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F indexer scoring — combined across heads with relu gating.
+    /// `scores[n] = sum_h relu(q[h, :] · k_cache[n, :]) * weights[h]`.
+    /// Block per slot N, threads-per-block = H (one head per thread),
+    /// LDS reduction across heads.
+    pub fn indexer_relu_score_f32(
+        &mut self,
+        q: &GpuTensor,         // [H, D] F32
+        k_cache: &GpuTensor,   // [N, D] F32
+        weights: &GpuTensor,   // [H] F32
+        scores: &GpuTensor,    // [N] F32
+        h: i32,
+        d: i32,
+        n: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_relu_score",
+            kernels::INDEXER_RELU_SCORE_SRC,
+            "indexer_relu_score_f32",
+        )?;
+        let func = &self.functions["indexer_relu_score_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut hi = h;
+        let mut di = d;
+        let mut ni = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n as u32, 1, 1],
+                [h as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F indexer-extended attention K/V gather. Reads from
+    /// `main_kv_cache` [N_compressed, head_dim] at the indices given by
+    /// `topk_idx` [K] and writes into columns `[col_offset, col_offset+K)`
+    /// of an [n_kv=1, head_dim, out_stride] output tensor — letting the
+    /// caller stage the gather into a buffer whose first `col_offset`
+    /// columns hold raw SWA window K/V. Sentinel `topk_idx[k] = -1` (or
+    /// out-of-range) writes zeros. The `scale` parameter multiplies the
+    /// gathered values; pass 1.0 for pass-through, larger to compensate
+    /// for compressor.norm undershoot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_topk_kv_gather_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] F32
+        topk_idx: &GpuTensor,    // [K] i32
+        out: &GpuTensor,         // [head_dim, out_stride] F32 (n_kv=1)
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather",
+            kernels::V4F_TOPK_KV_GATHER_SRC,
+            "v4f_topk_kv_gather_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F mixed-attention identity gather (ratio=128 path). Same output
+    /// layout as `v4f_topk_kv_gather_f32` but skips topk-index lookup —
+    /// copies main_kv_cache[0..K] directly into gathered_k[:, 0..K].
+    pub fn v4f_topk_kv_gather_identity_f32(
+        &mut self,
+        kv_cache: &GpuTensor,
+        out: &GpuTensor,
+        k_active: i32,
+        head_dim: i32,
+        out_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_identity",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_SRC,
+            "v4f_topk_kv_gather_identity_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_identity_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F indexer-extended SWA attention. Reads from the SWA ring
+    /// buffer (`swa_k/v` [n_kv=1, head_dim, swa_window]) AND the
+    /// indexer-gathered top-K K/V (`topk_k/v` [n_kv=1, head_dim,
+    /// topk_window]) under a single joint softmax with `attn_sink` as
+    /// an extra entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_topk_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor, swa_v: &GpuTensor,
+        topk_k: &GpuTensor, topk_v: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32, head_dim: i32,
+        swa_window: i32, topk_window: i32,
+        n_valid_swa: i32, n_active_topk: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_attn_swa_topk",
+            kernels::V4F_ATTN_SWA_TOPK_SRC,
+            "v4f_attn_swa_topk_f32",
+        )?;
+        let func = &self.functions["v4f_attn_swa_topk_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let tkp = topk_k.buf.as_ptr();
+        let tvp = topk_v.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut vsw = n_valid_swa;
+        let mut atk = n_active_topk;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tkp as *const _ as *mut c_void,
+            &tvp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut vsw as *mut _ as *mut c_void,
+            &mut atk as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F head HC mix — compute the per-stream `pre` weights for the
+    /// 4-stream → hidden projection before lm_head. Matches upstream
+    /// `ParallelHead.hc_head`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_head_compute_pre(
+        &mut self,
+        x_flat: &GpuTensor,    // [hc_mult * hidden] F32
+        w_fn: &GpuTensor,      // [hc_mult, hc_mult * hidden] F16
+        base: &GpuTensor,      // [hc_mult] F16
+        pre_out: &GpuTensor,   // [hc_mult] F32
+        hc_mult: i32,
+        x_dim: i32,
+        scale: f32,            // hc_head_scale (scalar)
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_head_compute_pre",
+            kernels::HC_HEAD_COMPUTE_PRE_SRC, "hc_head_compute_pre")?;
+        let func = &self.functions["hc_head_compute_pre"];
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let pp = pre_out.buf.as_ptr();
+        let mut hm = hc_mult;
+        let mut xd = x_dim;
+        let mut sv = scale;
+        let mut ne = norm_eps;
+        let mut he = hc_eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut hm as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut sv as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut he as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [hc_mult as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 3 — Sinkhorn-normalise a 4×4 gating matrix (in place).
+    /// `matrix` is row-major 16 floats; `iters` = `hc_sinkhorn_iters`
+    /// from V4F config (= 20). `eps` = `hc_eps` (= 1e-6).
+    #[allow(dead_code)]
+    pub fn hc_sinkhorn_4x4(
+        &mut self,
+        matrix: &GpuTensor,
+        eps: f32,
+        iters: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(matrix.numel(), 16, "hc_sinkhorn_4x4 expects a 4x4 matrix");
+        self.ensure_kernel(
+            "hc_sinkhorn_4x4",
+            kernels::HC_SINKHORN_4X4_SRC,
+            "hc_sinkhorn_4x4",
+        )?;
+        let func = &self.functions["hc_sinkhorn_4x4"];
+        let m_ptr = matrix.buf.as_ptr();
+        let mut eps_v = eps;
+        let mut iters_v = iters;
+        let mut params: Vec<*mut c_void> = vec![
+            &m_ptr as *const _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut iters_v as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [1, 1, 1],  // stub single-thread; optimised version uses 4 threads
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Write a single KV vector into the SWA ring at slot.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn swa_ring_write_f32(
+        &mut self,
+        kv: &GpuTensor,
+        cache: &GpuTensor,
+        n_kv_heads: i32,
+        head_dim: i32,
+        window: i32,
+        slot: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("swa_ring_write_f32",
+            kernels::SWA_RING_WRITE_SRC, "swa_ring_write_f32")?;
+        let func = &self.functions["swa_ring_write_f32"];
+        let kp = kv.buf.as_ptr();
+        let cp = cache.buf.as_ptr();
+        let mut nh = n_kv_heads;
+        let mut hd = head_dim;
+        let mut wn = window;
+        let mut sl = slot;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        let grid = ((head_dim + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F SWA-windowed attention with attn_sink (multi-position).
+    /// Generalises `v4f_attn_pos0` to attend over a cache of up to
+    /// `window` past KV positions.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_swa(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+        n_valid: i32,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_swa",
+            kernels::V4F_ATTN_SWA_SRC, "v4f_attn_swa")?;
+        let func = &self.functions["v4f_attn_swa"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut nv = n_valid;
+        let mut wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [o_groups as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F position-0 attention: per-head sigmoid-of-(Q·K + attn_sink),
+    /// times V, reduced over o_groups.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_pos0(
+        &mut self,
+        q: &GpuTensor,
+        kv: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_pos0",
+            kernels::V4F_ATTN_POS0_SRC, "v4f_attn_pos0")?;
+        let func = &self.functions["v4f_attn_pos0"];
+        let qp = q.buf.as_ptr();
+        let kp = kv.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [o_groups as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F MoE routing affinity: sqrt(softplus(x)) elementwise in-place.
+    #[allow(dead_code)]
+    pub fn sqrt_softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sqrt_softplus_f32",
+            kernels::SQRT_SOFTPLUS_F32_SRC, "sqrt_softplus_f32")?;
+        let func = &self.functions["sqrt_softplus_f32"];
+        let n = x.numel() as i32;
+        let xp = x.buf.as_ptr();
+        let mut nv = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// Phase 3 — Apply α scaling to the 24-element HC control vector
+    /// after `hc_compute_control` has run (which produces α=1 output).
+    /// Rescales c[i] = α[seg(i)] · (c[i] - base[i]) + base[i] so each
+    /// of the three segments (Ã/B̃/C̃) gets its proper α^pre/res/post.
+    #[allow(dead_code)]
+    pub fn hc_apply_alpha(
+        &mut self,
+        c: &GpuTensor,
+        alpha: &GpuTensor,
+        base: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_apply_alpha",
+            kernels::HC_APPLY_ALPHA_SRC, "hc_apply_alpha")?;
+        let func = &self.functions["hc_apply_alpha"];
+        let cp = c.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [24, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]).
+    /// A is sigmoid-bounded [0, 1].
+    #[allow(dead_code)]
+    pub fn hc_input_map_4stream(
+        &mut self,
+        a_vec: &GpuTensor,
+        streams: &GpuTensor,
+        x_out: &GpuTensor,
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_input_map_4stream",
+            kernels::HC_INPUT_MAP_SRC, "hc_input_map_4stream")?;
+        let func = &self.functions["hc_input_map_4stream"];
+        let ap = a_vec.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let op = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 3 — Mix 4 residual streams via gating matrix + transform output.
+    /// `x_out[s, d] = sum_t(A[s, t] * x_in[t, d]) + scale[s] * transform_out[d]`.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hc_mix_4stream(
+        &mut self,
+        x_in: &GpuTensor,            // [4, hidden] fp16
+        a_matrix: &GpuTensor,        // [4, 4] fp32 (post-Sinkhorn)
+        scale: &GpuTensor,           // [4] fp32
+        transform_out: &GpuTensor,   // [hidden] fp16
+        x_out: &GpuTensor,           // [4, hidden] fp16
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_mix_4stream", kernels::HC_MIX_4STREAM_SRC, "hc_mix_4stream")?;
+        let func = &self.functions["hc_mix_4stream"];
+        let xi  = x_in.buf.as_ptr();
+        let am  = a_matrix.buf.as_ptr();
+        let sc  = scale.buf.as_ptr();
+        let to  = transform_out.buf.as_ptr();
+        let xo  = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &xi as *const _ as *mut c_void,
+            &am as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &to as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 4, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 4 — Tail-only partial RoPE (V4F's last 64 of 512 head_dim).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn rope_tail_halfsplit(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,   // [1] i32, position index
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,            // qk_rope_head_dim
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_halfsplit",
+            kernels::ROPE_TAIL_HALFSPLIT_SRC,
+            "rope_tail_halfsplit_f32",
+        )?;
+        let func = &self.functions["rope_tail_halfsplit_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(half + 31) / 32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F-faithful tail RoPE in INTERLEAVED pair convention (pairs are
+    /// (2i, 2i+1) within the tail region). Upstream V4F's RoPE goes
+    /// through `torch.view_as_complex`, which is the interleaved form.
+    /// Distinct from `rope_tail_halfsplit` which uses HF rotate_half.
+    pub fn rope_tail_interleaved(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_interleaved",
+            kernels::ROPE_TAIL_INTERLEAVED_SRC,
+            "rope_tail_interleaved_f32",
+        )?;
+        let func = &self.functions["rope_tail_interleaved_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(half + 31) / 32, 1, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// YaRN-aware tail-only RoPE (V4F compressed layers). Mirrors
+    /// antirez/ds4 `rope_tail_ext_inplace`. Caller supplies:
+    ///   freq_base    — 10000 (dense) or 160000 (compressed)
+    ///   freq_scale   — 1.0 (dense) or 1/16 = 0.0625 (compressed)
+    ///   ext_factor   — 0.0 (dense, no YaRN) or 1.0 (compressed)
+    ///   attn_factor  — 1.0 net (cancels with the inner log correction)
+    ///   corr_low/high — output of yarn_corr_dims (computed on host)
+    ///   inverse      — 0 for forward, 1 for inverse rotation
+    ///
+    /// For ext_factor=0 the math collapses to plain rope_tail_interleaved
+    /// at freq=freq_scale*freq_base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_tail_yarn_interleaved(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &GpuTensor,
+        n_heads_q: i32,
+        n_heads_k: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        corr_low: f32,
+        corr_high: f32,
+        inverse: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_yarn_interleaved",
+            kernels::ROPE_TAIL_YARN_INTERLEAVED_SRC,
+            "rope_tail_yarn_interleaved_f32",
+        )?;
+        let func = &self.functions["rope_tail_yarn_interleaved_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nq = n_heads_q;
+        let mut nk = n_heads_k;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut fs = freq_scale;
+        let mut ef = ext_factor;
+        let mut af = attn_factor;
+        let mut cl = corr_low;
+        let mut ch = corr_high;
+        let mut inv = inverse;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nq as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut fs as *mut _ as *mut c_void,
+            &mut ef as *mut _ as *mut c_void,
+            &mut af as *mut _ as *mut c_void,
+            &mut cl as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+            &mut inv as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [(half + 31) / 32, 1, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F inverse tail RoPE on attention output. Undoes the RoPE that V
+    /// had baked in (since K=V tied and K's tail dims were RoPE'd at
+    /// write time). Upstream calls `apply_rotary_emb(o[..., -rd:],
+    /// freqs_cis, True)` after sparse_attn, before O-LoRA.
+    pub fn rope_tail_inverse(
+        &mut self,
+        x: &GpuTensor,
+        pos_buf: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_inverse",
+            kernels::ROPE_TAIL_INVERSE_SRC,
+            "rope_tail_inverse_f32",
+        )?;
+        let func = &self.functions["rope_tail_inverse_f32"];
+        let xp = x.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(half + 31) / 32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Compressed-K scoring (Q · K^T over indexer-compressed positions).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_compressed_k_score(
+        &mut self,
+        q_idx: &GpuTensor,         // [H, D] fp16
+        k_idx_cache: &GpuTensor,   // [H, D, N] fp16
+        scores: &GpuTensor,        // [H, N] fp32
+        n_idx_heads: i32,
+        idx_head_dim: i32,
+        n_compressed: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_compressed_k_score",
+            kernels::INDEXER_COMPRESSED_K_SCORE_SRC,
+            "indexer_compressed_k_score",
+        )?;
+        let func = &self.functions["indexer_compressed_k_score"];
+        let qp = q_idx.buf.as_ptr();
+        let kp = k_idx_cache.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut d  = idx_head_dim;
+        let mut nc = n_compressed;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        // grid.x = heads, grid.y = ceil(N / TILE_POSITIONS=8)
+        let grid_y = ((n_compressed + 7) / 8).max(1) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, grid_y, 1],
+                [64, 1, 1],  // THREADS_PER_BLOCK
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Per-head top-k selection.
+    pub fn indexer_top_k(
+        &mut self,
+        scores: &GpuTensor,         // [H, N] fp32
+        top_indices: &GpuTensor,    // [H, K] i32
+        n_idx_heads: i32,
+        n_compressed: i32,
+        k: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("indexer_top_k", kernels::INDEXER_TOP_K_SRC, "indexer_top_k")?;
+        let func = &self.functions["indexer_top_k"];
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut nc = n_compressed;
+        let mut kk = k;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        // shared mem = n_compressed bytes for the `taken` flag array.
+        let smem = n_compressed as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, 1, 1],
+                [1, 1, 1],  // stub single-thread per head
+                smem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase 2 — Gather raw K/V rows from main cache at indexer indices.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_kv_gather(
+        &mut self,
+        k_main_cache: &GpuTensor,
+        v_main_cache: &GpuTensor,
+        unique_indices: &GpuTensor,
+        k_gathered: &GpuTensor,
+        v_gathered: &GpuTensor,
+        n_kv_heads: i32,
+        head_dim: i32,
+        max_seq: i32,
+        n_unique: i32,
+        compress_ratio: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_kv_gather",
+            kernels::INDEXER_KV_GATHER_SRC,
+            "indexer_kv_gather",
+        )?;
+        let func = &self.functions["indexer_kv_gather"];
+        let kc = k_main_cache.buf.as_ptr();
+        let vc = v_main_cache.buf.as_ptr();
+        let ui = unique_indices.buf.as_ptr();
+        let kg = k_gathered.buf.as_ptr();
+        let vg = v_gathered.buf.as_ptr();
+        let mut nh  = n_kv_heads;
+        let mut hd  = head_dim;
+        let mut ms  = max_seq;
+        let mut nu  = n_unique;
+        let mut cr  = compress_ratio;
+        let mut params: Vec<*mut c_void> = vec![
+            &kc as *const _ as *mut c_void,
+            &vc as *const _ as *mut c_void,
+            &ui as *const _ as *mut c_void,
+            &kg as *const _ as *mut c_void,
+            &vg as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut cr as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_unique as u32, n_kv_heads as u32, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
 

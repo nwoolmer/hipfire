@@ -39,6 +39,18 @@ pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2
 /// MQ2G256Lloyd: 2-bit + per-block 4-entry fp16 codebook (72 B/group).
 pub const GEMV_MQ2G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256_lloyd.hip");
 
+/// MQ2-Lloyd MoE indexed family: routed-experts gate_up + down with
+/// device-side topk routing + per-expert pointer table. Mirrors the HFQ4
+/// MoE indexed kernels. X must be FWHT-pre-rotated by the caller.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched.hip");
+
 /// MQ3G256Lloyd: 3-bit + per-block 8-entry fp16 codebook (112 B/group).
 pub const GEMV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.hip");
 /// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
@@ -962,6 +974,10 @@ pub const MUL_SRC: &str = include_str!("../../../kernels/src/mul.hip");
 /// SiLU (Sigmoid Linear Unit): silu(x) = x * sigmoid(x)
 pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 
+/// V4F SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
+/// L = swiglu_limit (V4F config = 10.0).
+pub const V4F_SILU_MUL_CLAMP_SRC: &str = include_str!("../../../kernels/src/v4f_silu_mul_clamp.hip");
+
 
 /// Fused SiLU(gate) * up: out[i] = silu(gate[i]) * up[i]
 /// Saves one kernel launch + one intermediate buffer.
@@ -1551,3 +1567,99 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+// ─── DeepSeek V4 Flash (arch_id=7) — stub kernels ────────────────────────────
+// All five are functional-stub implementations whose API contract is the
+// signature; bodies are placeholder reference impls until V4F forward
+// bring-up lands optimised versions. See `docs/plans/deepseek4-phase{2,3,4}-*.md`.
+//
+// Phase 2 — Compressed-KV indexer:
+pub const INDEXER_COMPRESSED_K_SCORE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_compressed_k_score.hip");
+pub const INDEXER_TOP_K_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k.hip");
+pub const INDEXER_KV_GATHER_SRC: &str =
+    include_str!("../../../kernels/src/indexer_kv_gather.hip");
+
+// Phase 3 — Hyper-Connections:
+pub const HC_COMPUTE_CONTROL_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control.hip");
+pub const HC_SINKHORN_4X4_SRC: &str =
+    include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
+pub const HC_MIX_4STREAM_SRC: &str =
+    include_str!("../../../kernels/src/hc_mix_4stream.hip");
+pub const HC_INPUT_MAP_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map.hip");
+pub const HC_APPLY_ALPHA_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha.hip");
+pub const SQRT_SOFTPLUS_F32_SRC: &str =
+    include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
+pub const V4F_ATTN_POS0_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_pos0.hip");
+pub const V4F_ATTN_SWA_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa.hip");
+pub const SWA_RING_WRITE_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write.hip");
+
+// Phase 4 — Tail-only RoPE:
+pub const ROPE_TAIL_HALFSPLIT_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_halfsplit.hip");
+
+/// Inverse tail RoPE for V4F attention output (sin negated).
+pub const ROPE_TAIL_INVERSE_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_inverse.hip");
+
+/// Tail-only RoPE, INTERLEAVED pair convention (V4F upstream's
+/// `torch.view_as_complex` variant, distinct from HF rotate_half).
+pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved.hip");
+
+/// YaRN-aware tail-only RoPE for compressed-layer attention (V4F).
+/// Adds per-call freq_scale / ext_factor / attn_factor / corr_dims to
+/// match antirez/ds4 rope_tail_ext_inplace. For dense (uncompressed)
+/// layers, caller passes ext_factor=0 to disable YaRN — math collapses
+/// to standard RoPE.
+pub const ROPE_TAIL_YARN_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip");
+
+/// V4F head HC mix — compute per-stream pre weights for the final
+/// 4-stream → hidden projection before lm_head.
+pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
+    include_str!("../../../kernels/src/hc_head_compute_pre.hip");
+
+/// V4F Compressor softmax-weighted pool along window dim.
+/// Used in Compressor.forward when should_compress fires every
+/// `ratio` steps, to produce a single compressed KV vector from
+/// T accumulated step values.
+pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
+    include_str!("../../../kernels/src/compressor_softmax_pool.hip");
+
+/// V4F Compressor overlap-transform concat. Builds the [2*ratio,
+/// head_dim] view for compression from the [2*ratio, 2*head_dim]
+/// kv_state / score_state buffer (overlap=true, ratio=4 case).
+pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
+    include_str!("../../../kernels/src/compressor_overlap_concat.hip");
+
+/// V4F indexer scoring kernel — combined across heads with relu
+/// gating and per-head weights from weights_proj. Operates on the
+/// indexer's compressed K cache (shared across heads, NOT per-head
+/// like the older indexer_compressed_k_score variant).
+pub const INDEXER_RELU_SCORE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score.hip");
+
+/// V4F indexer-extended attention: gather K/V from main_kv_cache at
+/// top-K compressed-slot indices into a [n_kv, head_dim, K] buffer
+/// that matches the v4f_attn_swa K layout for downstream concat.
+pub const V4F_TOPK_KV_GATHER_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather.hip");
+
+/// V4F mixed-attention identity gather (ratio=128 layers without indexer).
+/// Copies main_kv_cache[0..K, :] to gathered_k[:, 0..K] directly.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_identity.hip");
+
+/// V4F indexer-extended SWA attention: jointly attends to the SWA
+/// window K/V and the indexer-gathered top-K K/V slots under a single
+/// softmax (with attn_sink as an additional entry).
+pub const V4F_ATTN_SWA_TOPK_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_topk.hip");
