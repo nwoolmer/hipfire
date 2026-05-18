@@ -5447,6 +5447,112 @@ fn main() {
 }
 
 #[cfg(test)]
+mod gptq_damping_probe {
+    //! Offline GPTQ-Lloyd damping sweep. Runs the GPTQ-Lloyd quant pipeline
+    //! against synthetic V4F-realistic weight distributions across a damping
+    //! range, compares per-block reconstruction MSE to plain Lloyd. Catches
+    //! a known failure mode where forward-error-propagation on FWHT-rotated
+    //! (largely-decorrelated) weights INJECTS noise rather than removing it
+    //! at moderate-to-high damping values — what the V4F MQ2-GPTQ-all run
+    //! is suspected to be hitting.
+    //!
+    //! Run with:
+    //!   cargo test -p hipfire-quantize gptq_damping_probe -- --nocapture
+    use super::*;
+
+    /// Deterministic Box-Muller-from-LCG Gaussian sampler — no external dep.
+    /// Returns N samples with zero mean and unit variance.
+    fn gaussian_samples(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut step = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as u64 & ((1u64 << 53) - 1)) as f64 / (1u64 << 53) as f64
+        };
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let mut u1 = step() as f64;
+            if u1 < 1e-12 { u1 = 1e-12; }
+            let u2 = step() as f64;
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            out.push((r * theta.cos()) as f32);
+            if out.len() < n { out.push((r * theta.sin()) as f32); }
+        }
+        out
+    }
+
+    fn mse(a: &[f32], b: &[f32]) -> f64 {
+        debug_assert_eq!(a.len(), b.len());
+        let mut acc = 0.0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = *x as f64 - *y as f64;
+            acc += d * d;
+        }
+        acc / a.len() as f64
+    }
+
+    fn run_one_distribution(label: &str, weights: &[f32]) {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let n = weights.len();
+        // Unit column weights — what V4F's mq2-gptq-all build passes.
+        let unit: Vec<f32> = vec![1.0; n];
+
+        eprintln!("\n=== {label} (n={n}) ===");
+
+        let lloyd_bytes = quantize_mq2g256_lloyd(weights, &signs1, &signs2);
+        let lloyd_recon = dequantize_mq2g256_lloyd_to_f32(&lloyd_bytes, n, &signs1, &signs2);
+        let lloyd_mse = mse(weights, &lloyd_recon);
+        eprintln!("  Lloyd                  MSE = {:.6e}", lloyd_mse);
+
+        for damping in [0.0_f32, 0.1, 0.3, 0.5, 0.8, 1.0] {
+            // Inject env override since the quantizer reads it at fn entry.
+            std::env::set_var("HIPFIRE_GPTQ_DAMPING", format!("{damping}"));
+            let gptq_bytes = quantize_mq2g256_lloyd_gptq(weights, &unit, &signs1, &signs2);
+            let gptq_recon = dequantize_mq2g256_lloyd_to_f32(&gptq_bytes, n, &signs1, &signs2);
+            let gptq_mse = mse(weights, &gptq_recon);
+            let delta = ((gptq_mse - lloyd_mse) / lloyd_mse) * 100.0;
+            eprintln!("  GPTQ d={damping:>4.1}             MSE = {:.6e}  ({:+.2}% vs Lloyd)",
+                gptq_mse, delta);
+        }
+        std::env::remove_var("HIPFIRE_GPTQ_DAMPING");
+    }
+
+    #[test]
+    fn sweep_v4f_like_distributions() {
+        // 1) Pure Gaussian — baseline.
+        run_one_distribution("N(0,1), 256 weights",
+            &gaussian_samples(256, 0xc001cafe));
+
+        // 2) Pure Gaussian, larger sample — averages across multiple blocks.
+        run_one_distribution("N(0,1), 16x256 weights",
+            &gaussian_samples(16 * 256, 0xc001cafe));
+
+        // 3) Heavy-tailed mixture — 5% from N(0, 3), rest N(0, 1).
+        //    Mimics V4F's expert distributions with occasional outliers.
+        let mut htw = gaussian_samples(16 * 256, 0xfeed);
+        let tail = gaussian_samples((16 * 256) / 20, 0xbeef);
+        for (i, t) in tail.iter().enumerate() {
+            // Sprinkle the tail in every 20th slot.
+            htw[i * 20] = t * 3.0;
+        }
+        run_one_distribution("Heavy-tailed, 16x256 weights", &htw);
+
+        // 4) Sparse weights — most near zero, a few large. Sometimes
+        //    happens in attention-related projections.
+        let mut sw = gaussian_samples(16 * 256, 0x5_a55e);
+        for v in sw.iter_mut() {
+            *v *= 0.1;
+        }
+        // Inject 5% large values.
+        for i in 0..(16 * 256 / 20) {
+            sw[i * 20] *= 30.0;
+        }
+        run_one_distribution("Sparse (10% scale, 5% × 30 outliers)", &sw);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
