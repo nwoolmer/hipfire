@@ -471,39 +471,42 @@ impl Architecture for DeepseekV4 {
             layer.shared_w3 = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.ffn.shared_experts.w3.weight"))?);
 
-            // Routed experts: 256 × 3 = 768 tensors per layer ×
-            // 43 layers = ~33K total. Per-expert hipMalloc takes ~10ms
-            // (driver overhead) → 5+ min naive. Batch as ONE upload per
-            // (layer, projection): 129 uploads total. Skip unless
-            // HIPFIRE_V4F_UPLOAD_EXPERTS=1 (model is ~40 GB).
-            // Per-layer gate: skip uploads when partial-MoE budget excludes
-            // this layer (forward gracefully falls back to shared-only).
-            let upload_this_layer = upload_experts
-                && expert_layer_end.map_or(true, |end| l < end);
-            if upload_this_layer {
+        }
+
+        // Phase B (2026-05-18): drop the HFQ mmap BEFORE the routed-expert
+        // upload pass. The dense + shared-expert pass above accumulates
+        // ~5 GB of mmap-backed page cache that competes with the upcoming
+        // ~80 GB of hipMalloc-backed routed-expert blobs under unified
+        // memory. Dropping the mmap now lets the kernel reclaim those
+        // pages immediately — measured per-layer time stays flat across
+        // the routed pass instead of growing 0.84 s → 2.04 s as before.
+        //
+        // tensor_data_pread (used by the routed pass) reads via pread() on
+        // self._file directly, so it does not need the mmap alive.
+        hfq.drop_mmap();
+
+        // Routed experts: 256 × 3 = 768 tensors per layer ×
+        // 43 layers = ~33K total. Per-expert hipMalloc takes ~10ms
+        // (driver overhead) → 5+ min naive. Batch as ONE upload per
+        // (layer, projection): 129 uploads total. Skip unless
+        // HIPFIRE_V4F_UPLOAD_EXPERTS=1 (model is ~40 GB).
+        // Per-layer gate: skip uploads when partial-MoE budget excludes
+        // this layer (forward gracefully falls back to shared-only).
+        //
+        // Per-layer batched pread + single GPU upload. The pread bypasses
+        // mmap entirely (no longer alive after the drop above); each pread
+        // is followed by fadvise(DONTNEED) so the kernel reclaims file
+        // pages as soon as they're consumed. Host peak per layer ≈
+        // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
+        // well below the pressure threshold.
+        if upload_experts {
+            for (l, layer) in weights.layers.iter_mut().enumerate() {
+                let upload_this_layer = expert_layer_end.map_or(true, |end| l < end);
+                if !upload_this_layer {
+                    continue;
+                }
                 let n_exp = cfg.n_routed_experts;
 
-                // Per-layer batched pread + single GPU upload.
-                //
-                // The OLD `tensor_data()` mmap path triggered >1 GB/s
-                // sustained page-fault thrash on Strix Halo because the
-                // 13 GB+ accumulated host blob competed with the model's
-                // 78 GB of GPU allocations under unified memory.
-                //
-                // Per-expert streaming (one pread + one memcpy_htod per
-                // expert) bounded the host buffer but multiplied syscalls
-                // and tiny GPU transfers — 30k+ ops total, dominated by
-                // per-call overhead.
-                //
-                // This pattern: build ONE host Vec<u8> per (layer,
-                // projection), filling it via `tensor_data_pread` per
-                // expert (so file pages get fadvise(DONTNEED)'d after
-                // each read, no page-cache buildup), then ONE
-                // `upload_raw` per layer-projection. Host peak per
-                // layer ≈ stride_w1 × n_exp + stride_w2 × n_exp ≈
-                // 600 MB + 600 MB = 1.2 GB — bounded, well below the
-                // pressure threshold. Syscalls/uploads drop to 82 per
-                // model (2 per layer × 41 layers).
                 {
                     // w2 (down): pread each expert into a layer-local
                     // host Vec, then one upload.
@@ -590,17 +593,6 @@ impl Architecture for DeepseekV4 {
             }
         }
 
-        // Drop the HFQ mmap now that all weights are uploaded. On
-        // unified-memory APUs (gfx1151 / Strix Halo) the mmap and the
-        // "GPU" allocation share the same physical RAM, so keeping the
-        // mmap alive doubles memory pressure to ~160 GB on a 125 GB
-        // system → kernel evicts mmap pages → next access faults back
-        // in from disk → sustained 2.5 GB/s page-fault traffic for the
-        // life of the process. Matches the qwen35 path (commit 7f23bc
-        // landed the same fix there). After this call, tensor_data()
-        // panics; only tensor_data_pread() works (and we don't call it
-        // post-upload).
-        hfq.drop_mmap();
         Ok(weights)
     }
 
