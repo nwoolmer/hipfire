@@ -1895,6 +1895,63 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
     output
 }
 
+/// Inverse FWHT for MQ-family dequantization (sibling of cpu_fwht_256).
+fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 256);
+    for i in 0..256 { x[i] *= signs2[i]; }
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    let scale = 0.0625; // 1/sqrt(256) = 1/16
+    for i in 0..256 { x[i] *= scale * signs1[i]; }
+}
+
+/// MQ2-Lloyd dequantize for round-trip / re-quant pipelines. Mirrors
+/// the kernel's decode: 4-entry fp16 codebook + 2-bit indices per 256-
+/// weight group, then inverse FWHT.
+fn dequantize_mq2g256_lloyd_to_f32(
+    data: &[u8], n_weights: usize, signs1: &[f32], signs2: &[f32],
+) -> Vec<f32> {
+    let group_size = 256;
+    let block_bytes = 72;
+    let n_blocks = (n_weights + group_size - 1) / group_size;
+    assert!(data.len() == n_blocks * block_bytes);
+    let mut out = vec![0.0f32; n_weights];
+    use rayon::prelude::*;
+    out.par_chunks_mut(group_size).enumerate().for_each(|(b, out_chunk)| {
+        let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+        let cb: [f32; 4] = [
+            f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+            f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+            f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+        ];
+        let mut group = [0.0f32; 256];
+        for i in 0..64 {
+            let byte_val = blk[8 + i];
+            for j in 0..4 {
+                let idx = (byte_val >> (j * 2)) & 0x3;
+                group[4 * i + j] = cb[idx as usize];
+            }
+        }
+        cpu_inv_fwht_256(&mut group, signs1, signs2);
+        let actual = out_chunk.len();
+        out_chunk.copy_from_slice(&group[..actual]);
+    });
+    out
+}
+
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
