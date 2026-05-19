@@ -66,7 +66,7 @@ fn main() -> Result<(), String> {
     let max_batch: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let path = std::env::var("HIPFIRE_V4F_MODEL")
-        .unwrap_or_else(|_| "/home/nick/.hipfire/models/v4f.mq2lloyd-fp4fix".to_string());
+        .unwrap_or_else(|_| "/data/hipfire-models/v4f.mq2lloyd-f16compress.hfq".to_string());
     eprintln!("model: {path}");
     eprintln!("prompt_len: {prompt_len}, max_batch: {max_batch}");
     eprintln!("RSS guard: 115 GiB (process aborts if exceeded)");

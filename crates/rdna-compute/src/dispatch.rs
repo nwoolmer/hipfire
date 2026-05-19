@@ -19020,6 +19020,52 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n as u32, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.
+    /// Each block holds BATCH_TILE=8 accumulators in registers and
+    /// reuses each loaded weight element across them — amortizing
+    /// weight bandwidth, which is the prefill bottleneck on unified-
+    /// memory Strix Halo. Replaces the fake-batched `gemm_f32_batched`
+    /// for prefill (where weight reads dominate).
+    pub fn gemm_f32_register_tiled(
+        &mut self,
+        a: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_register_tiled",
+            kernels::GEMM_F32_REGISTER_TILED_SRC,
+            "gemm_f32_register_tiled",
+        )?;
+        let func = &self.functions["gemm_f32_register_tiled"];
+        let mut ap = a.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        const BATCH_TILE: u32 = 8;
+        let grid_y = (batch_size as u32 + BATCH_TILE - 1) / BATCH_TILE;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, grid_y, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
     pub fn gemm_f32_batched(
         &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,
@@ -20853,18 +20899,21 @@ impl Gpu {
 
     /// V4F indexer score — BATCHED. Per batch position b scores every
     /// compressed slot against `q[b, :, :]` using `weights[b, :]`. The
-    /// k_cache is shared across batch. Output is `scores[B, N]`.
-    /// Byte-identical to `indexer_relu_score_f32` at batch_size == 1.
+    /// k_cache is shared across batch. `n_per_batch[b]` gives the per-
+    /// batch causal cutoff; cache slots ≥ n_per_batch[b] are written
+    /// with -inf so top-K skips them (handles within-chunk commits
+    /// that batch row b shouldn't see).
     #[allow(clippy::too_many_arguments)]
     pub fn indexer_relu_score_batched_f32(
         &mut self,
         q: &GpuTensor,             // [B, H, D]
-        k_cache: &GpuTensor,       // [N, D] shared
+        k_cache: &GpuTensor,       // [N_max, D] shared
         weights: &GpuTensor,       // [B, H]
-        scores: &GpuTensor,        // [B, N] output
+        n_per_batch: &GpuTensor,   // [B] i32
+        scores: &GpuTensor,        // [B, N_max] output
         n_idx_heads: i32,          // H
         idx_head_dim: i32,         // D
-        n_compressed: i32,         // N
+        n_max: i32,                // N_max (cache slots considered)
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -20877,15 +20926,17 @@ impl Gpu {
         let qp = q.buf.as_ptr();
         let kp = k_cache.buf.as_ptr();
         let wp = weights.buf.as_ptr();
+        let np = n_per_batch.buf.as_ptr();
         let sp = scores.buf.as_ptr();
         let mut h  = n_idx_heads;
         let mut d  = idx_head_dim;
-        let mut nc = n_compressed;
+        let mut nc = n_max;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
             &mut d as *mut _ as *mut c_void,
@@ -20895,7 +20946,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [n_compressed as u32, batch_size as u32, 1],
+                [n_max as u32, batch_size as u32, 1],
                 [n_idx_heads as u32, 1, 1],
                 0,
                 self.stream_ref(),

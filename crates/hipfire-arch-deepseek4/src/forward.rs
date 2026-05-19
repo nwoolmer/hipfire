@@ -90,14 +90,20 @@ fn gemv_auto_batched(
     batch_size: usize,
 ) -> Result<(), String> {
     match weight.dtype {
-        DType::F32 => gpu.gemm_f32_batched(
-            x_plain_batch, weight, y,
-            batch_size, k, m,
-        ).map_err(|e| format!("gemm_f32_batched: {e:?}")),
+        // F32 (F16-source decoded at upload). Use register-tiled GEMM
+        // that amortizes weight loads across BATCH_TILE=8 positions.
+        // `gemm_f32_batched` (the fake-batched grid-y kernel) is left
+        // intact for non-prefill callers; we route prefill here.
+        DType::F32 => gpu.gemm_f32_register_tiled(
+            weight, x_plain_batch, y,
+            m, k, batch_size,
+        ).map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
+        // Q8 register-tiles MAX_BATCH=64 already.
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             weight, x_plain_batch, y,
             m, k, batch_size,
         ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}")),
+        // HFQ4G256 register-tiles BATCH_TILE=8 already.
         _ => gpu.gemm_hfq4g256(
             weight, x_rotated_batch, y,
             m, k, batch_size,
@@ -2240,6 +2246,11 @@ pub struct PrefillBatchScratch {
     pub moe_gate_batch: GpuTensor,         // [B, k_top, IM]
     pub moe_up_batch: GpuTensor,           // [B, k_top, IM]
     pub moe_rot_batch: GpuTensor,          // [B, k_top, IM]
+    // ── Indexer chain scratch (Step-1 perf pass) ──
+    pub idx_q_batch: GpuTensor,            // [B, idx_n_heads, idx_head_dim]
+    pub idx_w_batch: GpuTensor,            // [B, idx_n_heads]
+    pub idx_scores_batch: GpuTensor,       // [B, max_compressed]
+    pub idx_topk_indices_batch: GpuTensor, // [B, index_topk]  i32-in-F32
 }
 
 impl PrefillBatchScratch {
@@ -2333,6 +2344,11 @@ impl PrefillBatchScratch {
             moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch", r, log_vram)?,
             moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch", r, log_vram)?,
             moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch", r, log_vram)?,
+            // Indexer-chain scratch. max_compressed default 2048 unless overridden via env.
+            idx_q_batch: alloc(gpu, &[max_batch, cfg.index_n_heads, cfg.index_head_dim], "idx_q_batch", r, log_vram)?,
+            idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch", r, log_vram)?,
+            idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch", r, log_vram)?,
+            idx_topk_indices_batch: alloc(gpu, &[max_batch, cfg.index_topk], "idx_topk_indices_batch", r, log_vram)?,
         });
         if log_vram {
             eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
@@ -2638,13 +2654,13 @@ fn attention_block_batched_mixed(
         ).map_err(|e| format!("swa_visibility_stage_batched l{layer_idx}: {e:?}"))?;
     }
 
-    // 2. Per-batch sequential compressor + indexer + gather. We swap
-    //    state.* fields to point at per-row sub-views of the batched
-    //    scratch so the existing per-token functions work unchanged.
+    // 2a. Compressor commits (sequential per batch — stateful ring writes
+    //     and conditional pools to indexer/main_kv_cache). MUST run before
+    //     the batched indexer chain so n_filled[b] reflects all relevant
+    //     commits. We swap state.* fields to point at per-row sub-views.
     let n_valid_host: Vec<i32> = (0..batch_size)
         .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
         .collect();
-    let mut n_active_host: Vec<i32> = vec![0; batch_size];
 
     // Snapshot the per-token state fields so we can restore after the loop.
     let orig_tmp = state.tmp.take();
@@ -2658,15 +2674,11 @@ fn attention_block_batched_mixed(
 
     for b in 0..batch_size {
         let pos = start_pos + b as u32;
-        // Swap state to point at this batch row's slices.
         state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
         state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
         state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
         state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
 
-        // Main compressor (always for ratio > 0). Clone the tmp view
-        // to avoid borrowing state both immutably (tmp ref) and mutably
-        // (compressor_forward).
         let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
         if let Err(e) = compressor_forward(
             cfg, weights, state, gpu, layer_idx,
@@ -2675,8 +2687,6 @@ fn attention_block_batched_mixed(
             loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
             break;
         }
-        // Indexer compressor (ratio=4 only) + indexer_forward (scoring + top-K).
-        let mut k_active: usize = 0;
         if ratio == 4 {
             let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
             if let Err(e) = compressor_forward(
@@ -2686,58 +2696,133 @@ fn attention_block_batched_mixed(
                 loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
                 break;
             }
-            let n_compressed = match indexer_forward(cfg, weights, state, gpu, layer_idx, pos) {
-                Ok(n) => n,
-                Err(e) => {
-                    loop_err = Some(format!("indexer_forward b={b} l{layer_idx}: {e}"));
-                    break;
-                }
-            };
-            if n_compressed > 0 {
-                // Gather top-K K/V into pbs.topk_staged_batch[b].
-                let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
-                let k = topk_max.min(n_compressed);
-                let staged_row = pbs.topk_staged_batch.sub_offset(
-                    b * head_dim * topk_max, head_dim * topk_max);
-                if let Err(e) = gpu.v4f_topk_kv_gather_f32(
-                    main_kv_cache, topk_idx, &staged_row,
-                    k as i32, head_dim as i32, n_compressed as i32,
-                    topk_max as i32, 0, /*scale=*/1.0,
-                ) {
-                    loop_err = Some(format!("v4f_topk_kv_gather b={b} l{layer_idx}: {e:?}"));
-                    break;
-                }
-                k_active = k;
-            }
-        } else {
-            // ratio == 128: identity gather of all compressed entries.
-            let n_compressed = ((pos as usize + 1) / ratio).min(topk_max);
-            if n_compressed > 0 {
-                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
-                let staged_row = pbs.topk_staged_batch.sub_offset(
-                    b * head_dim * topk_max, head_dim * topk_max);
-                if let Err(e) = gpu.v4f_topk_kv_gather_identity_f32(
-                    main_kv_cache, &staged_row,
-                    n_compressed as i32, head_dim as i32, topk_max as i32,
-                ) {
-                    loop_err = Some(format!("v4f_topk_kv_gather_identity b={b} l{layer_idx}: {e:?}"));
-                    break;
-                }
-                k_active = n_compressed;
-            }
         }
-        n_active_host[b] = k_active as i32;
     }
 
-    // Restore per-token state fields. Do this BEFORE bubbling the error
-    // so the state isn't left with sub-views into pbs.
+    // Restore per-token state fields before any potential early-return.
     state.tmp = orig_tmp;
     state.tmp_plain = orig_tmp_plain;
     state.q_lat = orig_q_lat;
     state.q_lat_rot = orig_q_lat_rot;
     if let Some(e) = loop_err {
         return Err(e);
+    }
+
+    // 2b. Batched indexer chain (ratio == 4 only) OR batched identity gather
+    //     (ratio == 128). Replaces the per-batch indexer_forward + gather
+    //     loop with one batched call per stage.
+    let mut n_active_host: Vec<i32> = vec![0; batch_size];
+    if ratio == 4 {
+        let wq_b_idx = layer.indexer_wq_b.as_ref()
+            .ok_or_else(|| format!("idx wq_b l{layer_idx}"))?;
+        let weights_proj = layer.indexer_weights_proj.as_ref()
+            .ok_or_else(|| format!("idx weights_proj l{layer_idx}"))?;
+        let h_idx = cfg.index_n_heads;
+        let d_idx = cfg.index_head_dim;
+
+        // Per-batch n_filled = (start_pos+b+1)/ratio, clamped.
+        // n_max across batch = max value, used as kernel's per-batch cap.
+        let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let n_per_batch_host: Vec<i32> = (0..batch_size).map(|b| {
+            (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32
+        }).collect();
+        let n_max_chunk = *n_per_batch_host.iter().max().unwrap_or(&0) as usize;
+        if n_max_chunk == 0 {
+            // No commits yet — nothing to score/gather. n_active_topk stays 0.
+        } else {
+            // Upload n_per_batch via the existing n_active_topk_arr buffer
+            // (repurposed temporarily — we'll overwrite it below with the
+            // actual k_active values).
+            let np_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(n_per_batch_host.as_ptr() as *const u8, batch_size * 4)
+            };
+            gpu.hip.memcpy_htod(&pbs.n_active_topk_arr.buf, np_bytes)
+                .map_err(|e| format!("htod n_per_batch: {e:?}"))?;
+
+            // wq_b_idx GEMV batched: q_lat_rot_batch → q_idx_batch.
+            gemv_auto_batched(
+                gpu, wq_b_idx, &pbs.q_lat_rot_batch, &pbs.q_lat_batch,
+                &pbs.idx_q_batch, h_idx * d_idx, q_rank, batch_size,
+            )?;
+
+            // Tail RoPE on q_idx_batch with compress_rope_theta.
+            gpu.rope_tail_interleaved_batched(
+                &pbs.idx_q_batch, &pbs.idx_q_batch, &pbs.positions,
+                h_idx as i32, 0, d_idx as i32,
+                cfg.qk_rope_head_dim as i32, cfg.compress_rope_theta,
+                batch_size as i32,
+            ).map_err(|e| format!("rope_tail_batched idx l{layer_idx}: {e:?}"))?;
+
+            // weights_proj GEMV batched: tmp_batch → idx_w_batch.
+            gemv_auto_batched(
+                gpu, weights_proj, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                &pbs.idx_w_batch, h_idx, hidden, batch_size,
+            )?;
+
+            // Batched scoring. Pass the SCORE BUFFER STRIDE (max_compressed,
+            // = the allocated row stride of pbs.idx_scores_batch), not the
+            // chunk's n_max_chunk. The kernel writes scores[b * stride + n];
+            // slots with n >= n_per_batch[b] get -inf and slots with
+            // n >= n_max_chunk read uninit K_cache data but also get -inf
+            // (since n_per_batch[b] ≤ n_max_chunk ≤ n).
+            let kv_cache = state._indexer[layer_idx].indexer_kv_cache.as_ref()
+                .ok_or_else(|| "indexer_kv_cache missing".to_string())?;
+            gpu.indexer_relu_score_batched_f32(
+                &pbs.idx_q_batch, kv_cache, &pbs.idx_w_batch,
+                &pbs.n_active_topk_arr,  // reuse buffer: holds n_per_batch right now
+                &pbs.idx_scores_batch,
+                h_idx as i32, d_idx as i32, max_compressed as i32, batch_size as i32,
+            ).map_err(|e| format!("indexer_relu_score_batched l{layer_idx}: {e:?}"))?;
+
+            // Batched top-K. Pass k=topk_max (the storage stride of
+            // idx_topk_indices_batch); ranks > n_per_batch[b] of any
+            // batch row get -1 sentinels which the gather treats as
+            // zero. Score N is the storage stride of idx_scores_batch
+            // (= max_compressed = 2048).
+            gpu.indexer_top_k_batched(
+                &pbs.idx_scores_batch, &pbs.idx_topk_indices_batch,
+                /*n_idx_heads=*/1, max_compressed as i32, topk_max as i32, batch_size as i32,
+            ).map_err(|e| format!("indexer_top_k_batched l{layer_idx}: {e:?}"))?;
+
+            // Batched gather: top-K K/V → pbs.topk_staged_batch. Pass
+            // K=topk_max (storage stride); -1 indices write zeros.
+            let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref()
+                .ok_or_else(|| "main_kv_cache missing".to_string())?;
+            gpu.v4f_topk_kv_gather_batched_f32(
+                main_kv_cache, &pbs.idx_topk_indices_batch, &pbs.topk_staged_batch,
+                topk_max as i32, head_dim as i32, n_max_chunk as i32,
+                topk_max as i32, 0, /*scale=*/1.0, batch_size as i32,
+            ).map_err(|e| format!("v4f_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+
+            // n_active_topk[b] = min(topk_max, n_per_batch[b]) — top-K
+            // returned -1 sentinels past n_per_batch[b], and gather wrote
+            // zeros there. Cap attention's visible-slot count to the
+            // actual valid range per batch row.
+            for b in 0..batch_size {
+                n_active_host[b] = topk_max.min(n_per_batch_host[b] as usize) as i32;
+            }
+        }
+    } else {
+        // ratio == 128: identity gather, no indexer. Per-batch n_compressed.
+        let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let max_n_compressed = (((start_pos as usize) + batch_size) / ratio)
+            .min(max_compressed).min(topk_max);
+        if max_n_compressed > 0 {
+            let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref()
+                .ok_or_else(|| "main_kv_cache missing".to_string())?;
+            gpu.v4f_topk_kv_gather_identity_batched_f32(
+                main_kv_cache, &pbs.topk_staged_batch,
+                max_n_compressed as i32, head_dim as i32, topk_max as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("v4f_topk_kv_gather_identity_batched l{layer_idx}: {e:?}"))?;
+            for b in 0..batch_size {
+                let n_b = (((start_pos as usize) + b + 1) / ratio)
+                    .min(max_compressed).min(topk_max);
+                n_active_host[b] = n_b as i32;
+            }
+        }
     }
 
     // 3. Upload per-batch valid-counts.

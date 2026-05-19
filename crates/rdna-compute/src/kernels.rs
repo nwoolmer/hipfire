@@ -1702,6 +1702,13 @@ pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/v4f_moe_topk_bias_aware_batched.hip");
 
+/// Register-tiled F32 batched GEMM (Phase B2 perf, 2026-05-18).
+/// Each block holds BATCH_TILE=8 accumulators in registers and reuses
+/// each loaded weight tile across them — amortizes weight bandwidth.
+/// Replaces gemm_f32_batched for prefill paths.
+pub const GEMM_F32_REGISTER_TILED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

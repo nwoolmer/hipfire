@@ -20,19 +20,29 @@
 extern "C" __global__ __launch_bounds__(MAX_HEADS, 4)
 void indexer_relu_score_batched_f32(
     const float* __restrict__ q,         // [B, H, D]
-    const float* __restrict__ k_cache,   // [N, D] shared
+    const float* __restrict__ k_cache,   // [N_max, D] shared
     const float* __restrict__ weights,   // [B, H]
-    float*       __restrict__ scores,    // [B, N]
+    const int*   __restrict__ n_per_batch, // [B] per-batch valid prefix
+    float*       __restrict__ scores,    // [B, N_max]
     int H,
     int D,
-    int N,
+    int N_max,
     int batch_size
 ) {
     const int n = blockIdx.x;
     const int b = blockIdx.y;
-    if (n >= N || b >= batch_size) return;
+    if (n >= N_max || b >= batch_size) return;
     const int tid = threadIdx.x;
     if (tid >= H) return;
+
+    // Per-batch causal cutoff: cache slots ≥ n_per_batch[b] are commits
+    // made by LATER batch positions within this chunk and must not be
+    // visible to batch row b. Write -inf so top-K skips them.
+    const int n_valid_b = n_per_batch[b];
+    if (n >= n_valid_b) {
+        if (tid == 0) scores[(size_t)b * N_max + n] = -1e30f;
+        return;
+    }
 
     const float* qh = q + ((size_t)b * H + tid) * D;
     const float* kt = k_cache + (size_t)n * D;
@@ -49,5 +59,5 @@ void indexer_relu_score_batched_f32(
         if (tid < s) reduce[tid] += reduce[tid + s];
         __syncthreads();
     }
-    if (tid == 0) scores[(size_t)b * N + n] = reduce[0];
+    if (tid == 0) scores[(size_t)b * N_max + n] = reduce[0];
 }
