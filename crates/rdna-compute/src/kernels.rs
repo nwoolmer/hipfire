@@ -1670,6 +1670,12 @@ pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
 pub const ROPE_TAIL_INVERSE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_inverse_batched.hip");
 
+/// V4F top-K K/V gather — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// top-K gather from the shared main compressed-K cache into a
+/// `[B, head_dim, out_stride]` buffer fed to v4f_attn_swa_topk_batched.
+pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

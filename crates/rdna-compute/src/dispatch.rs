@@ -20650,6 +20650,66 @@ impl Gpu {
         }
     }
 
+    /// V4F top-K K/V gather — BATCHED. Per batch position b uses its
+    /// own top-K index list `topk_idx[b, :]` (typically produced by
+    /// `indexer_top_k_batched`) and writes into its own slice of the
+    /// staged output `[B, head_dim, out_stride]`. Sentinel indices < 0
+    /// or ≥ n_compressed write zeros.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_topk_kv_gather_batched_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
+        topk_idx: &GpuTensor,    // [B, K] i32
+        out: &GpuTensor,         // [B, head_dim, out_stride]
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_batched",
+            kernels::V4F_TOPK_KV_GATHER_BATCHED_SRC,
+            "v4f_topk_kv_gather_batched_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_batched_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Inverse tail RoPE — BATCHED. Per batch row b reads positions[b]
     /// and applies the inverse rotation (negated sin) to the last n_rot
     /// dims of each head. Byte-identical to `rope_tail_inverse` at
