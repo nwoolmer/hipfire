@@ -6223,6 +6223,225 @@ mod gptq_damping_probe {
         out
     }
 
+    /// Quantize W (natural basis) with imatrix-weighted Lloyd, no FWHT.
+    /// Returns (codebook, indices) — both in natural basis.
+    fn lloyd_imatrix_no_fwht(
+        weights: &[f32], col_weights: &[f32],
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let group_size = 256;
+        let block_bytes = 72;
+        let n = weights.len();
+        let n_blocks = (n + group_size - 1) / group_size;
+        let mut output = vec![0u8; n_blocks * block_bytes];
+        let blocks_per_row = col_weights.len() / group_size;
+        output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&weights[start..end]);
+            // Use natural distribution; NO FWHT.
+            let col_off = (b % blocks_per_row) * group_size;
+            let block_w: &[f32] = &col_weights[col_off..col_off + group_size];
+
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125), percentile(0.375),
+                percentile(0.625), percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 16;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut wsums = [0.0f64; 4];
+                    let mut wtotals = [0.0f64; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        let pw = block_w[i] as f64;
+                        wsums[best] += pw * w as f64;
+                        wtotals[best] += pw;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if wtotals[k] > 0.0 {
+                            cb[k] = (wsums[k] / wtotals[k]) as f32;
+                        }
+                    }
+                }
+            }
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            let mut inv: [u8; 4] = [0; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+        output
+    }
+
+    fn dequant_no_fwht_natural(data: &[u8], n_weights: usize) -> Vec<f32> {
+        let group_size = 256;
+        let block_bytes = 72;
+        let n_blocks = (n_weights + group_size - 1) / group_size;
+        let mut out = vec![0.0f32; n_weights];
+        for b in 0..n_blocks {
+            let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+            let cb: [f32; 4] = [
+                f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+                f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+                f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+                f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+            ];
+            for i in 0..64 {
+                let bv = blk[8 + i];
+                for j in 0..4 {
+                    let gi = b * 256 + 4 * i + j;
+                    if gi < n_weights {
+                        let idx = (bv >> (j * 2)) & 0x3;
+                        out[gi] = cb[idx as usize];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn gemv_f32(w: &[f32], x: &[f32], m: usize, k: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; m];
+        for r in 0..m {
+            let mut acc = 0.0f64;
+            for j in 0..k {
+                acc += w[r * k + j] as f64 * x[j] as f64;
+            }
+            y[r] = acc as f32;
+        }
+        y
+    }
+
+    #[test]
+    fn prefwht_imatrix_lloyd_value() {
+        // Activation-weighted A/B test of post-FWHT vs pre-FWHT imatrix-Lloyd.
+        // Generate W [m=256, k=4096] with HETEROGENEOUS column variances —
+        // some columns have stddev=3, others stddev=0.1. Imatrix captures the
+        // ground-truth importance. Run a gemv with this W against a random
+        // unit-Gaussian X, then compare gemv-error for the two quant methods.
+        //
+        // If pre-FWHT-imatrix-Lloyd reduces gemv error meaningfully on
+        // activations vs post-FWHT, that's the green light for the
+        // pre-FWHT-Lloyd refactor (Action 5 in playbook).
+        let m = 256;
+        let k = 4096;
+        let n = m * k;
+
+        // Build heterogeneous-column W: column j has scale = log-uniform in
+        // [0.1, 3.0] — gives 30x spread, mimics real LLM channel importance.
+        let mut w = gaussian_samples(n, 0xc011c011);
+        let mut col_scales = vec![0.0f32; k];
+        let mut state: u64 = 0xc0ffeeed;
+        for j in 0..k {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let u = ((state >> 11) & ((1u64 << 53) - 1)) as f64 / (1u64 << 53) as f64;
+            // log-uniform in [0.1, 3.0]
+            col_scales[j] = (0.1_f64.ln() + u * (3.0_f64.ln() - 0.1_f64.ln())).exp() as f32;
+        }
+        for r in 0..m {
+            for j in 0..k {
+                w[r * k + j] *= col_scales[j];
+            }
+        }
+        // Imatrix: per-column 2-norm of W (mimics what a real activation
+        // imatrix produces — bigger for important channels). Geomean-normalize.
+        let mut imatrix = vec![0.0f32; k];
+        for j in 0..k {
+            let mut sum2 = 0.0f64;
+            for r in 0..m {
+                sum2 += (w[r * k + j] as f64).powi(2);
+            }
+            imatrix[j] = sum2.sqrt() as f32;
+        }
+        let mut sum_log = 0.0f64;
+        for &v in &imatrix { sum_log += (v.max(1e-12) as f64).ln(); }
+        let mean_log = sum_log / k as f64;
+        for v in imatrix.iter_mut() {
+            *v = ((*v as f64).ln() - mean_log).exp() as f32;
+        }
+
+        // Random unit-Gaussian X for activations.
+        let x = gaussian_samples(k, 0xacd1ac);
+        let y_ref = gemv_f32(&w, &x, m, k);
+
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // METHOD A: post-FWHT imatrix-Lloyd (production).
+        let bytes_a = quantize_mq2g256_lloyd_weighted(&w, &imatrix, &signs1, &signs2);
+        let recon_a = dequantize_mq2g256_lloyd_to_f32(&bytes_a, n, &signs1, &signs2);
+        let y_a = gemv_f32(&recon_a, &x, m, k);
+        let err_a: f64 = y_ref.iter().zip(y_a.iter())
+            .map(|(r, q)| (*r as f64 - *q as f64).powi(2))
+            .sum::<f64>() / m as f64;
+
+        // METHOD B: pre-FWHT imatrix-Lloyd (proposed refactor).
+        let bytes_b = lloyd_imatrix_no_fwht(&w, &imatrix);
+        let recon_b = dequant_no_fwht_natural(&bytes_b, n);
+        let y_b = gemv_f32(&recon_b, &x, m, k);
+        let err_b: f64 = y_ref.iter().zip(y_b.iter())
+            .map(|(r, q)| (*r as f64 - *q as f64).powi(2))
+            .sum::<f64>() / m as f64;
+
+        // METHOD C: post-FWHT uniform Lloyd (current production w/o imatrix).
+        let bytes_c = quantize_mq2g256_lloyd(&w, &signs1, &signs2);
+        let recon_c = dequantize_mq2g256_lloyd_to_f32(&bytes_c, n, &signs1, &signs2);
+        let y_c = gemv_f32(&recon_c, &x, m, k);
+        let err_c: f64 = y_ref.iter().zip(y_c.iter())
+            .map(|(r, q)| (*r as f64 - *q as f64).powi(2))
+            .sum::<f64>() / m as f64;
+
+        eprintln!("\n=== Pre-FWHT vs post-FWHT imatrix-Lloyd (activation-weighted) ===");
+        eprintln!("  W shape [{m}, {k}], heterogeneous column variances (0.1-3.0x)");
+        eprintln!("  Method A: post-FWHT imatrix-Lloyd (current prod)   gemv MSE = {err_a:.6e}");
+        eprintln!("  Method B: pre-FWHT  imatrix-Lloyd (proposed)       gemv MSE = {err_b:.6e}");
+        eprintln!("  Method C: post-FWHT uniform Lloyd (no imatrix)     gemv MSE = {err_c:.6e}");
+        eprintln!();
+        let ab = ((err_b - err_a) / err_a) * 100.0;
+        let ac = ((err_a - err_c) / err_c) * 100.0;
+        let bc = ((err_b - err_c) / err_c) * 100.0;
+        eprintln!("  Δ A→B (pre-FWHT win):              {ab:+.2}%");
+        eprintln!("  Δ C→A (current imatrix vs uniform):{ac:+.2}%");
+        eprintln!("  Δ C→B (pre-FWHT vs uniform):       {bc:+.2}%");
+    }
+
     #[test]
     fn fwht_value_audit() {
         // Hypothesis: FWHT-rotation makes Lloyd more accurate because the
@@ -6396,6 +6615,42 @@ mod hfq_block_diag {
         shape: Vec<u32>,
         data_offset: usize,
         data_size: usize,
+    }
+
+    fn parse_hfq_metadata(path: &Path) -> std::io::Result<String> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        assert_eq!(&mmap[0..4], b"HFQM");
+        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut json_end = 0usize;
+        for (i, &b) in mmap[metadata_offset..data_offset].iter().enumerate() {
+            if esc { esc = false; continue; }
+            if in_str { if b == b'\\' { esc = true; continue; } if b == b'"' { in_str = false; } continue; }
+            if b == b'"' { in_str = true; continue; }
+            if b == b'{' { depth += 1; }
+            if b == b'}' { depth -= 1; if depth == 0 { json_end = i + 1; break; } }
+        }
+        Ok(String::from_utf8_lossy(&mmap[metadata_offset..metadata_offset + json_end]).to_string())
+    }
+
+    #[test]
+    #[ignore]
+    fn hfq_dump_metadata() {
+        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
+            .unwrap_or_else(|_| "/data/hipfire-models/v4f.mq2lloyd-f16compress.hfq".to_string());
+        let path = Path::new(&path_str);
+        let json = parse_hfq_metadata(path).expect("parse");
+        // Print just keys at top level + any "source" / "path" / "input" hints.
+        eprintln!("=== Metadata from {path:?} (top 2000 chars) ===");
+        let truncated: String = json.chars().take(2000).collect();
+        eprintln!("{}", truncated);
+        if json.len() > 2000 {
+            eprintln!("... ({} chars total)", json.len());
+        }
     }
 
     fn parse_hfq(path: &Path) -> std::io::Result<(Mmap, Vec<TensorInfo>)> {
