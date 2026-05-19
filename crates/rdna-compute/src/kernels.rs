@@ -1681,3 +1681,10 @@ pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
 /// path. Same launch shape and byte-equality contract at batch=1.
 pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa_batched.hip");
+
+/// V4F batched indexer top-K (Phase A3, 2026-05-18). Per (batch, head)
+/// pair selects the top-K position indices from a score array. Grid
+/// extends to `[n_idx_heads, batch, 1]`. Byte-identical to the
+/// sequential indexer_top_k at batch=1.
+pub const INDEXER_TOP_K_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_batched.hip");

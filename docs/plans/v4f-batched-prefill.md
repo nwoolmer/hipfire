@@ -84,9 +84,10 @@ The hard part. Once these are working, the rest is mechanical.
   - Identical launch shape to A1 minus the topk branch
   - Test: `test_v4f_attn_swa_batched` — byte-equality at B=1/4/32 ✓
 
-* **A3: `indexer_top_k_batched.hip`** (~1 day)
+* **A3: `indexer_top_k_batched.hip`** ✅ **DONE 2026-05-18**
   - Per-batch-position top-K selection over compressed rows
-  - Parallel argmax-with-mask iteration (similar to sequential top-K)
+  - Grid `[n_idx_heads, batch, 1]`; reuses the existing single-thread-per-head stub strategy
+  - Test: `test_indexer_top_k_batched` — 0 mismatches at B=1/4/32 ✓
 
 * **A4: `compressor_commit_batched.hip`** (~1 day)
   - Conditional row-write to compressed cache based on `(pos % ratio == ratio - 1)`

@@ -20983,6 +20983,54 @@ impl Gpu {
         }
     }
 
+    /// Phase A3 — Batched per-head top-K selection. Processes `batch_size`
+    /// independent (batch_row, head) pairs in one launch. Each (b, h)
+    /// block reads from `scores[b * H * N + h * N + ..]` and writes to
+    /// `top_indices[b * H * K + h * K + ..]`. Byte-identical to
+    /// `indexer_top_k` at batch_size == 1.
+    pub fn indexer_top_k_batched(
+        &mut self,
+        scores: &GpuTensor,         // [B, H, N] fp32
+        top_indices: &GpuTensor,    // [B, H, K] i32
+        n_idx_heads: i32,
+        n_compressed: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_top_k_batched",
+            kernels::INDEXER_TOP_K_BATCHED_SRC,
+            "indexer_top_k_batched",
+        )?;
+        let func = &self.functions["indexer_top_k_batched"];
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut nc = n_compressed;
+        let mut kk = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let smem = n_compressed as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, batch_size as u32, 1],
+                [1, 1, 1],
+                smem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 2 — Gather raw K/V rows from main cache at indexer indices.
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn indexer_kv_gather(
