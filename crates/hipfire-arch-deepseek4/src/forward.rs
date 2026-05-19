@@ -3180,11 +3180,23 @@ fn ffn_batched(
     }
 
     // 11. Routed expert gate_up (MQ2-Lloyd indexed, position-batched).
-    gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched(
-        gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
-        &pbs.moe_gate_batch, &pbs.moe_up_batch,
-        2 * im, hidden, k_top, batch_size,
-    ).map_err(|e| format!("v4f_gemv_gate_up_batched l{layer_idx}: {e:?}"))?;
+    // K4-unrolled variant (4 independent accumulators per thread for ILP).
+    // Opt out via HIPFIRE_V4F_GATEUP_K4=0 (default: on).
+    let gate_up_k4 = std::env::var("HIPFIRE_V4F_GATEUP_K4")
+        .map(|s| s != "0").unwrap_or(true);
+    if gate_up_k4 {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
+            &pbs.moe_gate_batch, &pbs.moe_up_batch,
+            2 * im, hidden, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_gate_up_batched_k4 l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched(
+            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
+            &pbs.moe_gate_batch, &pbs.moe_up_batch,
+            2 * im, hidden, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_gate_up_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 12. SwiGLU + clamp over B * k_top streams of length IM.
     gpu.v4f_silu_mul_clamp_f32_batched(
@@ -3198,11 +3210,23 @@ fn ffn_batched(
     ).map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
 
     // 14. Routed expert down with scaled atomicAdd into ffn_out_batch.
-    gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched(
-        w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
-        &pbs.moe_rot_batch, &pbs.ffn_out_batch,
-        hidden, im, k_top, batch_size,
-    ).map_err(|e| format!("v4f_gemv_down_batched l{layer_idx}: {e:?}"))?;
+    // K4-unrolled variant (4 independent accumulators per thread for ILP).
+    // Opt out via HIPFIRE_V4F_DOWN_K4=0 (default: on).
+    let down_k4 = std::env::var("HIPFIRE_V4F_DOWN_K4")
+        .map(|s| s != "0").unwrap_or(true);
+    if down_k4 {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
+            hidden, im, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched(
+            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
+            hidden, im, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_down_batched l{layer_idx}: {e:?}"))?;
+    }
 
     Ok(())
 }

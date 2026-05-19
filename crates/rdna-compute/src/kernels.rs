@@ -1709,6 +1709,22 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F32_REGISTER_TILED_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
 
+/// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
+/// 4 independent accumulators per thread for ILP; mirrors qwen35's
+/// HFQ4 K4 unroll. Drop-in replacement for
+/// gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched with FMA-order
+/// epsilon drift.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip");
+
+/// V4F MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with K4-unrolled
+/// accumulator and scaled residual atomicAdd. Sibling of qwen35's HFQ4 K4
+/// unroll. Drop-in replacement for
+/// gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched with
+/// FMA-order epsilon drift.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
