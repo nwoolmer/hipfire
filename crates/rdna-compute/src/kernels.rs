@@ -1764,6 +1764,11 @@ pub const CONVERT_F32_TO_F16_SRC: &str =
 pub const GEMM_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
 
+/// WMMA per-group HFQ4G256 batched GEMV for V4F's wo_a block-diagonal
+/// projection. F16 input. Drop-in for `wo_per_group_batched_hfq4g256`.
+pub const WO_PER_GROUP_BATCHED_HFQ4G256_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256_wmma.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for

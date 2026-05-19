@@ -2572,8 +2572,17 @@ impl PrefillBatchScratch {
                 t
             },
             wmma_x_scratch_f16: {
+                // Cover the largest x-tensor size across all batched
+                // WMMA call sites. wo_a's input is [B, G, per_group_in]
+                // where per_group_in = (n_heads/n_groups) * head_dim —
+                // can exceed `hidden` for V4F (G=8, per_group_in=4096
+                // ⇒ G*per_group_in = 32768).
+                let per_group_in = (n_heads / cfg.o_groups) * head_dim;
                 let max_dim = cfg.o_groups * cfg.o_lora_rank;
-                let max_dim = max_dim.max(hidden).max(cfg.q_lora_rank);
+                let max_dim = max_dim
+                    .max(hidden)
+                    .max(cfg.q_lora_rank)
+                    .max(cfg.o_groups * per_group_in);
                 let nbytes = max_batch * max_dim * 2;
                 *r += nbytes as u64;
                 if log_vram {
@@ -2766,11 +2775,30 @@ fn attention_block_batched_swa_only(
         }
         DType::Raw if wo_a_batched => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
-            gpu.wo_per_group_batched_hfq4g256(
-                wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
-                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
-                batch_size as i32,
-            ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
+            // WMMA route was measured slightly SLOWER (44.7 vs 45.6 tok/s
+            // on Radeon 8060S) because the 16×16 WMMA tile shrinks the
+            // workgroup count to (M/16, B/16, G) = ~2k workgroups, well
+            // under the wave-saturation budget that the scalar per-output
+            // grid hits. Keep WMMA wired as opt-in for other arches.
+            let wo_a_wmma = std::env::var("HIPFIRE_V4F_WO_A_WMMA")
+                .map(|s| s == "1").unwrap_or(false);
+            if wo_a_wmma {
+                let n_inputs = (batch_size * n_groups * per_group_in) as i64;
+                gpu.convert_f32_to_f16(
+                    &pbs.attn_out_raw_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs,
+                ).map_err(|e| format!("convert_f32_to_f16 wo_a l{layer_idx}: {e:?}"))?;
+                gpu.wo_per_group_batched_hfq4g256_wmma(
+                    wo_a, &pbs.wmma_x_scratch_f16, &pbs.wo_a_out_batch,
+                    n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                    batch_size as i32,
+                ).map_err(|e| format!("wo_per_group_batched_hfq4g256_wmma l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.wo_per_group_batched_hfq4g256(
+                    wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
+                    n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                    batch_size as i32,
+                ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
+            }
         }
         _ => {
             // Per-(batch, group) sequential fallback for Q8 and the
