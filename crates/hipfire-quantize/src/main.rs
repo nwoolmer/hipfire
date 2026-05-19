@@ -5518,6 +5518,458 @@ mod gptq_damping_probe {
         std::env::remove_var("HIPFIRE_GPTQ_DAMPING");
     }
 
+    /// Variant of plain Lloyd with tunable iteration count. Used to test
+    /// whether the production 8-iter cap is leaving headroom.
+    fn quantize_mq2g256_lloyd_niter(
+        f32_data: &[f32], signs1: &[f32], signs2: &[f32], max_iter: usize,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let group_size = 256;
+        let block_bytes = 72;
+        let n = f32_data.len();
+        let n_blocks = (n + group_size - 1) / group_size;
+        let mut output = vec![0u8; n_blocks * block_bytes];
+        output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125), percentile(0.375),
+                percentile(0.625), percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 4];
+                    let mut counts = [0u32; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            }
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            let mut inv: [u8; 4] = [0; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+        output
+    }
+
+    fn run_lloyd_iter_sweep(label: &str, weights: &[f32]) {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let n = weights.len();
+        eprintln!("\n=== {label} (n={n}) — Lloyd iteration sweep ===");
+        let mut prev = f64::NAN;
+        for niter in [1usize, 2, 4, 8, 16, 32, 64] {
+            let bytes = quantize_mq2g256_lloyd_niter(weights, &signs1, &signs2, niter);
+            let recon = dequantize_mq2g256_lloyd_to_f32(&bytes, n, &signs1, &signs2);
+            let m = mse(weights, &recon);
+            let delta = if prev.is_finite() {
+                format!("  ({:+.3}% vs niter=prev)", ((m - prev) / prev) * 100.0)
+            } else { String::new() };
+            eprintln!("  Lloyd niter={niter:>3}        MSE = {m:.6e}{delta}");
+            prev = m;
+        }
+    }
+
+    /// Huber-Lloyd: same Lloyd loop but the centroid update is the
+    /// weighted-mean of points with |w - cb| ≤ k_huber * sigma, where
+    /// sigma is the within-cluster standard deviation. Points with
+    /// larger residuals get clipped (treated as `cb ± k_huber * sigma`)
+    /// so they don't drag centroids toward outlier values. With FWHT-
+    /// rotated weights the long tails are dampened but not eliminated;
+    /// this tests whether residual heavy-tailedness is hurting MSE.
+    fn quantize_mq2g256_huber_lloyd(
+        f32_data: &[f32], signs1: &[f32], signs2: &[f32], k_huber: f32,
+        max_iter: usize,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let group_size = 256;
+        let block_bytes = 72;
+        let n = f32_data.len();
+        let n_blocks = (n + group_size - 1) / group_size;
+        let mut output = vec![0u8; n_blocks * block_bytes];
+        output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125), percentile(0.375),
+                percentile(0.625), percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    // Assignment pass — same as plain Lloyd.
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                    }
+                    // Within-cluster sigma estimate (one pass).
+                    let mut sums = [0.0f64; 4];
+                    let mut sqs  = [0.0f64; 4];
+                    let mut cnts = [0u32; 4];
+                    for i in 0..256 {
+                        let k = indices[i] as usize;
+                        let d = (group[i] - cb[k]) as f64;
+                        sums[k] += group[i] as f64;
+                        sqs[k]  += d * d;
+                        cnts[k] += 1;
+                    }
+                    let mut sigma = [0.0f64; 4];
+                    for k in 0..4 {
+                        if cnts[k] > 0 {
+                            sigma[k] = (sqs[k] / cnts[k] as f64).sqrt();
+                        }
+                    }
+                    // Huber-clipped update.
+                    let mut wsums = [0.0f64; 4];
+                    let mut wcnts = [0.0f64; 4];
+                    for i in 0..256 {
+                        let k = indices[i] as usize;
+                        let lim = (k_huber as f64) * sigma[k].max(1e-9);
+                        let resid = (group[i] - cb[k]) as f64;
+                        let clipped = resid.max(-lim).min(lim);
+                        let effective_w = cb[k] as f64 + clipped;
+                        wsums[k] += effective_w;
+                        wcnts[k] += 1.0;
+                    }
+                    let mut changed = 0u32;
+                    for k in 0..4 {
+                        if wcnts[k] > 0.0 {
+                            let new_cb = (wsums[k] / wcnts[k]) as f32;
+                            if new_cb != cb[k] { changed += 1; }
+                            cb[k] = new_cb;
+                        }
+                    }
+                    // Suppress unused warnings on sums.
+                    let _ = sums;
+                    if it > 0 && changed == 0 { break; }
+                }
+                // Final argmin pass to lock indices to the final centroids.
+                for i in 0..256 {
+                    let w = group[i];
+                    let mut best = 0usize;
+                    let mut best_d = (w - cb[0]).abs();
+                    for k in 1..4 {
+                        let d = (w - cb[k]).abs();
+                        if d < best_d { best_d = d; best = k; }
+                    }
+                    indices[i] = best as u8;
+                }
+            }
+            // Sort centroids, remap, pack.
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            let mut inv: [u8; 4] = [0; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+        output
+    }
+
+    fn run_huber_sweep(label: &str, weights: &[f32]) {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let n = weights.len();
+        eprintln!("\n=== {label} (n={n}) — Huber-Lloyd sweep (16 iter) ===");
+        // Reference: plain Lloyd at 16 iter.
+        let ref_bytes = quantize_mq2g256_lloyd_niter(weights, &signs1, &signs2, 16);
+        let ref_recon = dequantize_mq2g256_lloyd_to_f32(&ref_bytes, n, &signs1, &signs2);
+        let ref_mse = mse(weights, &ref_recon);
+        eprintln!("  Lloyd (niter=16)          MSE = {ref_mse:.6e}");
+        for k_huber in [1.0_f32, 1.5, 2.0, 2.5, 3.0, 10.0] {
+            let bytes = quantize_mq2g256_huber_lloyd(weights, &signs1, &signs2, k_huber, 16);
+            let recon = dequantize_mq2g256_lloyd_to_f32(&bytes, n, &signs1, &signs2);
+            let m = mse(weights, &recon);
+            let delta = ((m - ref_mse) / ref_mse) * 100.0;
+            eprintln!("  Huber k={k_huber:>4.1} (niter=16)   MSE = {m:.6e}  ({delta:+.2}% vs Lloyd16)");
+        }
+    }
+
+    /// GPTQ sequential pass on already-FWHT'd weights, no inner FWHT.
+    /// Used to A/B test the FWHT-position hypothesis: production GPTQ
+    /// FWHTs then propagates → noise injection. Pre-FWHT GPTQ
+    /// (correlated input) should help when input weights have
+    /// channel correlation.
+    fn quantize_mq2g256_lloyd_gptq_no_fwht(
+        f32_data: &[f32], damping: f32, max_iter: usize,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+        let group_size = 256;
+        let block_bytes = 72;
+        let n = f32_data.len();
+        let n_blocks = (n + group_size - 1) / group_size;
+        let mut output = vec![0u8; n_blocks * block_bytes];
+        output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            // NO FWHT here — operate on raw correlated weights.
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125), percentile(0.375),
+                percentile(0.625), percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            if range > 0.0 {
+                let mut prev = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 4];
+                    let mut counts = [0u32; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev[i] != best as u8 { changed += 1; }
+                        prev[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            }
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+            }
+            let cb_final = sorted_cb;
+            // Sequential GPTQ with no inner FWHT.
+            let mut indices = [0u8; 256];
+            let mut residual = 0.0f32;
+            for i in 0..256 {
+                let target = group[i] + residual;
+                let mut best = 0usize;
+                let mut best_d = (target - cb_final[0]).abs();
+                for k in 1..4 {
+                    let d = (target - cb_final[k]).abs();
+                    if d < best_d { best_d = d; best = k; }
+                }
+                indices[i] = best as u8;
+                let err = target - cb_final[best];
+                residual = err * damping;
+            }
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(cb_final[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+        output
+    }
+
+    /// Dequant the no-FWHT variant: indices + codebook, no inv-FWHT step.
+    fn dequant_no_fwht(data: &[u8], n_weights: usize) -> Vec<f32> {
+        let group_size = 256;
+        let block_bytes = 72;
+        let n_blocks = (n_weights + group_size - 1) / group_size;
+        let mut out = vec![0.0f32; n_weights];
+        for b in 0..n_blocks {
+            let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+            let cb: [f32; 4] = [
+                f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+                f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+                f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+                f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+            ];
+            for i in 0..64 {
+                let bv = blk[8 + i];
+                for j in 0..4 {
+                    let global_i = b * 256 + 4 * i + j;
+                    if global_i < n_weights {
+                        let idx = (bv >> (j * 2)) & 0x3;
+                        out[global_i] = cb[idx as usize];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn correlated_weights(n: usize, seed: u64, decay: f32) -> Vec<f32> {
+        // AR(1) process: x_t = decay * x_{t-1} + sqrt(1 - decay^2) * z_t.
+        // Produces channel-correlated weights (decay > 0).
+        let gauss = gaussian_samples(n, seed);
+        let mut out = Vec::with_capacity(n);
+        let mut prev = 0.0f32;
+        let noise_scale = (1.0f32 - decay * decay).sqrt();
+        for &g in &gauss {
+            let v = decay * prev + noise_scale * g;
+            out.push(v);
+            prev = v;
+        }
+        out
+    }
+
+    #[test]
+    fn gptq_on_correlated_pre_fwht() {
+        // The whole point of GPTQ is to exploit channel correlation.
+        // Test it on correlated (decay=0.7), modestly-correlated (0.4),
+        // and uncorrelated (0.0) inputs WITHOUT the inner FWHT step.
+        //
+        // If d>0 wins on correlated inputs but loses on uncorrelated,
+        // that confirms: the production code's mistake is FWHT-then-GPTQ.
+        // Fix path: drop the FWHT before the sequential pass (move it
+        // into dequant or change the runtime kernel to apply it on
+        // dequant'd values).
+        eprintln!("\n=== GPTQ on correlated weights (no inner FWHT) ===");
+        for (label, decay) in [("decay=0.0 (uncorrelated)", 0.0f32),
+                               ("decay=0.4 (moderately correlated)", 0.4),
+                               ("decay=0.7 (strongly correlated)", 0.7),
+                               ("decay=0.9 (very correlated)", 0.9)] {
+            let n = 16 * 256;
+            let w = correlated_weights(n, 0xc011a7ed, decay);
+            // Reference: plain Lloyd via no-FWHT path with d=0.
+            let ref_bytes = quantize_mq2g256_lloyd_gptq_no_fwht(&w, 0.0, 16);
+            let ref_recon = dequant_no_fwht(&ref_bytes, n);
+            let ref_mse = mse(&w, &ref_recon);
+            eprintln!("\n  {label} (n={n})");
+            eprintln!("    Lloyd                  MSE = {ref_mse:.6e}");
+            for damping in [0.05f32, 0.1, 0.2, 0.3, 0.5, 0.8] {
+                let b = quantize_mq2g256_lloyd_gptq_no_fwht(&w, damping, 16);
+                let r = dequant_no_fwht(&b, n);
+                let m = mse(&w, &r);
+                let delta = ((m - ref_mse) / ref_mse) * 100.0;
+                eprintln!("    GPTQ d={damping:>4.2} (no-fwht)   MSE = {m:.6e}  ({delta:+.2}% vs Lloyd)");
+            }
+        }
+    }
+
+    #[test]
+    fn huber_lloyd_headroom() {
+        let mut htw = gaussian_samples(16 * 256, 0xfeed);
+        let tail = gaussian_samples((16 * 256) / 20, 0xbeef);
+        for (i, t) in tail.iter().enumerate() {
+            htw[i * 20] = t * 3.0;
+        }
+        run_huber_sweep("Heavy-tailed 16x256", &htw);
+        let mut sw = gaussian_samples(16 * 256, 0x5_a55e);
+        for v in sw.iter_mut() { *v *= 0.1; }
+        for i in 0..(16 * 256 / 20) { sw[i * 20] *= 30.0; }
+        run_huber_sweep("Sparse + outliers 16x256", &sw);
+        run_huber_sweep("Gaussian 16x256", &gaussian_samples(16 * 256, 0xc001cafe));
+    }
+
+    #[test]
+    fn lloyd_iteration_headroom() {
+        // The production 8-iter cap may or may not converge on heavy-tailed
+        // distributions. Sweep niter ∈ {1, 2, 4, 8, 16, 32, 64} to find the
+        // convergence floor — if 32 or 64 iter gives meaningfully lower
+        // MSE than 8, that's free headroom (offline quant cost only).
+        run_lloyd_iter_sweep("Gaussian 16x256", &gaussian_samples(16 * 256, 0xc001cafe));
+        let mut htw = gaussian_samples(16 * 256, 0xfeed);
+        let tail = gaussian_samples((16 * 256) / 20, 0xbeef);
+        for (i, t) in tail.iter().enumerate() {
+            htw[i * 20] = t * 3.0;
+        }
+        run_lloyd_iter_sweep("Heavy-tailed 16x256", &htw);
+        let mut sw = gaussian_samples(16 * 256, 0x5_a55e);
+        for v in sw.iter_mut() { *v *= 0.1; }
+        for i in 0..(16 * 256 / 20) { sw[i * 20] *= 30.0; }
+        run_lloyd_iter_sweep("Sparse + outliers 16x256", &sw);
+    }
+
     #[test]
     fn sweep_v4f_like_distributions() {
         // 1) Pure Gaussian — baseline.
