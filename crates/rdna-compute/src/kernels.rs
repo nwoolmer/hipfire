@@ -1692,6 +1692,11 @@ pub const SWA_RING_WRITE_BATCHED_SRC: &str =
 pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/v4f_topk_kv_gather_identity_batched.hip");
 
+/// V4F per-group O-LoRA batched GEMV — F32 (Phase B2, 2026-05-18).
+/// Block-diagonal: wo_a[G, M, K] @ x_in[B, G, K] → y_out[B, G, M].
+pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

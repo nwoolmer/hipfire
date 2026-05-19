@@ -20650,6 +20650,57 @@ impl Gpu {
         }
     }
 
+    /// V4F per-group O-LoRA batched GEMV (F32 weights). Block-diagonal:
+    /// `y[b, g, r] = sum_k wo_a[g, r, k] * x_in[b, g, k]`. Single
+    /// launch processes B batch positions × G groups × M output rows
+    /// — replaces `B * G` separate gemv_f32 calls. F32-only for now;
+    /// Q8/MQ4 weights need separate batched-per-group kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_f32(
+        &mut self,
+        wo_a: &GpuTensor,    // [G, M, K] F32
+        x_in: &GpuTensor,    // [B, G, K]
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "wo_per_group_batched_f32",
+            kernels::WO_PER_GROUP_BATCHED_F32_SRC,
+            "wo_per_group_batched_f32",
+        )?;
+        let func = &self.functions["wo_per_group_batched_f32"];
+        let wp = wo_a.buf.as_ptr();
+        let xp = x_in.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_size as u32, g as u32],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F identity gather — BATCHED. For ratio=128 layers without an
     /// indexer: copies the same `kv_cache[0..K, :]` into every batch
     /// row's slab. Same shape as v4f_topk_kv_gather_batched_f32 but
