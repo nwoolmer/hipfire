@@ -2281,6 +2281,53 @@ fn hc_attn_mix_batched(
     Ok(())
 }
 
+/// Batched-aware twin of `final_norm_and_head` — extracts the LAST
+/// position's residual streams from pbs.streams_batch and runs the
+/// existing per-position head pipeline against it.
+///
+/// Phase B2 chunk forward only needs logits at the last position
+/// (matches qwen35::forward_prefill_batch's contract). All upstream
+/// state.* scratch fields used by `final_norm_and_head` are sized for
+/// one position and get reused unchanged.
+///
+/// Returns the logits at the last position. Caller is responsible for
+/// any sampler integration.
+#[allow(dead_code)]
+fn final_norm_and_head_last_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<Vec<f32>, String> {
+    if batch_size == 0 {
+        return Err("final_norm_and_head_last_batched: empty batch".to_string());
+    }
+    // Snapshot the original residual_streams so we can restore it (the
+    // sequential function reads/keeps state.residual_streams; we point
+    // it temporarily at the last position's slice).
+    let last_off = (batch_size - 1) * cfg.hc_mult * cfg.hidden_size;
+    let last_len = cfg.hc_mult * cfg.hidden_size;
+    let last_streams = pbs.streams_batch.sub_offset(last_off, last_len);
+
+    let orig = state.residual_streams.take();
+    state.residual_streams = Some(last_streams);
+
+    let result = final_norm_and_head(cfg, weights, state, gpu);
+
+    // Restore. Drop the temporary view (it shares the pbs buffer; the
+    // underlying buffer is owned by pbs, so leaking the view is fine —
+    // it's a thin GpuTensor wrapper, not a fresh allocation).
+    state.residual_streams = orig;
+
+    result?;
+    let logits_tensor = state.logits.as_ref()
+        .ok_or_else(|| "logits not allocated".to_string())?;
+    gpu.download_f32(logits_tensor)
+        .map_err(|e| format!("download logits: {e:?}"))
+}
+
 /// Batched twin of `hc_ffn_mix`. Same shape as `hc_attn_mix_batched`
 /// but mixes the FFN-side post/comb (produced by the second
 /// mhc_pre_batched call with is_attn=false) and the FFN's transform
