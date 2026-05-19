@@ -121,6 +121,62 @@ The hard part. Once these are working, the rest is mechanical.
 * **B2: `forward_prefill_batch_chunk()` function** — pending. Single-chunk
   batched forward pass. Mirrors `decode_step` but for B positions at once.
 
+  **Kernel inventory (2026-05-18 recon):** every per-layer kernel in
+  `decode_step` mapped against existing batched twins in dispatch.rs.
+
+  *Already-batched (reuse):*
+  - `embedding_lookup_q8_batched`
+  - `fused_rmsnorm_rotate_mq_batched`, `rmsnorm_batched`, `rotate_x_mq_batched`
+  - `v4f_attn_swa_topk_batched_f32`, `v4f_attn_swa_batched` (Phase A1/A2)
+  - `indexer_top_k_batched` (Phase A3)
+  - `hc_input_map_4stream_batched`, `hc_mix_4stream_batched` (Phase A5)
+  - `hc_streams_init_from_embed_batched` (shipped 2026-05-18)
+  - `v4f_silu_mul_clamp_f32_batched` (k_top-batched, reusable per position)
+  - `rotate_x_mq_batched` (k_top-batched, reusable per position)
+
+  *High-priority NEW kernels (these block prefill speedup):*
+  - **gemv_auto family** — currently dispatches per-dtype to `gemv_f32`,
+    `gemv_q8_0`, `gemv_mq4g256_prerotated`. None has a position-batched
+    variant. Used 10× in `decode_step` (q_lora ×3, kv_joint, compressors ×2,
+    indexer ×2, final_norm, router). The amortized-weight-load win is the
+    biggest single perf opportunity in the chunk forward.
+    - For V4F's `mq2lloyd-f16compress` build the relevant variant is
+      `gemv_mq2g256_lloyd_*_batched` (does not yet exist for the
+      non-MoE-indexed call sites; the MoE indexed variants for B=1
+      already exist as `v4f_gemv_*`).
+  - **V4F MoE position-batched** — `v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed`
+    and `..._down_residual_scaled_indexed` are k_top-batched per single
+    position. Need new `_position_batched` arms that add a B dim so the
+    expert weights load once per (k, expert) pair rather than B × that.
+  - **v4f_topk_kv_gather_{f32,identity_f32}_batched** — current gathers
+    stage one position's top-K K/V from the main compressed cache. For
+    batched attention to consume `[batch, head_dim, topk_window]` (the
+    layout v4f_attn_swa_topk_batched expects), this gather needs a B dim.
+
+  *Medium-priority (LOOP ACCEPTABLE for first pass, batch later):*
+  - HC algebra: `hc_compute_control`, `hc_apply_alpha`, `hc_sinkhorn_4x4`,
+    `hc_head_compute_pre` — operate on small per-position vectors,
+    looping per batch row is cheap.
+  - `sigmoid_f32`, `scale_f32` — tiny vector ops, loop acceptable.
+  - `indexer_relu_score_f32` — per-position score compute against a
+    shared compressed-K cache; loop acceptable.
+  - `v4f_moe_topk_bias_aware_f32` — top-K + bias + renorm + scale; loop
+    acceptable since output is small `[k_top]` per position.
+
+  *Low-priority (defer to Phase D polish):*
+  - `rope_tail_interleaved`, `rope_tail_yarn_interleaved`,
+    `rope_tail_inverse` — small kernels, loop is fine initially.
+
+  *Per-position sequential (intentional per A4 deferral):*
+  - `compressor_overlap_concat_f32`, `compressor_softmax_pool_f32` —
+    sparse commits, looped in the chunk forward.
+
+  **Critical-path effort:** ~5-6 days for the high-priority new kernels
+  + integration. The plan's original 3-day estimate for B2 was based on
+  qwen35's MoE batched kernels being a drop-in; the V4F-specific MoE
+  semantics (bias-aware top-K, atomicAdd down with route_scale, MQ2-Lloyd
+  format) require V4F-specific batched variants, which add ~2 days.
+
 * **B3: `forward_prefill_batch()` top-level entry** — 🟡 **SCAFFOLD 2026-05-18**
   - Public entry point in `forward.rs` with stable signature
     `(cfg, weights, state, gpu, tokens, start_pos, &mut PrefillBatchScratch)
