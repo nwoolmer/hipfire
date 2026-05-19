@@ -567,8 +567,14 @@ pub fn decode_step(
     //    reference code before optimising).
     init_residual_streams(cfg, weights, state, gpu, token_id)?;
 
+    // Optional early-stop for bisection: env HIPFIRE_V4F_FORWARD_LAYER_END=N
+    // halts after layer N-1 (exclusive bound) — leaves residual_streams in
+    // their just-after-layer-(N-1) state for cross-path comparison.
+    let layer_end: usize = std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(cfg.num_hidden_layers);
+
     // 2. Per-layer forward.
-    for layer_idx in 0..cfg.num_hidden_layers {
+    for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
         let layer = &weights.layers[layer_idx];
         let l_state = &mut state._indexer[layer_idx];
         let l_attn  = &mut state._attention[layer_idx];
@@ -643,8 +649,24 @@ pub fn decode_step(
 
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
+        // Bisection break: stop after hc_attn_mix (= attn-side residual update
+        // applied, FFN side not yet). Useful for isolating divergence in the
+        // FFN-side stages from divergence in the attention-side stages.
+        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
+            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
+                == Some("after_attn_mix")
+        {
+            return Ok(Vec::new());
+        }
+
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
+        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
+            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
+                == Some("after_mhc_pre_ffn")
+        {
+            return Ok(Vec::new());
+        }
         if std::env::var("HIPFIRE_V4F_SKIP_FFN").ok().as_deref() != Some("1") {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
             if layer_idx < cfg.num_hash_layers {
@@ -2510,26 +2532,56 @@ fn attention_block_batched_swa_only(
         n_heads * head_dim, batch_size,
     ).map_err(|e| format!("rotate attn_out_raw_batch l{layer_idx}: {e:?}"))?;
 
-    // 7. wo_a per-group batched. F32 weights only for now.
+    // 7. wo_a per-group batched. F32 has a register-tiled kernel;
+    //    other dtypes (MQ4, Q8) loop sequentially per (batch, group)
+    //    via gemv_auto. This is correct for any dtype but slow when
+    //    weights are MQ4/Q8 — a future optimization writes
+    //    wo_per_group_batched_{mq4g256,q8_0} kernels.
     let per_group_in = (n_heads / n_groups) * head_dim;
     match wo_a.dtype {
         DType::F32 => {
-            // Use rotated input for MQ4 path; we have F32, so plain input.
-            // wo_a_per_group expects [B, G, K] input — the rotated buffer
-            // IS [B, n_heads * head_dim] which views as [B, G, K] with
-            // K = (n_heads / G) * head_dim = per_group_in.
             gpu.wo_per_group_batched_f32(
                 wo_a, &pbs.attn_out_raw_batch, &pbs.wo_a_out_batch,
                 n_groups as i32, o_lora_rank as i32, per_group_in as i32,
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
         }
-        _ => return Err(format!(
-            "attention_block_batched_swa_only l{layer_idx}: wo_a.dtype={:?} not yet \
-             supported (only F32 wo_a has a per-group batched kernel). Q8 and MQ4 \
-             wo_a variants need wo_per_group_batched_{{q8_0,mq4g256}} kernels.",
-            wo_a.dtype
-        )),
+        _ => {
+            // Per-(batch, group) sequential fallback. attn_out_raw_batch
+            // and attn_out_raw_rot_batch are both [B, n_heads * head_dim]
+            // viewable as [B, G, per_group_in]. wo_a is [G * o_lora_rank,
+            // per_group_in] — per-group slice rows [g*o_lora_rank..].
+            for b in 0..batch_size {
+                for g in 0..n_groups {
+                    let in_off = b * n_heads * head_dim + g * per_group_in;
+                    let rot_view = pbs.attn_out_raw_rot_batch.sub_offset(in_off, per_group_in);
+                    let raw_view = pbs.attn_out_raw_batch.sub_offset(in_off, per_group_in);
+                    let out_off = b * n_groups * o_lora_rank + g * o_lora_rank;
+                    let out_view = pbs.wo_a_out_batch.sub_offset(out_off, o_lora_rank);
+                    // Per-group weight slice (M = o_lora_rank, K = per_group_in).
+                    // For quantized/Raw dtypes, dtype.size() == 1 byte so
+                    // sub_offset takes byte offsets directly.
+                    let wo_a_view = match wo_a.dtype {
+                        DType::Q8_0 => {
+                            let per_g_bytes = (o_lora_rank * per_group_in / 32) * 34;
+                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
+                            v.dtype = DType::Q8_0;
+                            v.shape = vec![o_lora_rank, per_group_in];
+                            v
+                        }
+                        _ => {
+                            // Treat as MQ4G256 (Raw). 136 bytes per 256 elements.
+                            let per_g_bytes = (o_lora_rank * per_group_in / 256) * 136;
+                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
+                            v.shape = vec![o_lora_rank, per_group_in];
+                            v
+                        }
+                    };
+                    gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
+                        o_lora_rank, per_group_in)?;
+                }
+            }
+        }
     }
 
     // 8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch.
@@ -2775,14 +2827,19 @@ fn attention_block_batched_mixed(
                 h_idx as i32, d_idx as i32, max_compressed as i32, batch_size as i32,
             ).map_err(|e| format!("indexer_relu_score_batched l{layer_idx}: {e:?}"))?;
 
-            // Batched top-K. Pass k=topk_max (the storage stride of
-            // idx_topk_indices_batch); ranks > n_per_batch[b] of any
-            // batch row get -1 sentinels which the gather treats as
-            // zero. Score N is the storage stride of idx_scores_batch
-            // (= max_compressed = 2048).
+            // Batched top-K. n_stride = max_compressed (storage),
+            // n_iter = n_max_chunk (actual range with valid scores),
+            // k_stride = topk_max (storage), k_fill = min(topk_max,
+            // n_max_chunk). The bound matters a LOT — at low context
+            // n_max_chunk ≈ 8 vs max_compressed = 2048, which is
+            // ~100× iteration savings.
+            let k_fill = topk_max.min(n_max_chunk);
             gpu.indexer_top_k_batched(
                 &pbs.idx_scores_batch, &pbs.idx_topk_indices_batch,
-                /*n_idx_heads=*/1, max_compressed as i32, topk_max as i32, batch_size as i32,
+                /*n_idx_heads=*/1,
+                max_compressed as i32, n_max_chunk as i32,
+                topk_max as i32, k_fill as i32,
+                batch_size as i32,
             ).map_err(|e| format!("indexer_top_k_batched l{layer_idx}: {e:?}"))?;
 
             // Batched gather: top-K K/V → pbs.topk_staged_batch. Pass
@@ -2879,7 +2936,8 @@ fn attention_block_batched_mixed(
         n_heads * head_dim, batch_size,
     ).map_err(|e| format!("rotate attn_out_raw l{layer_idx}: {e:?}"))?;
 
-    // 7. wo_a per-group batched (F32 only).
+    // 7. wo_a per-group batched. F32: register-tiled kernel. Others:
+    //    per-(batch, group) sequential gemv_auto fallback.
     let per_group_in = (n_heads / n_groups) * head_dim;
     match wo_a.dtype {
         DType::F32 => {
@@ -2889,10 +2947,34 @@ fn attention_block_batched_mixed(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
         }
-        _ => return Err(format!(
-            "attention_block_batched_mixed l{layer_idx}: wo_a.dtype={:?} not yet supported",
-            wo_a.dtype
-        )),
+        _ => {
+            for b in 0..batch_size {
+                for g in 0..n_groups {
+                    let in_off = b * n_heads * head_dim + g * per_group_in;
+                    let rot_view = pbs.attn_out_raw_rot_batch.sub_offset(in_off, per_group_in);
+                    let raw_view = pbs.attn_out_raw_batch.sub_offset(in_off, per_group_in);
+                    let out_off = b * n_groups * o_lora_rank + g * o_lora_rank;
+                    let out_view = pbs.wo_a_out_batch.sub_offset(out_off, o_lora_rank);
+                    let wo_a_view = match wo_a.dtype {
+                        DType::Q8_0 => {
+                            let per_g_bytes = (o_lora_rank * per_group_in / 32) * 34;
+                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
+                            v.dtype = DType::Q8_0;
+                            v.shape = vec![o_lora_rank, per_group_in];
+                            v
+                        }
+                        _ => {
+                            let per_g_bytes = (o_lora_rank * per_group_in / 256) * 136;
+                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
+                            v.shape = vec![o_lora_rank, per_group_in];
+                            v
+                        }
+                    };
+                    gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
+                        o_lora_rank, per_group_in)?;
+                }
+            }
+        }
     }
 
     // 8. FWHT rotate wo_a_out → wo_a_out_rot.
@@ -2957,6 +3039,7 @@ fn ffn_batched(
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
+    tokens: &[u32],
 ) -> Result<(), String> {
     let layer = &weights.layers[layer_idx];
     let ffn_norm  = layer.ffn_norm.as_ref().unwrap();
@@ -3008,17 +3091,23 @@ fn ffn_batched(
 
     // ── Routed-expert MoE ───────────────────────────────────────────
     let do_routed = std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() == Some("1")
-        && layer_idx >= cfg.num_hash_layers
         && layer.expert_gate_up_blob.is_some()
         && layer.expert_w2_blob.is_some();
     if !do_routed {
         return Ok(());
     }
+    // Layers 0..num_hash_layers use STATIC tid2eid routing per upstream
+    // V4F. Disabled via HIPFIRE_V4F_NO_HASH=1 (mirrors ffn_hash_routed).
+    let hash_routing = layer_idx < cfg.num_hash_layers;
+    if hash_routing
+        && (std::env::var("HIPFIRE_V4F_NO_HASH").ok().as_deref() == Some("1")
+            || layer.tid2eid_host.is_empty())
+    {
+        return Ok(());
+    }
 
     let gate_w = layer.gate_weight.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
-    let gate_bias = layer.gate_bias.as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} gate.bias missing"))?;
     let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let n_exp = cfg.n_routed_experts;
@@ -3032,17 +3121,63 @@ fn ffn_batched(
         &pbs.moe_scores_batch, n_exp, hidden, batch_size,
     )?;
 
-    // 9. sqrt_softplus over the full [B, n_exp] buffer. The element-wise
-    //    kernel operates on the GpuTensor's numel — passes batch_size·n_exp.
+    // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
 
-    // 10. Bias-aware top-K per batch row.
-    gpu.v4f_moe_topk_bias_aware_batched_f32(
-        &pbs.moe_scores_batch, gate_bias,
-        &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
-        n_exp as i32, k_top as i32, route_scale, batch_size as i32,
-    ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
+    if hash_routing {
+        // Hash routing: per-batch CPU lookup of static tid2eid → topk_ids,
+        // gather + normalise weights from the (already sqrt_softplus'd)
+        // scores, then upload to the same topk_indices/weights buffers
+        // the score-routed branch uses. Mirrors ffn_hash_routed
+        // line-for-line, applied per batch row.
+        if tokens.len() < batch_size {
+            return Err(format!(
+                "ffn_batched l{layer_idx}: tokens len {} < batch_size {}",
+                tokens.len(), batch_size,
+            ));
+        }
+        let scores_host = gpu.download_f32(&pbs.moe_scores_batch)
+            .map_err(|e| format!("d2h moe_scores l{layer_idx}: {e:?}"))?;
+        let mut topk_idx_host: Vec<i32> = Vec::with_capacity(batch_size * k_top);
+        let mut topk_w_host:   Vec<f32> = Vec::with_capacity(batch_size * k_top);
+        for b in 0..batch_size {
+            let token_id = tokens[b] as usize;
+            let row = token_id * k_top;
+            if row + k_top > layer.tid2eid_host.len() {
+                return Err(format!(
+                    "ffn_batched hash l{layer_idx}: token_id {token_id} \
+                     out of tid2eid range ({} entries)",
+                    layer.tid2eid_host.len()
+                ));
+            }
+            let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k_top].iter()
+                .map(|&i| i.min((n_exp - 1) as u32))
+                .collect();
+            let scores_b = &scores_host[b * n_exp..(b + 1) * n_exp];
+            let wts = match gather_normalized_weights(scores_b, &topk_ids) {
+                Some(w) => w,
+                None => vec![0.0; k_top],
+            };
+            topk_idx_host.extend(topk_ids.iter().map(|&i| i as i32));
+            topk_w_host.extend(wts.iter().map(|&w| w * route_scale));
+        }
+        let idx_bytes: Vec<u8> = topk_idx_host.iter().flat_map(|i| i.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&pbs.moe_topk_indices_batch.buf, &idx_bytes)
+            .map_err(|e| format!("htod hash topk_idx l{layer_idx}: {e:?}"))?;
+        let w_bytes: Vec<u8> = topk_w_host.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&pbs.moe_topk_weights_batch.buf, &w_bytes)
+            .map_err(|e| format!("htod hash topk_w l{layer_idx}: {e:?}"))?;
+    } else {
+        let gate_bias = layer.gate_bias.as_ref()
+            .ok_or_else(|| format!("layer {layer_idx} gate.bias missing"))?;
+        // 10. Bias-aware top-K per batch row.
+        gpu.v4f_moe_topk_bias_aware_batched_f32(
+            &pbs.moe_scores_batch, gate_bias,
+            &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+            n_exp as i32, k_top as i32, route_scale, batch_size as i32,
+        ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 11. Routed expert gate_up (MQ2-Lloyd indexed, position-batched).
     gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched(
@@ -3526,7 +3661,10 @@ pub fn forward_prefill_batch_chunk(
     // Then we hit the attention stage which still needs per-batch SWA
     // staging + indexer top-K gather + wo_a/wo_b O-LoRA projection. Bail
     // out cleanly so callers know the integration path is partial.
-    for layer_idx in 0..cfg.num_hidden_layers {
+    // Bisection-aid env: HIPFIRE_V4F_FORWARD_LAYER_END=N stops after N layers.
+    let layer_end: usize = std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(cfg.num_hidden_layers);
+    for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
         // Attention-side HC pre + per-stream input mapping.
         mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/true, n)?;
 
@@ -3555,10 +3693,24 @@ pub fn forward_prefill_batch_chunk(
         // hc_attn_mix: integrate attn_out_batch into streams_batch.
         hc_attn_mix_batched(cfg, pbs, gpu, n)?;
 
+        // Bisection break (mirror decode_step's env-gated stop).
+        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
+            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
+                == Some("after_attn_mix")
+        {
+            return Ok(());
+        }
+
         // FFN side: mhc_pre(is_attn=false) → ffn_batched (shared + routed)
         // → hc_ffn_mix_batched.
         mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/false, n)?;
-        ffn_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
+            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
+                == Some("after_mhc_pre_ffn")
+        {
+            return Ok(());
+        }
+        ffn_batched(cfg, weights, pbs, gpu, layer_idx, n, tokens)?;
         hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
     }
 

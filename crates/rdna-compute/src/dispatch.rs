@@ -21898,11 +21898,13 @@ impl Gpu {
     /// `indexer_top_k` at batch_size == 1.
     pub fn indexer_top_k_batched(
         &mut self,
-        scores: &GpuTensor,         // [B, H, N] fp32
-        top_indices: &GpuTensor,    // [B, H, K] i32
+        scores: &GpuTensor,         // [B, H, N_stride] fp32
+        top_indices: &GpuTensor,    // [B, H, K_stride] i32
         n_idx_heads: i32,
-        n_compressed: i32,
-        k: i32,
+        n_stride: i32,    // score storage row stride
+        n_iter: i32,      // actual iteration bound (≤ n_stride)
+        k_stride: i32,    // top_indices storage row stride
+        k_fill: i32,      // ranks to fill (rest get -1)
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
@@ -21915,18 +21917,22 @@ impl Gpu {
         let sp = scores.buf.as_ptr();
         let ti = top_indices.buf.as_ptr();
         let mut h  = n_idx_heads;
-        let mut nc = n_compressed;
-        let mut kk = k;
+        let mut ns = n_stride;
+        let mut ni = n_iter;
+        let mut ks = k_stride;
+        let mut kf = k_fill;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &sp as *const _ as *mut c_void,
             &ti as *const _ as *mut c_void,
             &mut h as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ks as *mut _ as *mut c_void,
+            &mut kf as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let smem = n_compressed as u32;
+        let smem = n_iter as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,

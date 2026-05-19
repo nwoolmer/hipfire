@@ -50,7 +50,8 @@ fn main() -> Result<(), String> {
         // Batched.
         let d_s_b = gpu.upload_f32(&all_scores, &[b, H, N]).map_err(|e| format!("s_b: {e:?}"))?;
         let d_top_b = gpu.zeros(&[b, H, K], DType::F32).map_err(|e| format!("top_b: {e:?}"))?;
-        gpu.indexer_top_k_batched(&d_s_b, &d_top_b, H as i32, N as i32, K as i32, b as i32)
+        gpu.indexer_top_k_batched(&d_s_b, &d_top_b, H as i32,
+            N as i32, N as i32, K as i32, K as i32, b as i32)
             .map_err(|e| format!("batched dispatch: {e:?}"))?;
         let mut bytes = vec![0u8; b * H * K * 4];
         gpu.hip.memcpy_dtoh(&mut bytes, &d_top_b.buf).map_err(|e| format!("d2h: {e:?}"))?;
