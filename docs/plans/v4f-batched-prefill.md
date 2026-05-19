@@ -321,6 +321,71 @@ The hard part. Once these are working, the rest is mechanical.
   speedup; step 3 unlocks the MoE FFN batched speedup which is the
   bigger absolute win on V4F.
 
+  ## End-of-session bench (2026-05-18, v4f.mq2lloyd-fp4fix)
+
+  Bench: `examples/bench_v4f_batched_prefill.rs`. Sequential
+  decode_step loop vs `forward_prefill_batch_chunked`, same prompt,
+  fresh `DeepseekV4State` each.
+
+  | prompt_len | max_batch | seq tok/s | bat tok/s | speedup | top1 match | max_abs |
+  |---|---|---|---|---|---|---|
+  | 16  | 4   | 12.8 | 4.2  | **0.33×** | ✓ | 0.000e0 |
+  | 64  | 16  | 19.4 | 20.5 | **1.06×** | ✓ | 0.000e0 |
+  | 64  | 32  | 18.3 | 20.4 | **1.12×** | ✓ | 0.000e0 |
+
+  **Math is byte-equal at every size** — the batched chain is
+  correct end-to-end. Perf gain is currently modest; the gap from
+  the 15-40× plan target reflects:
+
+  - **Per-batch sequential compressor+indexer dominates.** For each
+    of V4F's 41 compressed layers, `attention_block_batched_mixed`
+    runs a B-iteration sequential loop calling
+    `compressor_forward(main)` + `compressor_forward(indexer)` +
+    `indexer_forward` + `v4f_topk_kv_gather` per batch position. Each
+    inner call is ~5-6 small kernel launches; at B=32 × 41 layers
+    × ~17 launches = ~22K launches per chunk, dominating wall time
+    at ~5 µs launch overhead each (~110 ms / chunk).
+  - The actually-batched parts (attention kernel, wo, FFN) get a
+    real but modest win since they were already small fractions of
+    decode time.
+
+  **Memory (B=4, v4f.mq2lloyd-fp4fix):**
+  - PrefillBatchScratch: **8 MB** (negligible)
+  - load_weights jump: 27.7 → 105.5 GiB system-used (~78 GiB delta).
+    Likely pre-existing mmap/page-cache behaviour (model ~40 GiB on
+    disk; doubled in unified memory until OS reclaims) — independent
+    of this work.
+
+  ## Next perf-pass priorities (post-correctness)
+
+  1. **Batch the indexer chain end-to-end.** Replace the per-batch
+     sequential `indexer_forward` loop with batched primitives that
+     already exist: `gemv_auto_batched(wq_b_idx → q_idx_batch)` +
+     `rope_tail_interleaved_batched` + `gemv_auto_batched(weights_-
+     proj → idx_w_batch)` + `indexer_relu_score_batched_f32` +
+     `indexer_top_k_batched` + `v4f_topk_kv_gather_batched`. The
+     subtle correctness constraint: per-batch n_compressed[b] varies
+     when B > ratio (within-chunk commits change the cache); handle
+     by either limiting chunk B ≤ ratio (= 4 for indexer layers) or
+     extending `indexer_relu_score_batched` to take a per-batch
+     n_compressed array.
+
+  2. **Batch the per-step compressor kv_state write.** Today's
+     `compressor_forward(main)` writes a single position's compressed
+     residual into the kv_state ring. Replace the B-iteration loop
+     with one launch that writes all B slots. The conditional pool +
+     rmsnorm + rope at commit boundaries can stay sequential
+     (sparse: ≤ B/ratio commits per chunk).
+
+  3. **Tune the attention/wo block dimensions.** wo_per_group_batched_f32
+     uses 32 threads × `M × G × B` blocks — likely under-occupies
+     gfx1151 wave32 SIMD. Bump to 64-128 threads with shared-mem
+     weight broadcast.
+
+  Each of these is ≈1 day, total ~3 days to push from 1.12× to
+  the 5-10× range plausibly. The 15-40× target needs more
+  aggressive amortization (e.g. a fused per-layer megakernel).
+
 * **B3: `forward_prefill_batch()` top-level entry** — 🟡 **SCAFFOLD 2026-05-18**
   - Public entry point in `forward.rs` with stable signature
     `(cfg, weights, state, gpu, tokens, start_pos, &mut PrefillBatchScratch)
