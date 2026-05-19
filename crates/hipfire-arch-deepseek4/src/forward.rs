@@ -150,6 +150,52 @@ fn compressor_forward(
     position: u32,
     is_indexer: bool,
 ) -> Result<(), String> {
+    compressor_forward_impl(
+        cfg, weights, state, gpu, layer_idx, x_rotated, position, is_indexer,
+        /*pre_batched=*/None,
+    )
+}
+
+/// Variant of `compressor_forward` that uses pre-batched wkv/wgate
+/// outputs computed once per (layer, compressor) for all B positions
+/// in a chunk. Skips the per-position GEMVs entirely; the caller is
+/// responsible for running gemv_auto_batched on the full tmp/tmp_plain
+/// batch and providing the resulting (kv, score) buffers with a
+/// per-position offset into the [B, proj_dim] view.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn compressor_forward_prebatched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    position: u32,
+    is_indexer: bool,
+    kv_batch: &GpuTensor,
+    score_batch: &GpuTensor,
+    batch_offset: usize,
+) -> Result<(), String> {
+    let null_x = state.tmp.as_ref()
+        .ok_or_else(|| format!("compressor_forward_prebatched: state.tmp missing l{layer_idx}"))?
+        .sub_offset(0, cfg.hidden_size);
+    compressor_forward_impl(
+        cfg, weights, state, gpu, layer_idx, &null_x, position, is_indexer,
+        Some((kv_batch, score_batch, batch_offset)),
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn compressor_forward_impl(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    x_rotated: &GpuTensor,
+    position: u32,
+    is_indexer: bool,
+    pre_batched: Option<(&GpuTensor, &GpuTensor, usize)>,
+) -> Result<(), String> {
     let layer = &weights.layers[layer_idx];
     let ratio = layer.compress_ratio as usize;
     if ratio == 0 { return Ok(()); }
@@ -251,12 +297,23 @@ fn compressor_forward(
     // 1. kv = wkv @ x_rotated; score = wgate @ x_rotated
     //    Dispatch: MQ4 path uses x_rotated (FWHT'd); F16 path uses
     //    tmp_plain (plain RMSNorm, no FWHT — see q_lora step 1b).
-    let kv_buf = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
-    let score_buf = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
-    let tmp_plain = state.tmp_plain.as_ref()
-        .ok_or_else(|| format!("comp l{layer_idx}: tmp_plain missing (q_lora must run first)"))?;
-    gemv_auto(gpu, wkv, x_rotated, tmp_plain, kv_buf, proj_dim, hidden)?;
-    gemv_auto(gpu, wgate, x_rotated, tmp_plain, score_buf, proj_dim, hidden)?;
+    // If pre_batched is Some, the caller has already run the GEMVs
+    // for all B positions; we just point kv/score at the b-th slice.
+    let owned_kv_buf;
+    let owned_score_buf;
+    let (kv_buf, score_buf) = if let Some((kv_b, score_b, b_off)) = pre_batched {
+        owned_kv_buf = kv_b.sub_offset(b_off * proj_dim, proj_dim);
+        owned_score_buf = score_b.sub_offset(b_off * proj_dim, proj_dim);
+        (&owned_kv_buf, &owned_score_buf)
+    } else {
+        let kvb = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
+        let scb = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
+        let tmp_plain = state.tmp_plain.as_ref()
+            .ok_or_else(|| format!("comp l{layer_idx}: tmp_plain missing (q_lora must run first)"))?;
+        gemv_auto(gpu, wkv, x_rotated, tmp_plain, kvb, proj_dim, hidden)?;
+        gemv_auto(gpu, wgate, x_rotated, tmp_plain, scb, proj_dim, hidden)?;
+        (kvb, scb)
+    };
 
     // 2. score += ape[pos % ratio]
     // ape is shape [ratio, proj_dim] F16; row pos%ratio is proj_dim consecutive F16s.
@@ -2273,6 +2330,15 @@ pub struct PrefillBatchScratch {
     pub idx_w_batch: GpuTensor,            // [B, idx_n_heads]
     pub idx_scores_batch: GpuTensor,       // [B, max_compressed]
     pub idx_topk_indices_batch: GpuTensor, // [B, index_topk]  i32-in-F32
+    // ── Compressor batched-GEMV scratch (Phase 2.5 perf pass) ──
+    // Holds the wkv / wgate compressor outputs across all B positions
+    // so the GEMVs can be batched out of the per-position loop. Main
+    // and indexer compressors get separate buffers because the proj_dim
+    // differs (main=2*head_dim=1024, idx=2*idx_head_dim=256 for V4F).
+    pub comp_main_kv_batch: GpuTensor,     // [B, 2*head_dim]
+    pub comp_main_score_batch: GpuTensor,  // [B, 2*head_dim]
+    pub comp_idx_kv_batch: GpuTensor,      // [B, 2*idx_head_dim]
+    pub comp_idx_score_batch: GpuTensor,   // [B, 2*idx_head_dim]
 }
 
 impl PrefillBatchScratch {
@@ -2371,6 +2437,11 @@ impl PrefillBatchScratch {
             idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch", r, log_vram)?,
             idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch", r, log_vram)?,
             idx_topk_indices_batch: alloc(gpu, &[max_batch, cfg.index_topk], "idx_topk_indices_batch", r, log_vram)?,
+            // Compressor batched-GEMV scratch — main coff=2, idx coff=2.
+            comp_main_kv_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_kv_batch", r, log_vram)?,
+            comp_main_score_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_score_batch", r, log_vram)?,
+            comp_idx_kv_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch", r, log_vram)?,
+            comp_idx_score_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch", r, log_vram)?,
         });
         if log_vram {
             eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
@@ -2732,6 +2803,52 @@ fn attention_block_batched_mixed(
     let q_rank = cfg.q_lora_rank;
     let mut loop_err: Option<String> = None;
 
+    // 2a-pre. Batched compressor GEMVs for the whole chunk. Collapses
+    // 2 × batch_size sequential gemv_auto calls into ONE batched GEMM
+    // per (wkv|wgate) × (main|indexer). Wires through to
+    // compressor_forward_prebatched in the per-position loop below.
+    // Opt out via HIPFIRE_V4F_COMP_BATCHED_GEMV=0.
+    let comp_batched = std::env::var("HIPFIRE_V4F_COMP_BATCHED_GEMV")
+        .map(|s| s != "0").unwrap_or(true);
+    let main_coff = 2; // ratio=4 has overlap=true; ratio=128 has coff=1 → wastes half the buf.
+    let main_proj_dim = main_coff * head_dim;
+    let idx_coff = 2;
+    let idx_proj_dim = idx_coff * cfg.index_head_dim;
+    if comp_batched {
+        let comp_wkv = layer.compressor_wkv.as_ref()
+            .ok_or_else(|| format!("comp_wkv l{layer_idx}"))?;
+        let comp_wgate = layer.compressor_wgate.as_ref()
+            .ok_or_else(|| format!("comp_wgate l{layer_idx}"))?;
+        let real_main_proj = if ratio == 4 { 2 * head_dim } else { head_dim };
+        gemv_auto_batched(
+            gpu, comp_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+            &pbs.comp_main_kv_batch, real_main_proj, hidden, batch_size,
+        )?;
+        gemv_auto_batched(
+            gpu, comp_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+            &pbs.comp_main_score_batch, real_main_proj, hidden, batch_size,
+        )?;
+        if ratio == 4 {
+            let idx_wkv = layer.indexer_compressor_wkv.as_ref()
+                .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?;
+            let idx_wgate = layer.indexer_compressor_wgate.as_ref()
+                .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
+            gemv_auto_batched(
+                gpu, idx_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                &pbs.comp_idx_kv_batch, idx_proj_dim, hidden, batch_size,
+            )?;
+            gemv_auto_batched(
+                gpu, idx_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                &pbs.comp_idx_score_batch, idx_proj_dim, hidden, batch_size,
+            )?;
+        }
+    }
+    // The pre-batched buffers are stored at stride main_proj_dim (=1024)
+    // even when ratio=128 (proj_dim=512). For ratio=128 the second half
+    // of each [B, 1024] slot is unused but still strided. That matches
+    // the alloc but means the per-position offset uses the real proj_dim.
+    let main_view_proj = if ratio == 4 { main_proj_dim } else { head_dim };
+
     for b in 0..batch_size {
         let pos = start_pos + b as u32;
         state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
@@ -2739,20 +2856,42 @@ fn attention_block_batched_mixed(
         state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
         state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
 
-        let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-        if let Err(e) = compressor_forward(
-            cfg, weights, state, gpu, layer_idx,
-            &tmp_view, pos, /*is_indexer=*/false,
-        ) {
+        let cf_res = if comp_batched {
+            // The pre-batched [B, main_view_proj] buffer is laid out
+            // contiguous-per-row with stride main_view_proj at the
+            // wkv/wgate gemv_auto_batched call.
+            let _ = main_proj_dim; // silence warning when ratio=128
+            compressor_forward_prebatched(
+                cfg, weights, state, gpu, layer_idx, pos,
+                /*is_indexer=*/false,
+                &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
+            )
+        } else {
+            let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+            compressor_forward(
+                cfg, weights, state, gpu, layer_idx,
+                &tmp_view, pos, /*is_indexer=*/false,
+            )
+        };
+        if let Err(e) = cf_res {
             loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
             break;
         }
         if ratio == 4 {
-            let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-            if let Err(e) = compressor_forward(
-                cfg, weights, state, gpu, layer_idx,
-                &tmp_view2, pos, /*is_indexer=*/true,
-            ) {
+            let cf_res2 = if comp_batched {
+                compressor_forward_prebatched(
+                    cfg, weights, state, gpu, layer_idx, pos,
+                    /*is_indexer=*/true,
+                    &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                )
+            } else {
+                let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+                compressor_forward(
+                    cfg, weights, state, gpu, layer_idx,
+                    &tmp_view2, pos, /*is_indexer=*/true,
+                )
+            };
+            if let Err(e) = cf_res2 {
                 loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
                 break;
             }
