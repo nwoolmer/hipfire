@@ -1637,6 +1637,11 @@ pub const ROPE_TAIL_INTERLEAVED_BATCHED_SRC: &str =
 pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_yarn_interleaved_batched.hip");
 
+/// HC control-vector — BATCHED (Phase B2, 2026-05-18). Per-batch dot
+/// of streams[b] against the shared `hc_fn` weight + rsqrt mean + base.
+pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

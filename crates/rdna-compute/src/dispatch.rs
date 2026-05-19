@@ -19893,6 +19893,56 @@ impl Gpu {
         }
     }
 
+    /// HC control vector — BATCHED. Per batch row b reads
+    /// `x_flat[b, :]`, dots against the shared `w_fn` rows, divides by
+    /// rsqrt(mean(x^2)+eps), adds `base[ctrl]` → `c[b, ctrl]`. Byte-
+    /// identical to `hc_compute_control` at batch_size == 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_compute_control_batched(
+        &mut self,
+        x_flat: &GpuTensor,    // [batch, x_dim]
+        w_fn: &GpuTensor,      // [n_ctrl, x_dim] fp16
+        base: &GpuTensor,      // [n_ctrl] fp16
+        c_out: &GpuTensor,     // [batch, n_ctrl] fp32
+        n_ctrl: i32,
+        x_dim: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_compute_control_batched",
+            kernels::HC_COMPUTE_CONTROL_BATCHED_SRC,
+            "hc_compute_control_batched",
+        )?;
+        let func = &self.functions["hc_compute_control_batched"];
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut xd = x_dim;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_ctrl as u32, batch_size as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F Compressor overlap-transform concat (overlap=true / ratio=4).
     /// Reads [2*ratio, 2*head_dim] kv_state and writes [2*ratio, head_dim]
     /// dst by taking first half-cols for old window rows and second
