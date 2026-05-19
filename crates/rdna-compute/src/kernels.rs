@@ -1642,6 +1642,11 @@ pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
 pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control_batched.hip");
 
+/// HC α-scaling post-step — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// in-place rescale of c[b, 0..24] using the shared 3-segment α + base.
+pub const HC_APPLY_ALPHA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

@@ -20650,6 +20650,46 @@ impl Gpu {
         }
     }
 
+    /// HC α-scaling — BATCHED. Per-batch in-place rescale of c[b, 0..24]
+    /// using the shared 3-segment α + base. Byte-identical to
+    /// `hc_apply_alpha` at batch_size == 1.
+    #[allow(dead_code)]
+    pub fn hc_apply_alpha_batched(
+        &mut self,
+        c: &GpuTensor,
+        alpha: &GpuTensor,
+        base: &GpuTensor,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_apply_alpha_batched",
+            kernels::HC_APPLY_ALPHA_BATCHED_SRC,
+            "hc_apply_alpha_batched",
+        )?;
+        let func = &self.functions["hc_apply_alpha_batched"];
+        let cp = c.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [24, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 3 — Input mapping: x_in[d] = sum_s(A[s] * streams[s, d]).
     /// A is sigmoid-bounded [0, 1].
     #[allow(dead_code)]
