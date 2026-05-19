@@ -19032,12 +19032,41 @@ impl Gpu {
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_f32_register_tiled",
-            kernels::GEMM_F32_REGISTER_TILED_SRC,
-            "gemm_f32_register_tiled",
-        )?;
-        let func = &self.functions["gemm_f32_register_tiled"];
+        // Kernel variant selection:
+        //   w2  (64-thread, 2 waves/workgroup, BT=8) — default for V4F-
+        //         like shapes where the (M, ceil(B/8)) grid produces too
+        //         few workgroups to saturate DRAM. The extra waves issue
+        //         more in-flight memory requests per workgroup.
+        //   bt32 (32-thread, BT=32) — opt-in escape hatch
+        //         (HIPFIRE_GEMM_F32_BT32=1). Theoretical 4× fewer weight
+        //         reads but measured slower because the 32-row x working
+        //         set blows past L2 capacity.
+        //   default (32-thread, BT=8) — fallback when HIPFIRE_GEMM_F32_W2=0.
+        let want_bt32 = batch_size >= 16
+            && std::env::var("HIPFIRE_GEMM_F32_BT32")
+                .map(|s| s == "1").unwrap_or(false);
+        // W2 was hypothesized to help by issuing 2× memory requests per
+        // workgroup. Measured: marginally SLOWER on V4F+gfx1151 (33.3 vs
+        // 36.0 tok/s) — the existing 8k workgroups are enough wave-count
+        // for the existing memory subsystem. Keep as opt-in escape hatch.
+        let want_w2 = !want_bt32 && batch_size >= 4
+            && std::env::var("HIPFIRE_GEMM_F32_W2")
+                .map(|s| s == "1").unwrap_or(false);
+        let (kname, src, batch_tile, block_x) = if want_bt32 {
+            ("gemm_f32_register_tiled_bt32",
+             kernels::GEMM_F32_REGISTER_TILED_BT32_SRC,
+             32u32, 32u32)
+        } else if want_w2 {
+            ("gemm_f32_register_tiled_w2",
+             kernels::GEMM_F32_REGISTER_TILED_W2_SRC,
+             8u32, 64u32)
+        } else {
+            ("gemm_f32_register_tiled",
+             kernels::GEMM_F32_REGISTER_TILED_SRC,
+             8u32, 32u32)
+        };
+        self.ensure_kernel(kname, src, kname)?;
+        let func = &self.functions[kname];
         let mut ap = a.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -19052,13 +19081,12 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        const BATCH_TILE: u32 = 8;
-        let grid_y = (batch_size as u32 + BATCH_TILE - 1) / BATCH_TILE;
+        let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, grid_y, 1],
-                [32, 1, 1],
+                [block_x, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -22285,6 +22313,197 @@ impl Gpu {
                 b.push_ptr(rbp); b.push_ptr(xrp);
                 b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
                 b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// V4F MoE routing counting-sort by expert id. Single block of 256
+    /// threads runs count → exclusive prefix-sum → scatter, all in shared
+    /// memory. Output arrays are sized [B*K_TOP] and [n_exp+1].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_routing_sort_by_expert(
+        &mut self,
+        topk_indices: &GpuTensor,   // [B * K_TOP] i32
+        sorted_b: &GpuTensor,       // [B * K_TOP] i32
+        sorted_krank: &GpuTensor,   // [B * K_TOP] i32
+        sorted_expert: &GpuTensor,  // [B * K_TOP] i32
+        expert_starts: &GpuTensor,  // [n_exp + 1] i32
+        b: i32, k_top: i32, n_exp: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_routing_sort_by_expert",
+            kernels::MOE_ROUTING_SORT_BY_EXPERT_SRC,
+            "moe_routing_sort_by_expert",
+        )?;
+        let func = &self.functions["moe_routing_sort_by_expert"];
+        let tp = topk_indices.buf.as_ptr();
+        let sbp = sorted_b.buf.as_ptr();
+        let skp = sorted_krank.buf.as_ptr();
+        let sep = sorted_expert.buf.as_ptr();
+        let esp = expert_starts.buf.as_ptr();
+        let mut bi = b;
+        let mut kt = k_top;
+        let mut ne = n_exp;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &sbp as *const _ as *mut c_void,
+            &skp as *const _ as *mut c_void,
+            &sep as *const _ as *mut c_void,
+            &esp as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+        ];
+        // Shared mem = n_exp * sizeof(int).
+        let shared_bytes = (n_exp as u32) * 4;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                shared_bytes,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F MoE gate_up — SCATTER-BY-EXPERT K4-unrolled MQ2-Lloyd GEMV.
+    /// Caller must have run `moe_routing_sort_by_expert` first so that
+    /// adjacent routing indices share expert_id (yielding L2/IC cache
+    /// hits on the weight slabs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_gemv_mq2g256_lloyd_moe_gate_up_grouped_k4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sorted_b: &GpuTensor,
+        sorted_krank: &GpuTensor,
+        sorted_expert: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_gate_up_grouped_k4",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_GROUPED_K4_SRC,
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_grouped_k4",
+        )?;
+        let n_routings = (batch_size * k_top) as i32;
+        let pp = expert_ptrs.buf.as_ptr();
+        let sbp = sorted_b.buf.as_ptr();
+        let skp = sorted_krank.buf.as_ptr();
+        let sep = sorted_expert.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sbp as *const _ as *mut c_void,
+            &skp as *const _ as *mut c_void,
+            &sep as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &n_routings as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv",
+            "v4f_gemv_mq2g256_lloyd_moe_gate_up_grouped_k4",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_grouped_k4",
+            [m as u32, n_routings as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(pp); bb.push_ptr(sbp); bb.push_ptr(skp);
+                bb.push_ptr(sep); bb.push_ptr(xp);
+                bb.push_ptr(ygp); bb.push_ptr(yup);
+                bb.push_i32(m_val); bb.push_i32(k_val);
+                bb.push_i32(kt_val); bb.push_i32(n_routings);
+                bb
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// V4F MoE down — SCATTER-BY-EXPERT K4-unrolled MQ2-Lloyd GEMV
+    /// with scaled residual atomicAdd. Same caller contract as the
+    /// gate_up grouped variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_grouped_k4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sorted_b: &GpuTensor,
+        sorted_krank: &GpuTensor,
+        sorted_expert: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_down_grouped_k4",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_GROUPED_K4_SRC,
+            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_grouped_k4",
+        )?;
+        let n_routings = (batch_size * k_top) as i32;
+        let pp = expert_ptrs.buf.as_ptr();
+        let sbp = sorted_b.buf.as_ptr();
+        let skp = sorted_krank.buf.as_ptr();
+        let sep = sorted_expert.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sbp as *const _ as *mut c_void,
+            &skp as *const _ as *mut c_void,
+            &sep as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &n_routings as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv",
+            "v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_grouped_k4",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_grouped_k4",
+            [m as u32, n_routings as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(pp); bb.push_ptr(sbp); bb.push_ptr(skp);
+                bb.push_ptr(sep); bb.push_ptr(wp);
+                bb.push_ptr(rbp); bb.push_ptr(xrp);
+                bb.push_i32(m_val); bb.push_i32(k_val);
+                bb.push_i32(kt_val); bb.push_i32(n_routings);
+                bb
             },
         );
         if let Some(t) = timer { t.finish(&self.hip); }

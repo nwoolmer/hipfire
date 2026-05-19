@@ -1715,6 +1715,20 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F32_REGISTER_TILED_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
 
+/// BATCH_TILE=32 variant of `gemm_f32_register_tiled`. Reads each
+/// weight row once for up to 32 batch positions. Used for the V4F
+/// compressor wkv/wgate path where the BATCH_TILE=8 variant was
+/// reading each row 4× and running at ~9 GB/s.
+pub const GEMM_F32_REGISTER_TILED_BT32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled_bt32.hip");
+
+/// 2-wave (64-thread) variant of `gemm_f32_register_tiled` — doubles
+/// memory requests in flight per workgroup, helping saturate DRAM on
+/// V4F shapes where the (M, ceil(B/8)) grid produces only ~8k
+/// workgroups (well below gfx1151's wave-saturation point).
+pub const GEMM_F32_REGISTER_TILED_W2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled_w2.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for
@@ -1730,6 +1744,24 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
 /// FMA-order epsilon drift.
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip");
+
+/// MoE routing counting-sort by expert id. Single launch produces
+/// (sorted_b, sorted_krank, sorted_expert, expert_starts) so the
+/// grouped MoE GEMVs read each expert weight slab once with cache reuse.
+pub const MOE_ROUTING_SORT_BY_EXPERT_SRC: &str =
+    include_str!("../../../kernels/src/moe_routing_sort_by_expert.hip");
+
+/// V4F MoE gate_up — SCATTER-BY-EXPERT K4-unrolled MQ2-Lloyd GEMV.
+/// Replaces indexed-gather cache thrashing (~3.7 GB/s on gfx1151) with
+/// expert-grouped scheduling where adjacent thread blocks share weight
+/// slabs and hit L2/IC cache.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_GROUPED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_grouped_k4.hip");
+
+/// V4F MoE down — SCATTER-BY-EXPERT K4-unrolled MQ2-Lloyd GEMV with
+/// scaled residual atomicAdd.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_GROUPED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_grouped_k4.hip");
 
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.

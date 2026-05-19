@@ -2339,6 +2339,13 @@ pub struct PrefillBatchScratch {
     pub comp_main_score_batch: GpuTensor,  // [B, 2*head_dim]
     pub comp_idx_kv_batch: GpuTensor,      // [B, 2*idx_head_dim]
     pub comp_idx_score_batch: GpuTensor,   // [B, 2*idx_head_dim]
+    // ── Scatter-by-expert MoE sort outputs ──
+    // Single counting-sort produces these per layer; the grouped MoE
+    // GEMVs then read each expert weight slab once with cache reuse.
+    pub moe_sorted_b: GpuTensor,           // [B * K_TOP] i32
+    pub moe_sorted_krank: GpuTensor,       // [B * K_TOP] i32
+    pub moe_sorted_expert: GpuTensor,      // [B * K_TOP] i32
+    pub moe_expert_starts: GpuTensor,      // [n_exp + 1] i32
 }
 
 impl PrefillBatchScratch {
@@ -2442,6 +2449,11 @@ impl PrefillBatchScratch {
             comp_main_score_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_score_batch", r, log_vram)?,
             comp_idx_kv_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch", r, log_vram)?,
             comp_idx_score_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch", r, log_vram)?,
+            // Scatter-by-expert MoE sort scratch.
+            moe_sorted_b: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_b", r, log_vram)?,
+            moe_sorted_krank: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank", r, log_vram)?,
+            moe_sorted_expert: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_expert", r, log_vram)?,
+            moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts", r, log_vram)?,
         });
         if log_vram {
             eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
@@ -3338,12 +3350,38 @@ fn ffn_batched(
         ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
     }
 
-    // 11. Routed expert gate_up (MQ2-Lloyd indexed, position-batched).
+    // 10.5. Scatter-by-expert routing sort + grouped GEMV. Opt-in via
+    //       HIPFIRE_V4F_MOE_GROUPED=1. Default OFF: measured 18 % SLOWER
+    //       than the indexed-batched K4 path on V4F+gfx1151 because the
+    //       grouped layout trades x-row cache reuse (M=4096 blocks share
+    //       x[b] in the indexed grid) for expert-slab reuse — and the
+    //       indexed kernel was already at ~62 % of peak DRAM bandwidth.
+    //       Keep wired for larger batches / archs where the trade flips.
+    let moe_grouped = std::env::var("HIPFIRE_V4F_MOE_GROUPED")
+        .map(|s| s == "1").unwrap_or(false);
+    if moe_grouped {
+        gpu.moe_routing_sort_by_expert(
+            &pbs.moe_topk_indices_batch,
+            &pbs.moe_sorted_b, &pbs.moe_sorted_krank,
+            &pbs.moe_sorted_expert, &pbs.moe_expert_starts,
+            batch_size as i32, k_top as i32, cfg.n_routed_experts as i32,
+        ).map_err(|e| format!("moe_routing_sort_by_expert l{layer_idx}: {e:?}"))?;
+    }
+
+    // 11. Routed expert gate_up (MQ2-Lloyd, scatter-by-expert grouped K4).
     // K4-unrolled variant (4 independent accumulators per thread for ILP).
     // Opt out via HIPFIRE_V4F_GATEUP_K4=0 (default: on).
     let gate_up_k4 = std::env::var("HIPFIRE_V4F_GATEUP_K4")
         .map(|s| s != "0").unwrap_or(true);
-    if gate_up_k4 {
+    if moe_grouped && gate_up_k4 {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_grouped_k4(
+            gate_up_ptrs,
+            &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,
+            &pbs.ffn_x_rot_batch,
+            &pbs.moe_gate_batch, &pbs.moe_up_batch,
+            2 * im, hidden, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_gate_up_grouped_k4 l{layer_idx}: {e:?}"))?;
+    } else if gate_up_k4 {
         gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
             gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
             &pbs.moe_gate_batch, &pbs.moe_up_batch,
@@ -3369,11 +3407,19 @@ fn ffn_batched(
     ).map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
 
     // 14. Routed expert down with scaled atomicAdd into ffn_out_batch.
-    // K4-unrolled variant (4 independent accumulators per thread for ILP).
+    // K4-unrolled scatter-by-expert grouped variant (or fallbacks).
     // Opt out via HIPFIRE_V4F_DOWN_K4=0 (default: on).
     let down_k4 = std::env::var("HIPFIRE_V4F_DOWN_K4")
         .map(|s| s != "0").unwrap_or(true);
-    if down_k4 {
+    if moe_grouped && down_k4 {
+        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_grouped_k4(
+            w2_ptrs,
+            &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,
+            &pbs.moe_topk_weights_batch,
+            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
+            hidden, im, k_top, batch_size,
+        ).map_err(|e| format!("v4f_gemv_down_grouped_k4 l{layer_idx}: {e:?}"))?;
+    } else if down_k4 {
         gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
             w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
             &pbs.moe_rot_batch, &pbs.ffn_out_batch,
