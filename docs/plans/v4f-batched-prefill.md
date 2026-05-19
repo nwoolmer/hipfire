@@ -183,6 +183,86 @@ The hard part. Once these are working, the rest is mechanical.
   semantics (bias-aware top-K, atomicAdd down with route_scale, MQ2-Lloyd
   format) require V4F-specific batched variants, which add ~2 days.
 
+  **B2 progress checkpoint (2026-05-18, end of working session):**
+
+  *Shipped batched per-layer helpers (all dormant — chunk forward
+  errors at attention dispatch before any per-layer stage runs
+  end-to-end):*
+  - `gemv_auto_batched` — per-dtype dispatcher to gemm_f32_batched /
+    gemm_q8_0_batched_chunked / gemm_hfq4g256
+  - `mhc_pre_batched` — 5-step pipeline (compute_control → apply_alpha
+    → split_finalize → sinkhorn → input_map); honours
+    `HIPFIRE_V4F_POST_SCALE`
+  - `q_lora_batched` — fused norm+rotate + plain norm + 2 GEMVs +
+    q_norm + rotate + per-(B, head) Q norm; honours
+    `HIPFIRE_V4F_SKIP_QHN`
+  - `kv_joint_batched` — single GEMV + kv_norm in-place
+  - `apply_tail_rope_batched` — plain + YaRN variants, per-layer freq
+    params, honours `HIPFIRE_V4F_NO_YARN`
+  - `hc_attn_mix_batched` / `hc_ffn_mix_batched` — wrappers on top of
+    hc_mix_4stream_batched + memcpy back into streams_batch
+  - `final_norm_and_head_last_batched` — extracts the last batch
+    position via sub_offset, calls the existing per-position chain
+
+  *New HIP kernels shipped this session (10 total):*
+  - v4f_attn_swa_topk_batched.hip (Phase A1)
+  - v4f_attn_swa_batched.hip (Phase A2)
+  - indexer_top_k_batched.hip (Phase A3)
+  - hc_mix_4stream_batched.hip, hc_input_map_batched.hip (Phase A5)
+  - hc_streams_init_from_embed_batched.hip
+  - rope_tail_interleaved_batched.hip, rope_tail_yarn_interleaved_-
+    batched.hip
+  - hc_compute_control_batched.hip, hc_apply_alpha_batched.hip,
+    hc_sinkhorn_4x4_batched.hip, hc_split_finalize_batched.hip
+
+  *forward_prefill_batch_chunk status:*
+  - ✓ tokens + positions upload, batched embedding, HC stream init
+  - ✓ per-layer mhc_pre + q_lora + kv_joint + rope (attention-side)
+  - ☐ per-layer attention dispatch — bails out here
+  - ☐ per-layer wo_a/wo_b O-LoRA projection
+  - ☐ per-layer hc_attn_mix call
+  - ☐ per-layer mhc_pre (ffn-side) + ffn_routed + hc_ffn_mix
+  - ☐ final_norm_and_head_last_batched call (function exists)
+
+  *Remaining work (each piece independently complex):*
+
+  1. **Attention block staging** (~2-3 days). Each batch position needs
+     a per-row visibility window into the SWA ring buffer + per-row
+     indexer top-K K/V gather. Two-step path:
+     - new kernel `swa_visibility_stage_batched.hip` — given the layer's
+       SWA ring buffer + per-batch absolute positions, build a
+       `[B, head_dim, swa_window]` per-row contiguous view (causal-mask
+       aware: zero-pad beyond start_pos+b)
+     - new kernel `v4f_topk_kv_gather_batched.hip` (Phase A4-equivalent
+       deferred from recon) — gather per-batch top-K K/V from the
+       main compressed cache via `indexer_top_k_batched` output
+     - host-side per-batch `n_valid_swa_arr` and `n_active_topk_arr`
+       i32 uploads
+     - Then `v4f_attn_swa_topk_batched_f32` runs in one launch.
+
+  2. **wo_a/wo_b O-LoRA batched** (~1 day). Per-group dispatch loops
+     in sequential `attn_stub` — 8 groups × 2 GEMVs per group per
+     token. Batched: 8 groups × 2 batched-GEMM calls total. Plus
+     `rope_tail_inverse_batched` (~half day kernel, mirrors plain
+     rope_tail_interleaved_batched).
+
+  3. **ffn_routed_batched + ffn_hash_routed_batched** (~2-3 days). The
+     V4F-specific MoE GEMV kernels (`v4f_gemv_mq2g256_lloyd_moe_-
+     gate_up_indexed`, `..._down_residual_scaled_indexed`) are
+     k_top-batched per single position. Need new
+     `_position_batched` variants with an outer B dim that amortize
+     the routed expert weight loads across positions. Plus a position-
+     batched `v4f_moe_topk_bias_aware_f32_batched`.
+
+  4. **End-to-end integration** (~half day once 1-3 are in place):
+     wire all stages in forward_prefill_batch_chunk and replace
+     forward_prefill_batch's per-token fallback with a chunked loop
+     over forward_prefill_batch_chunk calls. Then byte-equality test
+     vs sequential at small B.
+
+  **Total estimated remaining for end-to-end batched prefill:**
+  5-7 days of focused work. Roughly equal-effort phases.
+
 * **B3: `forward_prefill_batch()` top-level entry** — 🟡 **SCAFFOLD 2026-05-18**
   - Public entry point in `forward.rs` with stable signature
     `(cfg, weights, state, gpu, tokens, start_pos, &mut PrefillBatchScratch)
