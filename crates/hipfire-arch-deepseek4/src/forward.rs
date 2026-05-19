@@ -57,6 +57,54 @@ fn gemv_auto(
     }
 }
 
+/// Batched twin of `gemv_auto` for Phase B2 chunk forward.
+///
+/// Same dispatch shape but each call processes `batch_size` inputs against
+/// a single weight matrix. Output `y` is row-major `[batch_size, m]` —
+/// matches what concatenating `batch_size` sequential gemv_auto outputs
+/// would produce.
+///
+/// Inputs:
+///   - `x_rotated_batch`: `[batch_size, k]` FWHT-rotated (consumed by the
+///     MQ4 path only)
+///   - `x_plain_batch`:   `[batch_size, k]` plain RMSNorm'd (consumed by
+///     the F32 and Q8 paths)
+///
+/// Backed by the existing GEMM-batched kernels:
+///   - F32  → `gemm_f32_batched` (M_kernel=batch, N_kernel=output_dim)
+///   - Q8_0 → `gemm_q8_0_batched_chunked` (handles batch > 64 via internal
+///            sub-batching; same MAX_BATCH=64 as the underlying kernel)
+///   - Raw (MQ4G256) → `gemm_hfq4g256` (consumes pre-rotated x)
+///
+/// At batch_size == 1 each path reduces to the equivalent of one
+/// sequential gemv_auto call against the same weight; per-row outputs
+/// match within FMA-order ε.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn gemv_auto_batched(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated_batch: &GpuTensor,
+    x_plain_batch: &GpuTensor,
+    y: &GpuTensor,
+    m: usize, k: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    match weight.dtype {
+        DType::F32 => gpu.gemm_f32_batched(
+            x_plain_batch, weight, y,
+            batch_size, k, m,
+        ).map_err(|e| format!("gemm_f32_batched: {e:?}")),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            weight, x_plain_batch, y,
+            m, k, batch_size,
+        ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}")),
+        _ => gpu.gemm_hfq4g256(
+            weight, x_rotated_batch, y,
+            m, k, batch_size,
+        ).map_err(|e| format!("gemm_hfq4g256: {e:?}")),
+    }
+}
+
 /// V4F Compressor decode step (phase 3b scaffold — not yet wired).
 ///
 /// Implements the upstream `Compressor.forward` decode case
