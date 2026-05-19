@@ -1658,6 +1658,13 @@ pub const HC_SINKHORN_4X4_BATCHED_SRC: &str =
 pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_split_finalize_batched.hip");
 
+/// SWA visibility staging — BATCHED (Phase B2, 2026-05-18). Per batch
+/// position b at absolute position start_pos+b: builds the visibility
+/// window from the pre-chunk SWA ring + within-chunk KV. Output feeds
+/// v4f_attn_swa_topk_batched / v4f_attn_swa_batched.
+pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

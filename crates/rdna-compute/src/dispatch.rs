@@ -20650,6 +20650,61 @@ impl Gpu {
         }
     }
 
+    /// SWA visibility staging — BATCHED. For each batch position b at
+    /// absolute position `start_pos + b`, build a contiguous visibility
+    /// window from the pre-chunk SWA ring + within-chunk `kv_batch`.
+    /// Output `[B, head_dim, swa_window]` feeds the batched attention
+    /// kernels (v4f_attn_swa_topk_batched / v4f_attn_swa_batched).
+    ///
+    /// Each batch row's effective length is `min(start_pos + b + 1,
+    /// swa_window)`; trailing slots beyond that are left uninitialised
+    /// since the attention kernel masks them via `n_valid_swa_arr[b]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swa_visibility_stage_batched(
+        &mut self,
+        ring: &GpuTensor,          // [head_dim, swa_window] pre-chunk
+        kv_batch: &GpuTensor,      // [B, head_dim] within-chunk
+        staged: &GpuTensor,        // [B, head_dim, swa_window] output
+        start_pos: i32,
+        swa_window: i32,
+        head_dim: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "swa_visibility_stage_batched",
+            kernels::SWA_VISIBILITY_STAGE_BATCHED_SRC,
+            "swa_visibility_stage_batched",
+        )?;
+        let func = &self.functions["swa_visibility_stage_batched"];
+        let rp = ring.buf.as_ptr();
+        let kp = kv_batch.buf.as_ptr();
+        let sp = staged.buf.as_ptr();
+        let mut sp_i = start_pos;
+        let mut sw = swa_window;
+        let mut hd = head_dim;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &rp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut sp_i as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [head_dim as u32, batch_size as u32, 1],
+                [swa_window as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HC split + finalize — BATCHED. Per-batch position: applies
     /// sigmoid to c[b, 0..4] → pre[b], applies post_scale·sigmoid to
     /// c[b, 4..8] → post[b], and copies c[b, 8..24] → comb[b]. Avoids
