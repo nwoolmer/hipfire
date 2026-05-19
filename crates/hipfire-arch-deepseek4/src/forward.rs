@@ -2228,6 +2228,18 @@ pub struct PrefillBatchScratch {
     /// FWHT-rotated wo_a output `[max_batch, n_groups * o_lora_rank]`.
     /// Input to wo_b batched GEMV (MQ4 weight path).
     pub wo_a_out_rot_batch: GpuTensor,
+    // ── FFN-side scratch ──
+    pub ffn_x_rot_batch: GpuTensor,        // [B, hidden]
+    pub ffn_x_plain_batch: GpuTensor,      // [B, hidden]
+    pub ffn_shared_gate_batch: GpuTensor,  // [B, IM]
+    pub ffn_shared_up_batch: GpuTensor,    // [B, IM]
+    pub ffn_shared_rot_batch: GpuTensor,   // [B, IM]
+    pub moe_scores_batch: GpuTensor,       // [B, n_exp]
+    pub moe_topk_indices_batch: GpuTensor, // [B, k_top]  i32-in-F32
+    pub moe_topk_weights_batch: GpuTensor, // [B, k_top]
+    pub moe_gate_batch: GpuTensor,         // [B, k_top, IM]
+    pub moe_up_batch: GpuTensor,           // [B, k_top, IM]
+    pub moe_rot_batch: GpuTensor,          // [B, k_top, IM]
 }
 
 impl PrefillBatchScratch {
@@ -2285,6 +2297,17 @@ impl PrefillBatchScratch {
             attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch")?,
             wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch")?,
             wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch")?,
+            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch")?,
+            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch")?,
+            ffn_shared_gate_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_gate_batch")?,
+            ffn_shared_up_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_up_batch")?,
+            ffn_shared_rot_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_rot_batch")?,
+            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch")?,
+            moe_topk_indices_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_indices_batch")?,
+            moe_topk_weights_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_weights_batch")?,
+            moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch")?,
+            moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch")?,
+            moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch")?,
         })
     }
 }
@@ -2489,6 +2512,154 @@ fn attention_block_batched_swa_only(
             start_pos as i32, batch_size as i32,
         ).map_err(|e| format!("swa_ring_write_batched (v) l{layer_idx}: {e:?}"))?;
     }
+
+    Ok(())
+}
+
+/// Batched FFN: shared expert + routed-expert MoE, end-to-end.
+///
+/// Computes per-batch ffn_out_batch[b, :] = shared_expert(hc_x_in[b])
+/// + (if score-routed) Σ_k topk_w[b,k] · routed_expert_{topk_idx[b,k]}(hc_x_in[b])
+///
+/// Stages:
+///   1. fused_rmsnorm_rotate_mq_batched(hc_x_in → ffn_x_rot)
+///   2. rmsnorm_batched(hc_x_in → ffn_x_plain)
+///   3. gemv_auto_batched(shared_w1, → shared_gate)
+///   4. gemv_auto_batched(shared_w3, → shared_up)
+///   5. v4f_silu_mul_clamp_f32_batched(shared_gate, shared_up → shared_gate)
+///   6. rotate_x_mq_batched(shared_gate → shared_rot)
+///   7. gemv_auto_batched(shared_w2, shared_rot → ffn_out_batch)
+///   8. (score-routed only) gemv_auto_batched(gate.weight, ffn_x_rot → moe_scores)
+///   9. sqrt_softplus_f32 on moe_scores (operates on full [B*n_exp] numel)
+///   10. v4f_moe_topk_bias_aware_batched_f32 → topk_indices, topk_weights
+///   11. v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched → moe_gate, moe_up
+///   12. v4f_silu_mul_clamp_f32_batched(B*k_top streams of MI) → moe_gate
+///   13. rotate_x_mq_batched(B*k_top FWHT rotations) → moe_rot
+///   14. v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched
+///       (atomicAdds routed expert outputs into ffn_out_batch with scale)
+///
+/// Hash-routed layers (layer_idx < num_hash_layers) skip steps 8-14.
+/// V4F's hash routing uses static tid2eid lookup which is skipped at
+/// quant time per the load_weights logic; falls back to shared-only.
+#[allow(dead_code)]
+fn ffn_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let ffn_norm  = layer.ffn_norm.as_ref().unwrap();
+    let shared_w1 = layer.shared_w1.as_ref().unwrap();
+    let shared_w2 = layer.shared_w2.as_ref().unwrap();
+    let shared_w3 = layer.shared_w3.as_ref().unwrap();
+
+    let hidden = cfg.hidden_size;
+    let im = cfg.moe_intermediate_size;
+
+    // 1. Fused RMSNorm + FWHT rotate of hc_x_in_batch → ffn_x_rot_batch.
+    gpu.fused_rmsnorm_rotate_mq_batched(
+        &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_rot_batch,
+        hidden, cfg.rms_norm_eps, batch_size,
+    ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched ffn l{layer_idx}: {e:?}"))?;
+
+    // 1b. Plain RMSNorm → ffn_x_plain_batch.
+    gpu.rmsnorm_batched(
+        &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_plain_batch,
+        batch_size, hidden, cfg.rms_norm_eps,
+    ).map_err(|e| format!("rmsnorm_batched ffn-side l{layer_idx}: {e:?}"))?;
+
+    // 2-3. Shared expert gate + up GEMVs.
+    gemv_auto_batched(
+        gpu, shared_w1, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
+        &pbs.ffn_shared_gate_batch, im, hidden, batch_size,
+    )?;
+    gemv_auto_batched(
+        gpu, shared_w3, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
+        &pbs.ffn_shared_up_batch, im, hidden, batch_size,
+    )?;
+
+    // 4. SwiGLU + clamp. The kernel batches `B` streams of length `n`.
+    gpu.v4f_silu_mul_clamp_f32_batched(
+        &pbs.ffn_shared_gate_batch, &pbs.ffn_shared_up_batch, &pbs.ffn_shared_gate_batch,
+        im, batch_size, cfg.swiglu_limit,
+    ).map_err(|e| format!("v4f_silu_mul_clamp_f32_batched shared l{layer_idx}: {e:?}"))?;
+
+    // 5. FWHT rotate silu output.
+    gpu.rotate_x_mq_batched(
+        &pbs.ffn_shared_gate_batch, &pbs.ffn_shared_rot_batch, im, batch_size,
+    ).map_err(|e| format!("rotate_x_mq_batched shared silu l{layer_idx}: {e:?}"))?;
+
+    // 6. Shared down GEMV → ffn_out_batch.
+    gemv_auto_batched(
+        gpu, shared_w2, &pbs.ffn_shared_rot_batch, &pbs.ffn_shared_gate_batch,
+        &pbs.ffn_out_batch, hidden, im, batch_size,
+    )?;
+
+    // ── Routed-expert MoE ───────────────────────────────────────────
+    let do_routed = std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() == Some("1")
+        && layer_idx >= cfg.num_hash_layers
+        && layer.expert_gate_up_blob.is_some()
+        && layer.expert_w2_blob.is_some();
+    if !do_routed {
+        return Ok(());
+    }
+
+    let gate_w = layer.gate_weight.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
+    let gate_bias = layer.gate_bias.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} gate.bias missing"))?;
+    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
+    let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
+    let n_exp = cfg.n_routed_experts;
+    let k_top = cfg.num_experts_per_tok;
+    let route_scale: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
+
+    // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
+    gemv_auto_batched(
+        gpu, gate_w, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
+        &pbs.moe_scores_batch, n_exp, hidden, batch_size,
+    )?;
+
+    // 9. sqrt_softplus over the full [B, n_exp] buffer. The element-wise
+    //    kernel operates on the GpuTensor's numel — passes batch_size·n_exp.
+    gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
+        .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
+
+    // 10. Bias-aware top-K per batch row.
+    gpu.v4f_moe_topk_bias_aware_batched_f32(
+        &pbs.moe_scores_batch, gate_bias,
+        &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+        n_exp as i32, k_top as i32, route_scale, batch_size as i32,
+    ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
+
+    // 11. Routed expert gate_up (MQ2-Lloyd indexed, position-batched).
+    gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched(
+        gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
+        &pbs.moe_gate_batch, &pbs.moe_up_batch,
+        2 * im, hidden, k_top, batch_size,
+    ).map_err(|e| format!("v4f_gemv_gate_up_batched l{layer_idx}: {e:?}"))?;
+
+    // 12. SwiGLU + clamp over B * k_top streams of length IM.
+    gpu.v4f_silu_mul_clamp_f32_batched(
+        &pbs.moe_gate_batch, &pbs.moe_up_batch, &pbs.moe_gate_batch,
+        im, batch_size * k_top, cfg.swiglu_limit,
+    ).map_err(|e| format!("v4f_silu_mul_clamp_f32_batched routed l{layer_idx}: {e:?}"))?;
+
+    // 13. FWHT rotate B * k_top vectors of length IM.
+    gpu.rotate_x_mq_batched(
+        &pbs.moe_gate_batch, &pbs.moe_rot_batch, im, batch_size * k_top,
+    ).map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
+
+    // 14. Routed expert down with scaled atomicAdd into ffn_out_batch.
+    gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched(
+        w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+        &pbs.moe_rot_batch, &pbs.ffn_out_batch,
+        hidden, im, k_top, batch_size,
+    ).map_err(|e| format!("v4f_gemv_down_batched l{layer_idx}: {e:?}"))?;
 
     Ok(())
 }
@@ -2979,23 +3150,82 @@ pub fn forward_prefill_batch_chunk(
         // hc_attn_mix: integrate attn_out_batch into streams_batch.
         hc_attn_mix_batched(cfg, pbs, gpu, n)?;
 
-        // FFN side: mhc_pre with is_attn=false, then ffn_routed_batched,
-        // then hc_ffn_mix_batched.
+        // FFN side: mhc_pre(is_attn=false) → ffn_batched (shared + routed)
+        // → hc_ffn_mix_batched.
         mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/false, n)?;
-
-        // ── Pending: ffn_routed_batched (V4F MoE position-batched
-        //    GEMV variants don't exist yet) + hc_ffn_mix_batched.
-        return Err(format!(
-            "forward_prefill_batch_chunk: layer {layer_idx} reached FFN — \
-             ffn_routed_batched not yet wired. The V4F MoE GEMV kernels \
-             (v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed, \
-              v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed) \
-             are k_top-batched per single position; need new \
-             _position_batched variants that add an outer B dim."
-        ));
+        ffn_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+        hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
     }
 
     Ok(())
+}
+
+/// Top-level batched-prefill driver — chunks the prompt by max_batch
+/// and dispatches each chunk through `forward_prefill_batch_chunk`.
+///
+/// Returns logits at the LAST position only (matches the qwen35
+/// contract). Falls back to per-token decode_step if any chunk fails
+/// (typically because a layer's compress_ratio path isn't yet wired —
+/// pure-SWA-only for now, mixed-attention layers error out).
+///
+/// **Phase B2 status (2026-05-18):** the chunk-forward path handles
+/// pure-SWA layers (compress_ratio == 0) end-to-end including the
+/// MoE FFN; mixed-attention layers (compress_ratio > 0) still bail
+/// at the indexer chain. Until mixed is wired, this function falls
+/// back to per-token decode_step for any chunk that contains a
+/// mixed-attention layer (i.e. all V4F prompts except the trivial
+/// case where all 43 layers are dense, which doesn't exist).
+#[allow(dead_code)]
+pub fn forward_prefill_batch_chunked(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: u32,
+    pbs: &PrefillBatchScratch,
+) -> Result<Vec<f32>, String> {
+    if tokens.is_empty() {
+        return Err("forward_prefill_batch_chunked: empty tokens".to_string());
+    }
+
+    // Try the chunked batched path. If it fails (mixed-attention layer
+    // not yet wired), fall back to per-token decode_step. The fallback
+    // is byte-identical to current sequential prefill semantics.
+    let mut pos_cursor = start_pos as usize;
+    let mut remaining = tokens;
+    while !remaining.is_empty() {
+        let take = remaining.len().min(pbs.max_batch);
+        let chunk = &remaining[..take];
+        match forward_prefill_batch_chunk(
+            cfg, weights, state, gpu, pbs, chunk, pos_cursor as u32,
+        ) {
+            Ok(()) => {
+                // If this was the last chunk, run the head on the last
+                // batch position.
+                if take == remaining.len() {
+                    return final_norm_and_head_last_batched(
+                        cfg, weights, state, pbs, gpu, take,
+                    );
+                }
+                pos_cursor += take;
+                remaining = &remaining[take..];
+            }
+            Err(_) => {
+                // Chunk failed (mixed-attention layer not wired).
+                // Fall through to per-token decode_step for this and
+                // remaining chunks.
+                let mut last_logits = Vec::new();
+                for (i, &tok) in remaining.iter().enumerate() {
+                    last_logits = decode_step(
+                        cfg, weights, state, gpu, tok, (pos_cursor + i) as u32,
+                    )?;
+                }
+                return Ok(last_logits);
+            }
+        }
+    }
+    Err("forward_prefill_batch_chunked: chunk loop completed without producing logits".to_string())
 }
 
 #[cfg(test)]
