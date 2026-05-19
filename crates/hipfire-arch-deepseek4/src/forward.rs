@@ -2245,7 +2245,9 @@ pub struct PrefillBatchScratch {
 impl PrefillBatchScratch {
     /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
     /// Sizes track the V4F config's hidden_size / q_lora_rank /
-    /// num_attention_heads × head_dim.
+    /// num_attention_heads × head_dim. Prints per-field VRAM cost +
+    /// running total to stderr — gated on `HIPFIRE_V4F_PBS_VRAM=1`
+    /// (default off; on by default for the bench example).
     pub fn new(gpu: &mut Gpu, cfg: &DeepseekV4Config, max_batch: usize) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_rank = cfg.q_lora_rank;
@@ -2253,11 +2255,33 @@ impl PrefillBatchScratch {
         let head_dim = cfg.head_dim;
         let hc_mult = cfg.hc_mult;
 
-        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
+        let log_vram = std::env::var("HIPFIRE_V4F_PBS_VRAM").ok().as_deref() == Some("1");
+        let mut running_bytes: u64 = 0;
+        if log_vram {
+            eprintln!("PrefillBatchScratch::new max_batch={max_batch}");
+            eprintln!("  V4F shape: hidden={hidden}, head_dim={head_dim}, n_heads={n_heads}, q_rank={q_rank}, hc_mult={hc_mult}, n_kv={}, swa={}, idx_topk={}, n_exp={}, k_top={}, IM={}",
+                cfg.num_key_value_heads, cfg.sliding_window, cfg.index_topk,
+                cfg.n_routed_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size);
+        }
+        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str, running: &mut u64, log: bool| -> Result<GpuTensor, String> {
+            let nelem: usize = shape.iter().product();
+            let bytes = (nelem * 4) as u64;
+            *running += bytes;
+            if log {
+                eprintln!("  + {label:<28} {shape:?} = {} MB (cum {} MB)",
+                    bytes / (1024 * 1024), *running / (1024 * 1024));
+            }
             gpu.alloc_tensor(shape, DType::F32)
                 .map_err(|e| format!("PrefillBatchScratch alloc {label}: {e:?}"))
         };
-        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
+        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str, running: &mut u64, log: bool| -> Result<GpuTensor, String> {
+            let nelem: usize = shape.iter().product();
+            let bytes = (nelem * 4) as u64;
+            *running += bytes;
+            if log {
+                eprintln!("  + {label:<28} {shape:?} = {} MB (cum {} MB)",
+                    bytes / (1024 * 1024), *running / (1024 * 1024));
+            }
             gpu.zeros(shape, DType::F32)
                 .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))
         };
@@ -2268,47 +2292,54 @@ impl PrefillBatchScratch {
 
         let kv_dim = cfg.num_key_value_heads * head_dim;
 
-        Ok(Self {
+        let r = &mut running_bytes;
+        let out = Ok(Self {
             max_batch,
-            embed_batch:     alloc(gpu, &[max_batch, hidden], "embed_batch")?,
-            streams_batch:   zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch")?,
-            tokens:          alloc(gpu, &[max_batch], "tokens")?,
-            tmp_batch:       alloc(gpu, &[max_batch, hidden], "tmp_batch")?,
-            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch")?,
-            q_lat_batch:     alloc(gpu, &[max_batch, q_rank], "q_lat_batch")?,
-            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch")?,
-            q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch")?,
+            embed_batch:     alloc(gpu, &[max_batch, hidden], "embed_batch", r, log_vram)?,
+            streams_batch:   zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch", r, log_vram)?,
+            tokens:          alloc(gpu, &[max_batch], "tokens", r, log_vram)?,
+            tmp_batch:       alloc(gpu, &[max_batch, hidden], "tmp_batch", r, log_vram)?,
+            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch", r, log_vram)?,
+            q_lat_batch:     alloc(gpu, &[max_batch, q_rank], "q_lat_batch", r, log_vram)?,
+            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch", r, log_vram)?,
+            q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch", r, log_vram)?,
             q_head_ones,
-            kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
-            positions:       alloc(gpu, &[max_batch], "positions")?,
-            hc_c_batch:      alloc(gpu, &[max_batch, 24], "hc_c_batch")?,
-            hc_pre_batch:    alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch")?,
-            hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch")?,
-            hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch")?,
-            hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch")?,
-            attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch")?,
-            ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch")?,
-            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch")?,
-            swa_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.sliding_window], "swa_staged_batch")?,
-            topk_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.index_topk], "topk_staged_batch")?,
-            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr")?,
-            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr")?,
-            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch")?,
-            attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch")?,
-            wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch")?,
-            wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch")?,
-            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch")?,
-            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch")?,
-            ffn_shared_gate_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_gate_batch")?,
-            ffn_shared_up_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_up_batch")?,
-            ffn_shared_rot_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_rot_batch")?,
-            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch")?,
-            moe_topk_indices_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_indices_batch")?,
-            moe_topk_weights_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_weights_batch")?,
-            moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch")?,
-            moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch")?,
-            moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch")?,
-        })
+            kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch", r, log_vram)?,
+            positions:       alloc(gpu, &[max_batch], "positions", r, log_vram)?,
+            hc_c_batch:      alloc(gpu, &[max_batch, 24], "hc_c_batch", r, log_vram)?,
+            hc_pre_batch:    alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch", r, log_vram)?,
+            hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch", r, log_vram)?,
+            hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch", r, log_vram)?,
+            hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch", r, log_vram)?,
+            attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch", r, log_vram)?,
+            ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch", r, log_vram)?,
+            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch", r, log_vram)?,
+            swa_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.sliding_window], "swa_staged_batch", r, log_vram)?,
+            topk_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.index_topk], "topk_staged_batch", r, log_vram)?,
+            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr", r, log_vram)?,
+            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr", r, log_vram)?,
+            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch", r, log_vram)?,
+            attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch", r, log_vram)?,
+            wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch", r, log_vram)?,
+            wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch", r, log_vram)?,
+            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch", r, log_vram)?,
+            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch", r, log_vram)?,
+            ffn_shared_gate_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_gate_batch", r, log_vram)?,
+            ffn_shared_up_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_up_batch", r, log_vram)?,
+            ffn_shared_rot_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_rot_batch", r, log_vram)?,
+            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch", r, log_vram)?,
+            moe_topk_indices_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_indices_batch", r, log_vram)?,
+            moe_topk_weights_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_weights_batch", r, log_vram)?,
+            moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch", r, log_vram)?,
+            moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch", r, log_vram)?,
+            moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch", r, log_vram)?,
+        });
+        if log_vram {
+            eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
+                running_bytes / (1024 * 1024),
+                (running_bytes as f64) / (1024.0 * 1024.0 * 1024.0));
+        }
+        out
     }
 }
 
