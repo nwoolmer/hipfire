@@ -2202,6 +2202,24 @@ pub struct PrefillBatchScratch {
     /// before it's memcpy'd back into streams_batch. Mirrors the
     /// sequential path's reuse of `state.q` as the mix-output buffer.
     pub streams_out_batch: GpuTensor,
+    /// Per-row visible SWA window `[max_batch, head_dim, swa_window]`
+    /// produced by swa_visibility_stage_batched. V4F has K=V tied so
+    /// one buffer feeds both the K and V args of the attention kernel.
+    pub swa_staged_batch: GpuTensor,
+    /// Per-row top-K K/V gather buffer `[max_batch, head_dim, topk_max]`
+    /// produced by v4f_topk_kv_gather_batched (or the identity variant
+    /// for ratio=128). Same K=V tied semantics.
+    pub topk_staged_batch: GpuTensor,
+    /// Per-row n_valid_swa array `[max_batch]` (i32-in-F32 slots).
+    /// Tells v4f_attn_swa_topk_batched_f32 how many SWA entries are
+    /// valid for each batch row.
+    pub n_valid_swa_arr: GpuTensor,
+    /// Per-row n_active_topk array `[max_batch]` (i32-in-F32 slots).
+    pub n_active_topk_arr: GpuTensor,
+    /// Raw attention output `[max_batch, n_heads, head_dim]`. Output of
+    /// v4f_attn_swa_topk_batched_f32; consumed by inverse RoPE + the
+    /// O-LoRA wo_a/wo_b projection chain.
+    pub attn_out_raw_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2251,6 +2269,11 @@ impl PrefillBatchScratch {
             attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch")?,
             ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch")?,
             streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch")?,
+            swa_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.sliding_window], "swa_staged_batch")?,
+            topk_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.index_topk], "topk_staged_batch")?,
+            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr")?,
+            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr")?,
+            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch")?,
         })
     }
 }
