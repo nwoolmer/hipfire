@@ -20650,6 +20650,53 @@ impl Gpu {
         }
     }
 
+    /// V4F identity gather — BATCHED. For ratio=128 layers without an
+    /// indexer: copies the same `kv_cache[0..K, :]` into every batch
+    /// row's slab. Same shape as v4f_topk_kv_gather_batched_f32 but
+    /// without the per-batch index lookup.
+    #[allow(dead_code)]
+    pub fn v4f_topk_kv_gather_identity_batched_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
+        out: &GpuTensor,         // [B, head_dim, out_stride]
+        k_active: i32,
+        head_dim: i32,
+        out_stride: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_identity_batched",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC,
+            "v4f_topk_kv_gather_identity_batched_f32",
+        )?;
+        let func = &self.functions["v4f_topk_kv_gather_identity_batched_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// SWA ring write — BATCHED. For each batch position b at
     /// `start_pos + b`, writes `kv_batch[b, :]` into the ring at slot
     /// `(start_pos + b) % window`. Called at chunk-end to advance the

@@ -1686,6 +1686,12 @@ pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
 pub const SWA_RING_WRITE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/swa_ring_write_batched.hip");
 
+/// V4F identity gather — BATCHED (Phase B2, 2026-05-18). For ratio=128
+/// layers that lack an indexer: copies kv_cache[0..K, :] into every
+/// batch row's slab.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_identity_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
