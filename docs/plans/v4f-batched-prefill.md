@@ -110,13 +110,30 @@ The hard part. Once these are working, the rest is mechanical.
 
 ### Phase B — Driver + scratch + wiring (4-6 days)
 
-* **B1: `PrefillBatchScratch` struct in `forward.rs`** — pre-allocated GPU tensors sized for the max batch; reused across chunks. ~1 day.
+* **B1: `PrefillBatchScratch` struct** — 🟡 **SCAFFOLD 2026-05-18**
+  - Public struct + `new()` constructor in `forward.rs`. Currently a unit
+    struct (just `max_batch`) — fields grow incrementally as the Phase B2
+    batched chunk forward defines its staging tensor needs.
+  - Rationale for the scaffold approach: defining the full tensor list
+    upfront without a concrete batched body wastes VRAM on tensors we may
+    not need (and risks missing tensors we do need).
 
-* **B2: `forward_prefill_batch_chunk()` function** — single-chunk batched forward pass. Mirrors `decode_step` but for B positions at once. ~3 days.
+* **B2: `forward_prefill_batch_chunk()` function** — pending. Single-chunk
+  batched forward pass. Mirrors `decode_step` but for B positions at once.
 
-* **B3: `forward_prefill_batch()` top-level entry** — chunks the prompt by `max_batch`, calls `_chunk` repeatedly, manages `start_pos` advance. ~1-2 days.
+* **B3: `forward_prefill_batch()` top-level entry** — 🟡 **SCAFFOLD 2026-05-18**
+  - Public entry point in `forward.rs` with stable signature
+    `(cfg, weights, state, gpu, tokens, start_pos, &mut PrefillBatchScratch)
+    → Result<logits, String>`.
+  - Body currently loops `decode_step` per-token (byte-identical to the
+    existing sequential prefill). Callers (eval harnesses, daemon) can
+    wire against this surface while Phase B2 grows the batched body
+    behind it.
+  - Env opt-out planned: `HIPFIRE_V4F_PREFILL_BATCHED=0` to force the
+    per-token path once batched body lands.
 
-* **B4: Integration with existing `decode_step`** — after prefill, decode mode takes over at `start_pos + prompt_len`. ~0.5 day.
+* **B4: Integration with existing `decode_step`** — pending. After prefill,
+  decode mode takes over at `start_pos + prompt_len`. ~0.5 day.
 
 ### Phase C — Correctness validation (2-3 days)
 

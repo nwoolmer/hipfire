@@ -2079,6 +2079,69 @@ fn init_residual_streams(
     Ok(())
 }
 
+/// Reusable per-call scratch for the batched-prefill driver.
+///
+/// **Phase B status (2026-05-18):** scaffold. The struct is intentionally
+/// minimal — the driver currently loops `decode_step` per-token so no
+/// batched scratch tensors are needed yet. Future iterations (Phase B2)
+/// replace the inner per-token loop with `forward_prefill_batch_chunk`,
+/// at which point the struct grows tensors that match the per-layer
+/// batched kernels' staging needs (per-batch SWA / topK K-V slices,
+/// per-batch HC streams, per-batch MoE intermediates, etc).
+///
+/// Keeping the struct minimal until those needs are concrete avoids
+/// allocating tensors we end up not using. Sized to `max_batch`.
+pub struct PrefillBatchScratch {
+    pub max_batch: usize,
+}
+
+impl PrefillBatchScratch {
+    /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
+    /// Currently a placeholder; future phases add GPU tensor fields and
+    /// initialise them here.
+    pub fn new(_gpu: &mut Gpu, _cfg: &DeepseekV4Config, max_batch: usize) -> Result<Self, String> {
+        Ok(Self { max_batch })
+    }
+}
+
+/// Batched-prefill entry point for V4F.
+///
+/// Processes the `tokens` slice starting at absolute KV position
+/// `start_pos`. Returns the logits at the LAST position only (matches
+/// the qwen35 forward_prefill_batch contract).
+///
+/// **Phase B status (2026-05-18):** scaffold. The body falls back to a
+/// per-token `decode_step` loop — byte-identical to the existing
+/// sequential prefill semantics. Phase B2 will replace the loop body
+/// with a `forward_prefill_batch_chunk` call that processes `max_batch`
+/// positions at once using the Phase A batched kernels (A1: SWA-topK,
+/// A2: SWA, A3: indexer top-K, A5: HC mix).
+///
+/// The entry-point shape is finalised now so callers (eval harnesses,
+/// daemon, eventual prefill API) can wire against the stable signature
+/// while the inner batched body grows behind it. `HIPFIRE_V4F_PREFILL_BATCHED=0`
+/// will force the per-token fallback path once batching lands.
+pub fn forward_prefill_batch(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: u32,
+    _scratch: &mut PrefillBatchScratch,
+) -> Result<Vec<f32>, String> {
+    if tokens.is_empty() {
+        return Err("forward_prefill_batch: empty tokens slice".to_string());
+    }
+    // Per-token fallback. Future Phase B2 chunks the loop into
+    // forward_prefill_batch_chunk calls of up to `_scratch.max_batch`.
+    let mut last_logits = Vec::new();
+    for (i, &tok) in tokens.iter().enumerate() {
+        last_logits = decode_step(cfg, weights, state, gpu, tok, start_pos + i as u32)?;
+    }
+    Ok(last_logits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
