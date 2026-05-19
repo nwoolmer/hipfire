@@ -2172,6 +2172,25 @@ pub struct PrefillBatchScratch {
     /// rope_tail_*_batched kernels read it as i32). Uploaded once per
     /// chunk: positions[b] = start_pos + b.
     pub positions: GpuTensor,
+    /// HC control vector `[max_batch, 24]` — output of hc_compute_control
+    /// _batched, in-place rescaled by hc_apply_alpha_batched, then split
+    /// into pre/post/comb by hc_split_finalize_batched.
+    pub hc_c_batch: GpuTensor,
+    /// HC `pre` weights `[max_batch, hc_mult=4]`. Used by
+    /// hc_input_map_4stream_batched and hc_mix_4stream_batched.
+    pub hc_pre_batch: GpuTensor,
+    /// HC `post` weights `[max_batch, hc_mult=4]`. Scale-multiplied
+    /// sigmoid output. Feeds hc_mix_4stream_batched as the per-stream
+    /// scale.
+    pub hc_post_batch: GpuTensor,
+    /// HC `comb` matrix `[max_batch, 4, 4]` — Sinkhorn-normalised to be
+    /// doubly stochastic per batch row.
+    pub hc_comb_batch: GpuTensor,
+    /// HC transform input `[max_batch, hidden]` — output of mhc_pre's
+    /// hc_input_map_4stream_batched. Feeds q_lora_batched / kv_joint
+    /// _batched on the attention side, and the FFN gate/up on the FFN
+    /// side.
+    pub hc_x_in_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2213,8 +2232,90 @@ impl PrefillBatchScratch {
             q_head_ones,
             kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
             positions:       alloc(gpu, &[max_batch], "positions")?,
+            hc_c_batch:      alloc(gpu, &[max_batch, 24], "hc_c_batch")?,
+            hc_pre_batch:    alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch")?,
+            hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch")?,
+            hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch")?,
+            hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch")?,
         })
     }
+}
+
+/// Batched twin of `mhc_pre` for Phase B2 chunk forward.
+///
+/// Per batch position b, after this returns:
+///   pbs.hc_pre_batch[b, :]  = sigmoid(c[b, 0..4])
+///   pbs.hc_post_batch[b, :] = post_scale * sigmoid(c[b, 4..8])
+///   pbs.hc_comb_batch[b, :, :] = Sinkhorn(c[b, 8..24])
+///   pbs.hc_x_in_batch[b, :] = sum_h hc_pre_batch[b, h] · streams[b, h, :]
+///
+/// where c is the post-α-rescale control vector. The split into separate
+/// pre/post/comb buffers avoids strided sigmoid_f32 calls on the [B, 24]
+/// layout (per-row segments are not memory-contiguous).
+///
+/// `is_attn` selects attn-side vs FFN-side W_fn / base / scale.
+/// `HIPFIRE_V4F_POST_SCALE` env override (default 1.5) is honoured.
+#[allow(dead_code)]
+fn mhc_pre_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    is_attn: bool,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let (hc_fn, hc_base, hc_scale) = if is_attn {
+        (
+            layer.hc_attn_fn.as_ref().unwrap(),
+            layer.hc_attn_base.as_ref().unwrap(),
+            layer.hc_attn_scale.as_ref().unwrap(),
+        )
+    } else {
+        (
+            layer.hc_ffn_fn.as_ref().unwrap(),
+            layer.hc_ffn_base.as_ref().unwrap(),
+            layer.hc_ffn_scale.as_ref().unwrap(),
+        )
+    };
+
+    let n_ctrl = 24usize;
+    let x_dim = cfg.hidden_size * cfg.hc_mult;
+    let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
+
+    // 1. c = streams · W_fn · rsqrt(mean) + base. Per-batch.
+    gpu.hc_compute_control_batched(
+        &pbs.streams_batch, hc_fn, hc_base, &pbs.hc_c_batch,
+        n_ctrl as i32, x_dim as i32, batch_size as i32,
+    ).map_err(|e| format!("hc_compute_control_batched l{layer_idx}: {e:?}"))?;
+
+    // 2. α-rescale c in place per batch.
+    gpu.hc_apply_alpha_batched(
+        &pbs.hc_c_batch, hc_scale, hc_base, batch_size as i32,
+    ).map_err(|e| format!("hc_apply_alpha_batched l{layer_idx}: {e:?}"))?;
+
+    // 3. Split c[B, 24] → contiguous pre[B, 4] / post[B, 4] / comb[B, 16]
+    //    with sigmoid on pre, post_scale·sigmoid on post.
+    gpu.hc_split_finalize_batched(
+        &pbs.hc_c_batch, &pbs.hc_pre_batch, &pbs.hc_post_batch, &pbs.hc_comb_batch,
+        post_scale, batch_size as i32,
+    ).map_err(|e| format!("hc_split_finalize_batched l{layer_idx}: {e:?}"))?;
+
+    // 4. Sinkhorn-normalize comb[B, 4, 4] in place per batch.
+    gpu.hc_sinkhorn_4x4_batched(
+        &pbs.hc_comb_batch, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32,
+        batch_size as i32,
+    ).map_err(|e| format!("hc_sinkhorn_4x4_batched l{layer_idx}: {e:?}"))?;
+
+    // 5. Input mapping: hc_x_in[b, d] = sum_h pre[b, h] · streams[b, h, d].
+    gpu.hc_input_map_4stream_batched(
+        &pbs.hc_pre_batch, &pbs.streams_batch, &pbs.hc_x_in_batch,
+        cfg.hidden_size as i32, batch_size as i32,
+    ).map_err(|e| format!("hc_input_map_4stream_batched l{layer_idx}: {e:?}"))?;
+
+    Ok(())
 }
 
 /// Batched twin of `apply_tail_rope` for Phase B2 chunk forward.

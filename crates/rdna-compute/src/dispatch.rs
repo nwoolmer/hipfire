@@ -20650,6 +20650,93 @@ impl Gpu {
         }
     }
 
+    /// HC split + finalize — BATCHED. Per-batch position: applies
+    /// sigmoid to c[b, 0..4] → pre[b], applies post_scale·sigmoid to
+    /// c[b, 4..8] → post[b], and copies c[b, 8..24] → comb[b]. Avoids
+    /// strided sigmoid_f32 launches on the [B, 24] layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_split_finalize_batched(
+        &mut self,
+        c: &GpuTensor,        // [B, 24]
+        pre: &GpuTensor,      // [B, 4]
+        post: &GpuTensor,     // [B, 4]
+        comb: &GpuTensor,     // [B, 16]
+        post_scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_split_finalize_batched",
+            kernels::HC_SPLIT_FINALIZE_BATCHED_SRC,
+            "hc_split_finalize_batched",
+        )?;
+        let func = &self.functions["hc_split_finalize_batched"];
+        let cp = c.buf.as_ptr();
+        let prp = pre.buf.as_ptr();
+        let pop = post.buf.as_ptr();
+        let cop = comb.buf.as_ptr();
+        let mut ps = post_scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &prp as *const _ as *mut c_void,
+            &pop as *const _ as *mut c_void,
+            &cop as *const _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [24, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HC Sinkhorn 4×4 — BATCHED. Per-batch independent Sinkhorn
+    /// iterations on each 4×4 matrix slot at `matrix[b * 16..]`. Byte-
+    /// identical to `hc_sinkhorn_4x4` at batch_size == 1.
+    #[allow(dead_code)]
+    pub fn hc_sinkhorn_4x4_batched(
+        &mut self,
+        matrix: &GpuTensor,
+        eps: f32,
+        iters: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_sinkhorn_4x4_batched",
+            kernels::HC_SINKHORN_4X4_BATCHED_SRC,
+            "hc_sinkhorn_4x4_batched",
+        )?;
+        let func = &self.functions["hc_sinkhorn_4x4_batched"];
+        let m_ptr = matrix.buf.as_ptr();
+        let mut eps_v = eps;
+        let mut iters_v = iters;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &m_ptr as *const _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut iters_v as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [1, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HC α-scaling — BATCHED. Per-batch in-place rescale of c[b, 0..24]
     /// using the shared 3-segment α + base. Byte-identical to
     /// `hc_apply_alpha` at batch_size == 1.

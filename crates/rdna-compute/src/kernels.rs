@@ -1647,6 +1647,17 @@ pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
 pub const HC_APPLY_ALPHA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_apply_alpha_batched.hip");
 
+/// HC Sinkhorn 4×4 — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// independent Sinkhorn iterations on each 4×4 matrix slot.
+pub const HC_SINKHORN_4X4_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_sinkhorn_4x4_batched.hip");
+
+/// HC split/finalize — BATCHED (Phase B2, 2026-05-18). Splits the
+/// post-α-rescale c[B, 24] into contiguous pre/post/comb buffers with
+/// sigmoid + scale already applied. Avoids strided sigmoid_f32 calls.
+pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_split_finalize_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
