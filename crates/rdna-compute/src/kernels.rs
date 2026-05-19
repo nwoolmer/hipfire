@@ -1688,3 +1688,13 @@ pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
 /// sequential indexer_top_k at batch=1.
 pub const INDEXER_TOP_K_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_batched.hip");
+
+/// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
+/// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.
+pub const HC_MIX_4STREAM_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_mix_4stream_batched.hip");
+
+/// HC input mapping — BATCHED (Phase A5, 2026-05-18). Twin of
+/// HC_INPUT_MAP_SRC; batch dim parallelizes cleanly across blockIdx.y.
+pub const HC_INPUT_MAP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map_batched.hip");

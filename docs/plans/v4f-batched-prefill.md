@@ -89,13 +89,24 @@ The hard part. Once these are working, the rest is mechanical.
   - Grid `[n_idx_heads, batch, 1]`; reuses the existing single-thread-per-head stub strategy
   - Test: `test_indexer_top_k_batched` — 0 mismatches at B=1/4/32 ✓
 
-* **A4: `compressor_commit_batched.hip`** (~1 day)
-  - Conditional row-write to compressed cache based on `(pos % ratio == ratio - 1)`
-  - Some batch positions trigger, others don't
+* **A4: `compressor_commit_batched.hip`** — **DEFERRED, low-priority** (2026-05-18)
+  - Analysis: the compressor commit path is two operations:
+    1. Per-step kv_state write (always) — single proj_dim memcpy into a ring slot
+    2. Conditional pool + rmsnorm + rope (every `ratio` positions) — multi-kernel sequence
+  - Each commit is small. For B=32, ratio=4: ~8 conditional commits + 32 ring-slot writes
+    per layer per side. Total: ~80 small kernel launches per chunk-per-layer for compressor
+    work, but no single one is a hot kernel.
+  - Decision: don't batch the kernel — instead, loop the compressor sequence sequentially
+    in the Phase B driver per (batch_row → commit-boundary) call. Adds modest launch
+    overhead but is a tiny fraction of total batched-prefill cost (attention + MoE FFN
+    dominate). Revisit only if Phase D profiling shows compressor as a bottleneck.
 
-* **A5: HC ops batched** (~2 days)
+* **A5: HC ops batched** ✅ **DONE 2026-05-18** (~half a day, smaller than estimated)
   - `hc_mix_4stream_batched`, `hc_input_map_4stream_batched`
-  - Both are per-position 4-stream transforms; batch dim parallelizes cleanly
+  - Per-position 4-stream transforms; batch dim parallelizes cleanly. The plan's
+    earlier risk note about per-position state was about `mhc_pre()` (the upstream
+    computation that produces `a_vec` / `A` / `scale`), not these leaf kernels.
+  - Test: `test_hc_batched` — byte-equality at B=1/4/32 for both ✓
 
 ### Phase B — Driver + scratch + wiring (4-6 days)
 

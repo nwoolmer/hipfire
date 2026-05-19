@@ -20677,6 +20677,98 @@ impl Gpu {
         }
     }
 
+    /// Phase A5 — Batched HC input mapping. Per batch position b:
+    /// `x_out[b, d] = sum_s(a_vec[b, s] * streams[b, s, d])`.
+    /// At batch_size == 1, byte-identical to hc_input_map_4stream.
+    #[allow(dead_code)]
+    pub fn hc_input_map_4stream_batched(
+        &mut self,
+        a_vec: &GpuTensor,    // [batch, HC_MULT]
+        streams: &GpuTensor,  // [batch, HC_MULT, hidden]
+        x_out: &GpuTensor,    // [batch, hidden]
+        hidden: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_input_map_4stream_batched",
+            kernels::HC_INPUT_MAP_BATCHED_SRC,
+            "hc_input_map_4stream_batched",
+        )?;
+        let func = &self.functions["hc_input_map_4stream_batched"];
+        let ap = a_vec.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let op = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, batch_size as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Phase A5 — Batched HC 4-stream residual mix. Per batch position b:
+    /// `x_out[b, s, d] = sum_t(A[b, s, t] * x_in[b, t, d]) + scale[b, s] * transform_out[b, d]`.
+    /// At batch_size == 1, byte-identical to hc_mix_4stream.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hc_mix_4stream_batched(
+        &mut self,
+        x_in: &GpuTensor,            // [batch, 4, hidden]
+        a_matrix: &GpuTensor,        // [batch, 4, 4]
+        scale: &GpuTensor,           // [batch, 4]
+        transform_out: &GpuTensor,   // [batch, hidden]
+        x_out: &GpuTensor,           // [batch, 4, hidden]
+        hidden: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_mix_4stream_batched",
+            kernels::HC_MIX_4STREAM_BATCHED_SRC,
+            "hc_mix_4stream_batched",
+        )?;
+        let func = &self.functions["hc_mix_4stream_batched"];
+        let xi  = x_in.buf.as_ptr();
+        let am  = a_matrix.buf.as_ptr();
+        let sc  = scale.buf.as_ptr();
+        let to  = transform_out.buf.as_ptr();
+        let xo  = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &xi as *const _ as *mut c_void,
+            &am as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &to as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, 4, batch_size as u32],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase 4 — Tail-only partial RoPE (V4F's last 64 of 512 head_dim).
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn rope_tail_halfsplit(
