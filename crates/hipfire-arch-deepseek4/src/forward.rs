@@ -44,17 +44,43 @@ fn gemv_auto(
     m: usize, k: usize,
 ) -> Result<(), String> {
     // Dispatch by GpuTensor.dtype (set by upload_quant_or_f16):
-    //   F32  — F16-source weight, decoded at upload. Use plain input.
+    //   F32  — F16-source weight, decoded at upload (legacy decode-only path).
+    //   F16  — F16-source kept native. Uses gemm_f16_x_f16_wmma at B=1.
     //   Q8_0 — Q8F16-source (antirez attn/shared quant). Use plain input.
     //   else (Raw) — MQ4G256 default. Use FWHT-rotated input.
     match weight.dtype {
         DType::F32 => gpu.gemv_f32(weight, x_plain, y)
             .map_err(|e| format!("gemv_f32: {e:?}")),
+        DType::F16 => gemv_f16_x_decode(gpu, weight, x_plain, y, m, k),
         DType::Q8_0 => gpu.gemv_q8_0(weight, x_plain, y, m, k)
             .map_err(|e| format!("gemv_q8_0: {e:?}")),
         _ => gpu.gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
             .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}")),
     }
+}
+
+/// F16-weight single-token decode: F32 input → F16 (small scratch),
+/// then `gemm_f16_x_f16_wmma` at B=1. The WMMA tile shape is 16×16
+/// so even at B=1 the grid is M/16; not as bandwidth-saturating as
+/// the prefill path but still strictly faster than gemv_f32 on
+/// F16-source weights because we read half the weight bytes.
+///
+/// Allocates a per-call scratch — fine for decode latency since
+/// decode-step inputs are O(K) floats.
+fn gemv_f16_x_decode(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_plain: &GpuTensor,
+    y: &GpuTensor,
+    m: usize, k: usize,
+) -> Result<(), String> {
+    // Scratch lives for this call only — k floats.
+    let scratch = gpu.alloc_tensor(&[k], DType::F16)
+        .map_err(|e| format!("gemv_f16 scratch alloc: {e:?}"))?;
+    gpu.convert_f32_to_f16(x_plain, &scratch, k as i64)
+        .map_err(|e| format!("gemv_f16 convert: {e:?}"))?;
+    gpu.gemm_f16_x_f16_wmma(weight, &scratch, y, m, k, 1)
+        .map_err(|e| format!("gemv_f16 wmma: {e:?}"))
 }
 
 /// Batched twin of `gemv_auto` for Phase B2 chunk forward.
@@ -110,9 +136,20 @@ fn gemv_auto_batched_wmma(
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
     match weight.dtype {
-        DType::F32 => gpu.gemm_f32_register_tiled(
-            weight, x_plain_batch, y, m, k, batch_size,
-        ).map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
+        DType::F32 => {
+            if std::env::var("HIPFIRE_V4F_F32_TRACE").is_ok() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let c = N.fetch_add(1, Ordering::Relaxed);
+                if c < 8 {
+                    eprintln!("[F32_TRACE #{c}] m={m} k={k} B={batch_size} weight.shape={:?}",
+                        weight.shape);
+                }
+            }
+            gpu.gemm_f32_register_tiled(
+                weight, x_plain_batch, y, m, k, batch_size,
+            ).map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
+        },
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             weight, x_plain_batch, y, m, k, batch_size,
         ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}")),

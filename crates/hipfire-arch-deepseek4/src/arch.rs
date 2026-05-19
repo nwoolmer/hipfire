@@ -72,7 +72,32 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         if info.quant_type == 1 {
-            // F16 source → decode to F32 on upload.
+            // F16 source: KEEP F16 on device (no F32 decode). Forward
+            // routes F16 weights through `gemm_f16_x_f16_wmma` in the
+            // batched path and a thin convert+WMMA wrapper in the
+            // single-decode path — both ~10–25× faster than the old
+            // F32-decoded scalar GEMM.
+            // Opt out with HIPFIRE_V4F_F16_DECODE=1 to restore the old
+            // F32 dispatch (used as escape hatch if WMMA hurts quality
+            // on a future model variant; PPL re-sweep needed before
+            // setting this in production).
+            if std::env::var("HIPFIRE_V4F_F16_DECODE").map(|s| s == "1").unwrap_or(false) {
+                let n: usize = shape.iter().product();
+                if bytes.len() != n * 2 {
+                    return Err(format!(
+                        "deepseek4: '{name}' marked F16 but byte size {} != 2 × {n}",
+                        bytes.len()
+                    ));
+                }
+                let f32_vals: Vec<f32> = (0..n).map(|i| {
+                    let lo = bytes[i * 2];
+                    let hi = bytes[i * 2 + 1];
+                    hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
+                }).collect();
+                return gpu.upload_f32(&f32_vals, &shape)
+                    .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"));
+            }
+            // F16-native path: upload raw F16 bytes, tag dtype.
             let n: usize = shape.iter().product();
             if bytes.len() != n * 2 {
                 return Err(format!(
@@ -80,17 +105,11 @@ impl DeepseekV4 {
                     bytes.len()
                 ));
             }
-            let f32_vals: Vec<f32> = (0..n).map(|i| {
-                let lo = bytes[i * 2];
-                let hi = bytes[i * 2 + 1];
-                hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([lo, hi]))
-            }).collect();
-            return gpu.upload_f32(&f32_vals, &shape)
-                .map_err(|e| format!("deepseek4: upload f16→f32 '{name}' failed: {e:?}"));
+            let mut t = gpu.upload_raw(bytes, &shape)
+                .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
+            t.dtype = rdna_compute::DType::F16;
+            return Ok(t);
         }
-        // Q8F16 (quant_type=3) or MQ4G256 (quant_type=13) and other 2D
-        // quants: upload raw, then tag the GpuTensor dtype so forward.rs
-        // can dispatch the right GEMV kernel.
         let mut t = gpu.upload_raw(bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
         if info.quant_type == 3 {
