@@ -6115,6 +6115,172 @@ mod gptq_damping_probe {
         eprintln!("  Weight-norm-proxy Lloyd      MSE = {proxy_mse:.6e}  ({delta:+.2}% vs uniform)");
     }
 
+    /// Quantize via Lloyd WITHOUT the FWHT step — Lloyd applied directly
+    /// to the natural (pre-rotation) weight distribution. Same 4-codepoint
+    /// codebook + 2-bit indices.
+    fn quantize_mq2g256_lloyd_no_fwht(f32_data: &[f32]) -> Vec<u8> {
+        use rayon::prelude::*;
+        let group_size = 256;
+        let block_bytes = 72;
+        let n = f32_data.len();
+        let n_blocks = (n + group_size - 1) / group_size;
+        let mut output = vec![0u8; n_blocks * block_bytes];
+        output.par_chunks_mut(block_bytes).enumerate().for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            // NO FWHT — Lloyd directly on natural distribution.
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let mut cb: [f32; 4] = [
+                percentile(0.125), percentile(0.375),
+                percentile(0.625), percentile(0.875),
+            ];
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 16;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 4];
+                    let mut counts = [0u32; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..4 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            }
+            let mut order: [usize; 4] = [0, 1, 2, 3];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 4];
+            let mut inv: [u8; 4] = [0; 4];
+            for new_idx in 0..4 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+        output
+    }
+
+    fn dequant_mq2_no_fwht(data: &[u8], n_weights: usize) -> Vec<f32> {
+        let group_size = 256;
+        let block_bytes = 72;
+        let n_blocks = (n_weights + group_size - 1) / group_size;
+        let mut out = vec![0.0f32; n_weights];
+        for b in 0..n_blocks {
+            let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+            let cb: [f32; 4] = [
+                f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+                f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+                f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+                f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+            ];
+            for i in 0..64 {
+                let bv = blk[8 + i];
+                for j in 0..4 {
+                    let global_i = b * 256 + 4 * i + j;
+                    if global_i < n_weights {
+                        let idx = (bv >> (j * 2)) & 0x3;
+                        out[global_i] = cb[idx as usize];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fwht_value_audit() {
+        // Hypothesis: FWHT-rotation makes Lloyd more accurate because the
+        // rotation decorrelates weights toward a Gaussian distribution, and
+        // Lloyd's 4 codepoints are MSE-optimal for Gaussian.
+        //
+        // Test: quantize the SAME synthetic distribution two ways:
+        //   A) Lloyd with FWHT (production path)
+        //   B) Lloyd without FWHT (natural distribution)
+        // Compute MSE for each. If FWHT wins consistently, the rotation is
+        // earning its complexity. If they're close, dropping FWHT unblocks
+        // proper imatrix integration (per
+        // project_lloyd_imatrix_fwht_channel_mixing).
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        let cases: &[(&str, Box<dyn Fn() -> Vec<f32>>)] = &[
+            ("Gaussian 16x256",
+                Box::new(|| gaussian_samples(16 * 256, 0xc001cafe))),
+            ("Heavy-tailed 16x256", Box::new(|| {
+                let mut htw = gaussian_samples(16 * 256, 0xfeed);
+                let tail = gaussian_samples((16 * 256) / 20, 0xbeef);
+                for (i, t) in tail.iter().enumerate() { htw[i * 20] = t * 3.0; }
+                htw
+            })),
+            ("Sparse + outliers 16x256", Box::new(|| {
+                let mut sw = gaussian_samples(16 * 256, 0x5_a55e);
+                for v in sw.iter_mut() { *v *= 0.1; }
+                for i in 0..(16 * 256 / 20) { sw[i * 20] *= 30.0; }
+                sw
+            })),
+            ("Bimodal (50% near -1, 50% near +1)", Box::new(|| {
+                let mut bw = gaussian_samples(16 * 256, 0xb1ba1);
+                for (i, v) in bw.iter_mut().enumerate() {
+                    *v = 0.3 * *v + if i % 2 == 0 { -1.0 } else { 1.0 };
+                }
+                bw
+            })),
+        ];
+
+        eprintln!("\n=== FWHT value audit ===");
+        eprintln!("{:35} {:>14} {:>14} {:>10}",
+            "distribution", "fwht MSE", "no-fwht MSE", "fwht win %");
+        for (label, gen) in cases {
+            let w = gen();
+            let n = w.len();
+            let fwht_bytes = quantize_mq2g256_lloyd(&w, &signs1, &signs2);
+            let fwht_recon = dequantize_mq2g256_lloyd_to_f32(&fwht_bytes, n, &signs1, &signs2);
+            let fwht_mse = mse(&w, &fwht_recon);
+            let nofwht_bytes = quantize_mq2g256_lloyd_no_fwht(&w);
+            let nofwht_recon = dequant_mq2_no_fwht(&nofwht_bytes, n);
+            let nofwht_mse = mse(&w, &nofwht_recon);
+            let win_pct = ((nofwht_mse - fwht_mse) / nofwht_mse) * 100.0;
+            eprintln!("{:35} {:14.6e} {:14.6e} {:+9.2}%",
+                label, fwht_mse, nofwht_mse, win_pct);
+        }
+    }
+
     #[test]
     fn weight_norm_proxy_imatrix_sweep() {
         // Generate synthetic [m, k] matrices that mimic V4F's expert
