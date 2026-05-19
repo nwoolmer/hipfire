@@ -2129,27 +2129,216 @@ fn init_residual_streams(
 
 /// Reusable per-call scratch for the batched-prefill driver.
 ///
-/// **Phase B status (2026-05-18):** scaffold. The struct is intentionally
-/// minimal — the driver currently loops `decode_step` per-token so no
-/// batched scratch tensors are needed yet. Future iterations (Phase B2)
-/// replace the inner per-token loop with `forward_prefill_batch_chunk`,
-/// at which point the struct grows tensors that match the per-layer
-/// batched kernels' staging needs (per-batch SWA / topK K-V slices,
-/// per-batch HC streams, per-batch MoE intermediates, etc).
+/// **Phase B status (2026-05-18):** growing. Currently holds the
+/// per-layer batched intermediates needed by `q_lora_batched`. Future
+/// per-stage batched helpers (kv_joint_batched, attn_batched,
+/// ffn_batched, hc_mix_batched) extend this struct as they land.
 ///
-/// Keeping the struct minimal until those needs are concrete avoids
-/// allocating tensors we end up not using. Sized to `max_batch`.
+/// Sized to `max_batch` rows everywhere; tensors are reused across
+/// per-chunk layer iterations.
 pub struct PrefillBatchScratch {
     pub max_batch: usize,
+    /// Embedding-lookup output `[max_batch, hidden]`. Source for the
+    /// HC stream-broadcast init at chunk start.
+    pub embed_batch: GpuTensor,
+    /// HC residual streams `[max_batch, hc_mult, hidden]`. Lives across
+    /// the full per-layer loop within a chunk.
+    pub streams_batch: GpuTensor,
+    /// Token-ids buffer feeding `embedding_lookup_q8_batched`.
+    /// `[max_batch]` stored as F32 (same i32-in-F32-slots dtype-cosmetic
+    /// pattern as qwen35's `pbs.tokens`).
+    pub tokens: GpuTensor,
+    /// FWHT-rotated attn_norm output `[max_batch, hidden]` feeding MQ4
+    /// non-expert GEMMs.
+    pub tmp_batch: GpuTensor,
+    /// Plain attn_norm output `[max_batch, hidden]` feeding F32/Q8
+    /// non-expert GEMMs.
+    pub tmp_plain_batch: GpuTensor,
+    /// Q-LoRA bottleneck `[max_batch, q_lora_rank]`. Reused: wq_a output
+    /// → q_norm in place → fed to wq_b (after rotate into q_lat_rot_batch).
+    pub q_lat_batch: GpuTensor,
+    /// FWHT-rotated q_lat for the MQ4 wq_b path `[max_batch, q_lora_rank]`.
+    pub q_lat_rot_batch: GpuTensor,
+    /// Q output `[max_batch, n_heads, head_dim]`. wq_b output, then
+    /// per-(batch, head) RMSNormed by `q_head_ones`.
+    pub q_batch: GpuTensor,
+    /// Per-head ones vector `[head_dim]` reused as the rmsnorm weight
+    /// for the per-(batch, head) Q normalisation. Shared across batch.
+    pub q_head_ones: GpuTensor,
+    /// Joint KV `[max_batch, kv_dim]` where `kv_dim = n_kv_heads * head_dim`.
+    /// wkv output, then kv_norm RMSNormed in place.
+    pub kv_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
     /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
-    /// Currently a placeholder; future phases add GPU tensor fields and
-    /// initialise them here.
-    pub fn new(_gpu: &mut Gpu, _cfg: &DeepseekV4Config, max_batch: usize) -> Result<Self, String> {
-        Ok(Self { max_batch })
+    /// Sizes track the V4F config's hidden_size / q_lora_rank /
+    /// num_attention_heads × head_dim.
+    pub fn new(gpu: &mut Gpu, cfg: &DeepseekV4Config, max_batch: usize) -> Result<Self, String> {
+        let hidden = cfg.hidden_size;
+        let q_rank = cfg.q_lora_rank;
+        let n_heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        let hc_mult = cfg.hc_mult;
+
+        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
+            gpu.alloc_tensor(shape, DType::F32)
+                .map_err(|e| format!("PrefillBatchScratch alloc {label}: {e:?}"))
+        };
+        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
+            gpu.zeros(shape, DType::F32)
+                .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))
+        };
+
+        let ones_host = vec![1.0f32; head_dim];
+        let q_head_ones = gpu.upload_f32(&ones_host, &[head_dim])
+            .map_err(|e| format!("PrefillBatchScratch upload q_head_ones: {e:?}"))?;
+
+        let kv_dim = cfg.num_key_value_heads * head_dim;
+
+        Ok(Self {
+            max_batch,
+            embed_batch:     alloc(gpu, &[max_batch, hidden], "embed_batch")?,
+            streams_batch:   zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch")?,
+            tokens:          alloc(gpu, &[max_batch], "tokens")?,
+            tmp_batch:       alloc(gpu, &[max_batch, hidden], "tmp_batch")?,
+            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch")?,
+            q_lat_batch:     alloc(gpu, &[max_batch, q_rank], "q_lat_batch")?,
+            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch")?,
+            q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch")?,
+            q_head_ones,
+            kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
+        })
     }
+}
+
+/// Batched twin of `kv_joint` for Phase B2 chunk forward.
+///
+/// Per batch position b:
+///   kv[b] = wkv @ {tmp[b] or tmp_plain[b]}   (gemv_auto_batched)
+///   kv[b] = RMSNorm(kv[b], kv_norm)          (in-place)
+///
+/// Reuses pbs.tmp_batch / pbs.tmp_plain_batch produced by q_lora_batched
+/// in the same layer iteration. Writes pbs.kv_batch.
+#[allow(dead_code)]
+fn kv_joint_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let wkv = layer.wkv.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
+    let kv_norm = layer.kv_norm.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
+    let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+
+    // wkv @ tmp → kv.
+    gemv_auto_batched(
+        gpu, wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch, &pbs.kv_batch,
+        kv_dim, cfg.hidden_size, batch_size,
+    )?;
+
+    // kv_norm RMSNorm in-place: batch x [kv_dim].
+    gpu.rmsnorm_batched(
+        &pbs.kv_batch, kv_norm, &pbs.kv_batch,
+        batch_size, kv_dim, cfg.rms_norm_eps,
+    ).map_err(|e| format!("kv_norm rmsnorm_batched l{layer_idx}: {e:?}"))?;
+
+    Ok(())
+}
+
+/// Batched twin of `q_lora` for Phase B2 chunk forward.
+///
+/// Per batch position b:
+///   tmp[b] = FWHT(RMSNorm(hc_x_in[b], attn_norm))
+///   tmp_plain[b] = RMSNorm(hc_x_in[b], attn_norm)
+///   q_lat[b] = wq_a @ {tmp[b] or tmp_plain[b]}  (gemv_auto_batched)
+///   q_lat[b] = RMSNorm(q_lat[b], q_norm)        (in-place per row)
+///   q_lat_rot[b] = FWHT(q_lat[b])
+///   q[b] = wq_b @ {q_lat_rot[b] or q_lat[b]}    (gemv_auto_batched)
+///   q[b, head] = RMSNorm(q[b, head], q_head_ones) for each head  (per-head)
+///
+/// All seven steps stay in lockstep across the B positions by riding the
+/// existing `*_batched` kernels. The per-head Q normalisation at the end
+/// flattens `[B, n_heads, head_dim]` into `B * n_heads` rows of head_dim
+/// elements before calling `rmsnorm_batched`.
+///
+/// Honours `HIPFIRE_V4F_SKIP_QHN=1` for the per-head Q rmsnorm (matches
+/// the sequential bisect-escape hatch).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn q_lora_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    pbs: &PrefillBatchScratch,
+    hc_x_in_batch: &GpuTensor,   // [B, hidden]
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let attn_norm = layer.attn_norm.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_norm missing"))?;
+    let q_norm = layer.q_norm.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} q_norm missing"))?;
+    let wq_a = layer.wq_a.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_a missing"))?;
+    let wq_b = layer.wq_b.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_b missing"))?;
+
+    let hidden = cfg.hidden_size;
+    let q_rank = cfg.q_lora_rank;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+
+    // 1. Fused RMSNorm + FWHT-rotate batched: hc_x_in_batch → tmp_batch.
+    gpu.fused_rmsnorm_rotate_mq_batched(
+        hc_x_in_batch, attn_norm, &pbs.tmp_batch,
+        hidden, cfg.rms_norm_eps, batch_size,
+    ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched l{layer_idx}: {e:?}"))?;
+
+    // 1b. Plain RMSNorm batched: hc_x_in_batch → tmp_plain_batch.
+    gpu.rmsnorm_batched(
+        hc_x_in_batch, attn_norm, &pbs.tmp_plain_batch,
+        batch_size, hidden, cfg.rms_norm_eps,
+    ).map_err(|e| format!("rmsnorm_batched attn-side plain l{layer_idx}: {e:?}"))?;
+
+    // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
+    gemv_auto_batched(
+        gpu, wq_a, &pbs.tmp_batch, &pbs.tmp_plain_batch, &pbs.q_lat_batch,
+        q_rank, hidden, batch_size,
+    )?;
+
+    // 3. q_norm RMSNorm batched (in-place): batch x [q_lora_rank].
+    gpu.rmsnorm_batched(
+        &pbs.q_lat_batch, q_norm, &pbs.q_lat_batch,
+        batch_size, q_rank, cfg.rms_norm_eps,
+    ).map_err(|e| format!("q_norm rmsnorm_batched l{layer_idx}: {e:?}"))?;
+
+    // 4. FWHT rotate q_lat → q_lat_rot for the MQ4 wq_b path.
+    gpu.rotate_x_mq_batched(&pbs.q_lat_batch, &pbs.q_lat_rot_batch, q_rank, batch_size)
+        .map_err(|e| format!("rotate_x_mq_batched q_lat l{layer_idx}: {e:?}"))?;
+
+    // 5. wq_b GEMV batched: q_lat_rot* → q_batch. M = n_heads*head_dim, K = q_lora_rank.
+    let q_total = n_heads * head_dim;
+    gemv_auto_batched(
+        gpu, wq_b, &pbs.q_lat_rot_batch, &pbs.q_lat_batch, &pbs.q_batch,
+        q_total, q_rank, batch_size,
+    )?;
+
+    // 6. Per-(batch, head) RMSNorm of Q using q_head_ones as weight.
+    //    [B, n_heads, head_dim] viewed as [B*n_heads, head_dim].
+    if std::env::var("HIPFIRE_V4F_SKIP_QHN").ok().as_deref() != Some("1") {
+        gpu.rmsnorm_batched(
+            &pbs.q_batch, &pbs.q_head_ones, &pbs.q_batch,
+            batch_size * n_heads, head_dim, cfg.rms_norm_eps,
+        ).map_err(|e| format!("q per-head rmsnorm_batched l{layer_idx}: {e:?}"))?;
+    }
+
+    Ok(())
 }
 
 /// Batched-prefill entry point for V4F.
