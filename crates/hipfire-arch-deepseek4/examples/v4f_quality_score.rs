@@ -174,12 +174,26 @@ fn main() -> Result<(), String> {
         let ids = tokenizer.encode(s);
         if ids.len() == 1 { Some(ids[0]) } else { None }
     };
+    // We build the prompt as a single string per the DeepSeek-V4 reference
+    // encoding (huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py)
+    // and let the tokenizer handle the special-token recognition. This
+    // matches encode_messages(messages=[{"role":"user","content":X}],
+    // thinking_mode="chat") byte-for-byte:
+    //
+    //   <｜begin▁of▁sentence｜><｜User｜>{content}<｜Assistant｜></think>
+    //
+    // "chat" mode in the reference impl = API's thinking={"type":"disabled"},
+    // which is what antirez's test fixtures use.
     let bos_tok  = lookup_id("<｜begin▁of▁sentence｜>");
     let user_tok = lookup_id("<｜User｜>");
     let asst_tok = lookup_id("<｜Assistant｜>");
-    eprintln!("Chat tokens: bos={bos_tok:?} user={user_tok:?} assistant={asst_tok:?}");
+    let think_close_tok = lookup_id("</think>");
+    eprintln!("Verifying chat tokens are single-token: bos={bos_tok:?} user={user_tok:?} assistant={asst_tok:?} </think>={think_close_tok:?}");
     if user_tok.is_none() || asst_tok.is_none() {
         return Err("missing chat tokens — quality scoring requires them".into());
+    }
+    if think_close_tok.is_none() {
+        eprintln!("warning: </think> didn't single-token-encode — DeepSeek's tokenizer may split it. Continuing with full-string tokenize which handles this correctly.");
     }
 
     let mut gpu = Gpu::init().map_err(|e| format!("gpu: {e:?}"))?;
@@ -217,12 +231,16 @@ fn main() -> Result<(), String> {
         let (id, prompt, target) = parse_jsonl_line(&line)
             .ok_or_else(|| format!("parse jsonl line {line_no}: {line}"))?;
 
-        // Build the prompt token stream with the V4F chat template, no thinking.
-        let mut prompt_tokens: Vec<u32> = Vec::new();
-        if let Some(b) = bos_tok { prompt_tokens.push(b); }
-        if let Some(u) = user_tok { prompt_tokens.push(u); }
-        prompt_tokens.extend(tokenizer.encode(&prompt));
-        if let Some(a) = asst_tok { prompt_tokens.push(a); }
+        // Build the full prompt STRING per the DeepSeek-V4 reference encoder
+        // (`encode_messages(thinking_mode="chat")`), then tokenize in one shot.
+        // This is the only way to guarantee identical tokenization to the API
+        // — the tokenizer's special-token logic sees the full context and
+        // emits the same id sequence the upstream API saw.
+        let full_prompt = format!(
+            "<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜></think>",
+            prompt = prompt
+        );
+        let prompt_tokens: Vec<u32> = tokenizer.encode(&full_prompt);
         let target_tokens: Vec<u32> = tokenizer.encode(&target);
 
         if prompt_tokens.len() + target_tokens.len() + 1 >= ctx_size {

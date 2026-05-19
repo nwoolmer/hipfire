@@ -1,0 +1,4 @@
+id	prompt_tokens	target_tokens	nll	avg_nll	first_match	greedy_lcp
+short_italian_fact	21	4	8.710832687	2.177708172	1	2
+short_code_completion	27	4	4.906281332	1.226570333	0	0
+short_reasoning_plain	18	1	3.400994009	3.400994009	0	0

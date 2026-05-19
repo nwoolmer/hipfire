@@ -1,0 +1,3 @@
+{"id": "short_italian_fact", "prompt": "Rispondi in italiano con una frase: chi era Ada Lovelace?", "target": "Ada Lovelace"}
+{"id": "short_code_completion", "prompt": "Complete the C statement with the next exact token only:\nreturn snprintf(buf, sizeof(buf), \"%d\", value", "target": "```c\nreturn"}
+{"id": "short_reasoning_plain", "prompt": "Answer with only the number: 2048 divided by 128 is", "target": "16"}
