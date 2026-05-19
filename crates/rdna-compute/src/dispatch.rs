@@ -20650,6 +20650,56 @@ impl Gpu {
         }
     }
 
+    /// SWA ring write — BATCHED. For each batch position b at
+    /// `start_pos + b`, writes `kv_batch[b, :]` into the ring at slot
+    /// `(start_pos + b) % window`. Called at chunk-end to advance the
+    /// ring so future decode/chunk calls see the latest history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swa_ring_write_batched_f32(
+        &mut self,
+        kv_batch: &GpuTensor,    // [B, head_dim]
+        cache: &GpuTensor,       // [n_kv_heads, head_dim, window]
+        n_kv_heads: i32,
+        head_dim: i32,
+        window: i32,
+        start_pos: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "swa_ring_write_batched",
+            kernels::SWA_RING_WRITE_BATCHED_SRC,
+            "swa_ring_write_batched_f32",
+        )?;
+        let func = &self.functions["swa_ring_write_batched_f32"];
+        let kp = kv_batch.buf.as_ptr();
+        let cp = cache.buf.as_ptr();
+        let mut nh = n_kv_heads;
+        let mut hd = head_dim;
+        let mut w  = window;
+        let mut sp = start_pos;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut w  as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((head_dim + 255) / 256) as u32, batch_size as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F indexer score — BATCHED. Per batch position b scores every
     /// compressed slot against `q[b, :, :]` using `weights[b, :]`. The
     /// k_cache is shared across batch. Output is `scores[B, N]`.

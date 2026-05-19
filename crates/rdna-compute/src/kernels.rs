@@ -1681,6 +1681,11 @@ pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
 pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_batched.hip");
 
+/// SWA ring write — BATCHED (Phase B2, 2026-05-18). Advances the ring
+/// at chunk end to include all B positions. Slot = (start_pos+b) % win.
+pub const SWA_RING_WRITE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
