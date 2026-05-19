@@ -2726,27 +2726,40 @@ pub fn forward_prefill_batch_chunk(
         cfg.hidden_size as i32, cfg.hc_mult as i32, n as i32,
     ).map_err(|e| format!("hc_streams_init_from_embed_batched: {e:?}"))?;
 
-    // 4. Per-layer loop — only the stages that have shipped batched
-    //    bodies run for now. The mhc_pre + attention + ffn + hc_mix
-    //    stages remain pending; this function will error before doing
-    //    anything useful until those land. The per-layer stages that
-    //    DO run write into pbs.{tmp_batch, tmp_plain_batch, q_lat_*,
-    //    q_batch, kv_batch}; consumers downstream of the bodies that
-    //    haven't shipped yet would read uninitialised slots, so we
-    //    bail out before any attention dispatch.
+    // 4. Per-layer loop. Stages that DO run:
+    //   ✓ mhc_pre_batched(is_attn=true)  → pbs.{hc_pre,hc_post,hc_comb,hc_x_in}_batch
+    //   ✓ q_lora_batched   (consumes hc_x_in_batch) → pbs.q_batch
+    //   ✓ kv_joint_batched (consumes tmp/tmp_plain) → pbs.kv_batch
+    //   ✓ apply_tail_rope_batched         (in-place on q_batch & kv_batch)
+    //
+    // Then we hit the attention stage which still needs per-batch SWA
+    // staging + indexer top-K gather + wo_a/wo_b O-LoRA projection. Bail
+    // out cleanly so callers know the integration path is partial.
     for layer_idx in 0..cfg.num_hidden_layers {
-        // Stage: q_lora_batched (consumes pbs.streams_batch indirectly
-        // via mhc_pre's hc_x_in output — once mhc_pre_batched exists.
-        // Until then we'd read uninit memory, so skip these stages and
-        // return the placeholder error below.)
-        let _ = layer_idx;
+        // Attention-side HC pre + per-stream input mapping.
+        mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/true, n)?;
+
+        // Q-LoRA: pbs.hc_x_in_batch → tmp/tmp_plain → q_lat → q_batch.
+        q_lora_batched(cfg, weights, pbs, &pbs.hc_x_in_batch, gpu, layer_idx, n)?;
+
+        // Joint KV projection: tmp/tmp_plain → kv_batch.
+        kv_joint_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+
+        // Tail-only RoPE on q_batch and kv_batch in-place.
+        apply_tail_rope_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
+
+        // ── Pending: attention block ───────────────────────────────
+        // Need (per layer): SWA ring write batched + indexer score/
+        // gather batched + v4f_attn_swa_topk_batched_f32 dispatch +
+        // rope_tail_inverse + per-group O-LoRA wo_a/wo_b batched.
+        // Then attn_out_batch is ready; hc_attn_mix_batched updates
+        // streams_batch. Then mhc_pre_batched(is_attn=false) +
+        // ffn_routed_batched + hc_ffn_mix_batched complete the layer.
         return Err(format!(
-            "forward_prefill_batch_chunk: layer 0 mhc_pre_batched not yet \
-             implemented — q_lora_batched/kv_joint_batched/apply_tail_rope_batched \
-             are wired but the chunk forward needs the mhc_pre_batched + \
-             attention + ffn + hc_mix batched bodies before any per-layer \
-             stage can run end-to-end. Continue via forward_prefill_batch's \
-             per-token fallback path."
+            "forward_prefill_batch_chunk: layer {layer_idx} reached attention \
+             stage — per-batch SWA ring write + indexer + v4f_attn_swa_topk_-
+             batched + O-LoRA wo + ffn_routed_batched not yet wired. \
+             Callers should fall back to per-token decode_step for now."
         ));
     }
 
