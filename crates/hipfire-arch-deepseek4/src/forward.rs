@@ -89,25 +89,62 @@ fn gemv_auto_batched(
     m: usize, k: usize,
     batch_size: usize,
 ) -> Result<(), String> {
+    gemv_auto_batched_wmma(
+        gpu, weight, x_rotated_batch, x_plain_batch, y,
+        m, k, batch_size, /*x_f16_scratch=*/ None,
+    )
+}
+
+/// `gemv_auto_batched` plus an opt-in WMMA path. When `x_f16_scratch`
+/// is `Some` and the weight is HFQ4/MQ4 (Raw) on a WMMA-capable arch,
+/// stages the F32 input → F16 once and dispatches `gemm_hfq4g256_wmma`.
+/// Falls back to the scalar path on other dtypes / when scratch is None.
+fn gemv_auto_batched_wmma(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated_batch: &GpuTensor,
+    x_plain_batch: &GpuTensor,
+    y: &GpuTensor,
+    m: usize, k: usize,
+    batch_size: usize,
+    x_f16_scratch: Option<&GpuTensor>,
+) -> Result<(), String> {
     match weight.dtype {
-        // F32 (F16-source decoded at upload). Use register-tiled GEMM
-        // that amortizes weight loads across BATCH_TILE=8 positions.
-        // `gemm_f32_batched` (the fake-batched grid-y kernel) is left
-        // intact for non-prefill callers; we route prefill here.
         DType::F32 => gpu.gemm_f32_register_tiled(
-            weight, x_plain_batch, y,
-            m, k, batch_size,
+            weight, x_plain_batch, y, m, k, batch_size,
         ).map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
-        // Q8 register-tiles MAX_BATCH=64 already.
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            weight, x_plain_batch, y,
-            m, k, batch_size,
+            weight, x_plain_batch, y, m, k, batch_size,
         ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}")),
-        // HFQ4G256 register-tiles BATCH_TILE=8 already.
-        _ => gpu.gemm_hfq4g256(
-            weight, x_rotated_batch, y,
-            m, k, batch_size,
-        ).map_err(|e| format!("gemm_hfq4g256: {e:?}")),
+        DType::F16 => {
+            // F16 weight: need to stage F32 input to F16 too, then WMMA.
+            if let Some(scratch) = x_f16_scratch {
+                let n = (batch_size * k) as i64;
+                gpu.convert_f32_to_f16(x_plain_batch, scratch, n)
+                    .map_err(|e| format!("convert_f32_to_f16 (F16 weight): {e:?}"))?;
+                gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
+            } else {
+                Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
+            }
+        }
+        _ => {
+            // HFQ4G256/Raw. WMMA route requires F16 input staging.
+            // Note: HFQ4 expects FWHT-rotated input.
+            let wmma_on = std::env::var("HIPFIRE_V4F_HFQ4_WMMA")
+                .map(|s| s != "0").unwrap_or(true);
+            if wmma_on {
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.convert_f32_to_f16(x_rotated_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (HFQ4 WMMA): {e:?}"))?;
+                    return gpu.gemm_hfq4g256_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_hfq4g256_wmma: {e:?}"));
+                }
+            }
+            gpu.gemm_hfq4g256(weight, x_rotated_batch, y, m, k, batch_size)
+                .map_err(|e| format!("gemm_hfq4g256: {e:?}"))
+        }
     }
 }
 
@@ -2353,6 +2390,12 @@ pub struct PrefillBatchScratch {
     // hidden] like tmp_batch; 1/2 the per-element bytes of F32.
     pub tmp_batch_f16:        GpuTensor,   // [B, hidden] F16 (stored as Raw)
     pub tmp_plain_batch_f16:  GpuTensor,   // [B, hidden] F16 (stored as Raw)
+    /// Generic F16 staging buffer for WMMA HFQ4 GEMMs. Sized at
+    /// `max_batch * max_dim * 2 bytes` so any batched GEMM input can
+    /// be converted F32→F16 in place before dispatch. max_dim is the
+    /// largest K dim across all V4F batched GEMM call sites — wo_b's
+    /// K = groups × o_lora_rank for V4F (= 8 × 1024 = 8192).
+    pub wmma_x_scratch_f16: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2491,6 +2534,22 @@ impl PrefillBatchScratch {
                 t.shape = vec![max_batch, hidden];
                 t
             },
+            wmma_x_scratch_f16: {
+                let max_dim = cfg.o_groups * cfg.o_lora_rank;
+                let max_dim = max_dim.max(hidden).max(cfg.q_lora_rank);
+                let nbytes = max_batch * max_dim * 2;
+                *r += nbytes as u64;
+                if log_vram {
+                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
+                        "wmma_x_scratch_f16", nbytes,
+                        nbytes / (1024 * 1024), *r / (1024 * 1024));
+                }
+                let mut t = gpu.zeros(&[nbytes], DType::Raw)
+                    .map_err(|e| format!("PBS alloc wmma_x_scratch_f16: {e:?}"))?;
+                t.dtype = DType::F16;
+                t.shape = vec![max_batch, max_dim];
+                t
+            },
         });
         if log_vram {
             eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
@@ -2540,7 +2599,7 @@ fn hc_attn_mix_batched(
 ///   6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch
 ///   7. wo_per_group_batched_f32 → pbs.wo_a_out_batch (F32 wo_a only)
 ///   8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch
-///   9. gemv_auto_batched(wo_b, ..., pbs.attn_out_batch)
+///   9. gemv_auto_batched_wmma(wo_b, ..., pbs.attn_out_batch, Some(&pbs.wmma_x_scratch_f16))
 ///   10. swa_ring_write_batched: advance ring with chunk's KVs
 ///
 /// hc_attn_mix_batched is called by the chunk-forward caller after
@@ -2721,10 +2780,9 @@ fn attention_block_batched_swa_only(
     // 9. wo_b GEMV batched: wo_a_out_rot_batch → attn_out_batch.
     //    Standard non-block-diagonal GEMV; gemv_auto_batched handles
     //    F32/Q8/MQ4 dispatch.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, wo_b, &pbs.wo_a_out_rot_batch, &pbs.wo_a_out_batch,
-        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size,
-    )?;
+        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 10. Advance the SWA ring with this chunk's KVs for future steps.
     {
@@ -2771,7 +2829,7 @@ fn attention_block_batched_swa_only(
 ///   6. FWHT rotate attn_out_raw → attn_out_raw_rot
 ///   7. wo_per_group_batched_f32 (F32 wo_a only)
 ///   8. FWHT rotate wo_a_out → wo_a_out_rot
-///   9. gemv_auto_batched(wo_b → attn_out_batch)
+///   9. gemv_auto_batched_wmma(wo_b → attn_out_batch, Some(&pbs.wmma_x_scratch_f16))
 ///   10. swa_ring_write_batched
 ///
 /// Errors out cleanly on non-F32 wo_a (Q8/MQ4 need separate per-group
@@ -2915,27 +2973,23 @@ fn attention_block_batched_mixed(
                 ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
             }
         } else {
-            gemv_auto_batched(
+            gemv_auto_batched_wmma(
                 gpu, comp_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                &pbs.comp_main_kv_batch, real_main_proj, hidden, batch_size,
-            )?;
-            gemv_auto_batched(
+                &pbs.comp_main_kv_batch, real_main_proj, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
+            gemv_auto_batched_wmma(
                 gpu, comp_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                &pbs.comp_main_score_batch, real_main_proj, hidden, batch_size,
-            )?;
+                &pbs.comp_main_score_batch, real_main_proj, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
             if ratio == 4 {
                 let idx_wkv = layer.indexer_compressor_wkv.as_ref()
                     .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?;
                 let idx_wgate = layer.indexer_compressor_wgate.as_ref()
                     .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
-                gemv_auto_batched(
+                gemv_auto_batched_wmma(
                     gpu, idx_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                    &pbs.comp_idx_kv_batch, idx_proj_dim, hidden, batch_size,
-                )?;
-                gemv_auto_batched(
+                    &pbs.comp_idx_kv_batch, idx_proj_dim, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
+                gemv_auto_batched_wmma(
                     gpu, idx_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                    &pbs.comp_idx_score_batch, idx_proj_dim, hidden, batch_size,
-                )?;
+                    &pbs.comp_idx_score_batch, idx_proj_dim, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
             }
         }
     }
@@ -3036,10 +3090,9 @@ fn attention_block_batched_mixed(
                 .map_err(|e| format!("htod n_per_batch: {e:?}"))?;
 
             // wq_b_idx GEMV batched: q_lat_rot_batch → q_idx_batch.
-            gemv_auto_batched(
+            gemv_auto_batched_wmma(
                 gpu, wq_b_idx, &pbs.q_lat_rot_batch, &pbs.q_lat_batch,
-                &pbs.idx_q_batch, h_idx * d_idx, q_rank, batch_size,
-            )?;
+                &pbs.idx_q_batch, h_idx * d_idx, q_rank, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
             // Tail RoPE on q_idx_batch with compress_rope_theta.
             gpu.rope_tail_interleaved_batched(
@@ -3050,10 +3103,9 @@ fn attention_block_batched_mixed(
             ).map_err(|e| format!("rope_tail_batched idx l{layer_idx}: {e:?}"))?;
 
             // weights_proj GEMV batched: tmp_batch → idx_w_batch.
-            gemv_auto_batched(
+            gemv_auto_batched_wmma(
                 gpu, weights_proj, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                &pbs.idx_w_batch, h_idx, hidden, batch_size,
-            )?;
+                &pbs.idx_w_batch, h_idx, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
             // Batched scoring. Pass the SCORE BUFFER STRIDE (max_compressed,
             // = the allocated row stride of pbs.idx_scores_batch), not the
@@ -3239,10 +3291,9 @@ fn attention_block_batched_mixed(
     ).map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
 
     // 9. wo_b GEMV batched.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, wo_b, &pbs.wo_a_out_rot_batch, &pbs.wo_a_out_batch,
-        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size,
-    )?;
+        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 10. Advance the SWA ring.
     {
@@ -3269,12 +3320,12 @@ fn attention_block_batched_mixed(
 /// Stages:
 ///   1. fused_rmsnorm_rotate_mq_batched(hc_x_in → ffn_x_rot)
 ///   2. rmsnorm_batched(hc_x_in → ffn_x_plain)
-///   3. gemv_auto_batched(shared_w1, → shared_gate)
-///   4. gemv_auto_batched(shared_w3, → shared_up)
+///   3. gemv_auto_batched_wmma(shared_w1, → shared_gate, Some(&pbs.wmma_x_scratch_f16))
+///   4. gemv_auto_batched_wmma(shared_w3, → shared_up, Some(&pbs.wmma_x_scratch_f16))
 ///   5. v4f_silu_mul_clamp_f32_batched(shared_gate, shared_up → shared_gate)
 ///   6. rotate_x_mq_batched(shared_gate → shared_rot)
-///   7. gemv_auto_batched(shared_w2, shared_rot → ffn_out_batch)
-///   8. (score-routed only) gemv_auto_batched(gate.weight, ffn_x_rot → moe_scores)
+///   7. gemv_auto_batched_wmma(shared_w2, shared_rot → ffn_out_batch, Some(&pbs.wmma_x_scratch_f16))
+///   8. (score-routed only) gemv_auto_batched_wmma(gate.weight, ffn_x_rot → moe_scores, Some(&pbs.wmma_x_scratch_f16))
 ///   9. sqrt_softplus_f32 on moe_scores (operates on full [B*n_exp] numel)
 ///   10. v4f_moe_topk_bias_aware_batched_f32 → topk_indices, topk_weights
 ///   11. v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched → moe_gate, moe_up
@@ -3318,14 +3369,12 @@ fn ffn_batched(
     ).map_err(|e| format!("rmsnorm_batched ffn-side l{layer_idx}: {e:?}"))?;
 
     // 2-3. Shared expert gate + up GEMVs.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, shared_w1, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
-        &pbs.ffn_shared_gate_batch, im, hidden, batch_size,
-    )?;
-    gemv_auto_batched(
+        &pbs.ffn_shared_gate_batch, im, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
+    gemv_auto_batched_wmma(
         gpu, shared_w3, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
-        &pbs.ffn_shared_up_batch, im, hidden, batch_size,
-    )?;
+        &pbs.ffn_shared_up_batch, im, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 4. SwiGLU + clamp. The kernel batches `B` streams of length `n`.
     gpu.v4f_silu_mul_clamp_f32_batched(
@@ -3339,10 +3388,9 @@ fn ffn_batched(
     ).map_err(|e| format!("rotate_x_mq_batched shared silu l{layer_idx}: {e:?}"))?;
 
     // 6. Shared down GEMV → ffn_out_batch.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, shared_w2, &pbs.ffn_shared_rot_batch, &pbs.ffn_shared_gate_batch,
-        &pbs.ffn_out_batch, hidden, im, batch_size,
-    )?;
+        &pbs.ffn_out_batch, hidden, im, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // ── Routed-expert MoE ───────────────────────────────────────────
     let do_routed = std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() == Some("1")
@@ -3371,10 +3419,9 @@ fn ffn_batched(
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
 
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, gate_w, &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
-        &pbs.moe_scores_batch, n_exp, hidden, batch_size,
-    )?;
+        &pbs.moe_scores_batch, n_exp, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
@@ -3742,10 +3789,9 @@ fn kv_joint_batched(
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
     // wkv @ tmp → kv.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch, &pbs.kv_batch,
-        kv_dim, cfg.hidden_size, batch_size,
-    )?;
+        kv_dim, cfg.hidden_size, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // kv_norm RMSNorm in-place: batch x [kv_dim].
     gpu.rmsnorm_batched(
@@ -3812,10 +3858,9 @@ fn q_lora_batched(
     ).map_err(|e| format!("rmsnorm_batched attn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, wq_a, &pbs.tmp_batch, &pbs.tmp_plain_batch, &pbs.q_lat_batch,
-        q_rank, hidden, batch_size,
-    )?;
+        q_rank, hidden, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 3. q_norm RMSNorm batched (in-place): batch x [q_lora_rank].
     gpu.rmsnorm_batched(
@@ -3829,10 +3874,9 @@ fn q_lora_batched(
 
     // 5. wq_b GEMV batched: q_lat_rot* → q_batch. M = n_heads*head_dim, K = q_lora_rank.
     let q_total = n_heads * head_dim;
-    gemv_auto_batched(
+    gemv_auto_batched_wmma(
         gpu, wq_b, &pbs.q_lat_rot_batch, &pbs.q_lat_batch, &pbs.q_batch,
-        q_total, q_rank, batch_size,
-    )?;
+        q_total, q_rank, batch_size, Some(&pbs.wmma_x_scratch_f16))?;
 
     // 6. Per-(batch, head) RMSNorm of Q using q_head_ones as weight.
     //    [B, n_heads, head_dim] viewed as [B*n_heads, head_dim].

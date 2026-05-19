@@ -1759,6 +1759,11 @@ pub const GEMM_F16_X_F16_WMMA_SRC: &str =
 pub const CONVERT_F32_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/convert_f32_to_f16.hip");
 
+/// WMMA HFQ4G256 weight × F16 input → F32 output GEMM with (B, M)
+/// output layout. Drop-in for `gemm_hfq4g256` (scalar FMA path).
+pub const GEMM_HFQ4G256_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for

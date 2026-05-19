@@ -133,6 +133,27 @@ fn run_gemm_f32(gpu: &mut Gpu, iters: usize, env_flag: &str, env_val: &str, name
     Ok(())
 }
 
+fn run_gemm_hfq4_wmma(gpu: &mut Gpu, iters: usize) -> Result<(), String> {
+    let m = 2048;
+    let k = 4096;
+    let b = 64;
+    let weight_bytes = m * (k / 256) * 136;
+    let weight_raw = gpu.zeros(&[weight_bytes], DType::Raw)
+        .map_err(|e| format!("alloc weight: {e:?}"))?;
+    let x_f16 = gpu.zeros(&[b * k * 2], DType::Raw)
+        .map_err(|e| format!("alloc x_f16: {e:?}"))?;
+    let y = gpu.alloc_tensor(&[b, m], DType::F32)
+        .map_err(|e| format!("alloc y: {e:?}"))?;
+    let kbytes = (weight_bytes + (b * k * 2) + (b * m * 4)) as f64 / 1024.0;
+    bench("gemm_hfq4g256_wmma", iters, kbytes, || {
+        gpu.gemm_hfq4g256_wmma(&weight_raw, &x_f16, &y, m, k, b)
+            .map_err(|e| format!("gemm_hfq4g256_wmma: {e:?}"))?;
+        gpu.hip.device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))
+    })?;
+    Ok(())
+}
+
 fn run_gemm_hfq4(gpu: &mut Gpu, iters: usize) -> Result<(), String> {
     let m = 2048;
     let k = 4096;
@@ -302,6 +323,7 @@ fn main() -> Result<(), String> {
         "gemm_f32_per_output_v4" => run_gemm_f32_per_output_v4(&mut gpu, iters)?,
         "gemm_f16_wmma" => run_gemm_f16_wmma(&mut gpu, iters)?,
         "gemm_hfq4" => run_gemm_hfq4(&mut gpu, iters)?,
+        "gemm_hfq4_wmma" => run_gemm_hfq4_wmma(&mut gpu, iters)?,
         "wo_per_group_hfq4" => run_wo_per_group_hfq4(&mut gpu, iters)?,
         "moe_gateup_k4" => run_moe_gateup_k4(&mut gpu, iters, false)?,
         "moe_gateup_grouped_k4" => run_moe_gateup_k4(&mut gpu, iters, true)?,
@@ -316,6 +338,7 @@ fn main() -> Result<(), String> {
             run_gemm_f32_per_output_v4(&mut gpu, iters)?;
             run_gemm_f16_wmma(&mut gpu, iters)?;
             run_gemm_hfq4(&mut gpu, iters)?;
+            run_gemm_hfq4_wmma(&mut gpu, iters)?;
             run_wo_per_group_hfq4(&mut gpu, iters)?;
             run_moe_gateup_k4(&mut gpu, iters, false)?;
             run_moe_gateup_k4(&mut gpu, iters, true)?;
