@@ -2516,6 +2516,298 @@ fn attention_block_batched_swa_only(
     Ok(())
 }
 
+/// Mixed-attention batched dispatch (compress_ratio > 0 layers).
+///
+/// V4F's compressed layers attend jointly to (SWA window K/V) +
+/// (top-K of compressed-K cache, gated by the indexer for ratio=4 or
+/// the identity gather for ratio=128). The compressor + indexer
+/// pipelines per-position are stateful (writes to kv_state ring,
+/// conditional pool to main/indexer_kv_cache); we loop those
+/// sequentially per batch position by temporarily swapping the
+/// per-position state.* fields with sub_offset views into the
+/// batched scratch buffers. The big-fish attention kernel still runs
+/// in one batched launch.
+///
+/// Stages:
+///   1. SWA visibility staging from pre-chunk ring + within-chunk kv_batch
+///   2. For each batch position b:
+///      a. Swap state.tmp / tmp_plain / q_lat / q_lat_rot to b's slice
+///      b. compressor_forward(main, position=start_pos+b)
+///      c. compressor_forward(indexer, position=start_pos+b) for ratio=4
+///      d. indexer_forward → state._indexer[L].topk_idx_indices
+///      e. Gather top-K K/V into pbs.topk_staged_batch[b] slot OR
+///         identity-gather for ratio=128
+///      f. Compute n_active_topk[b] = min(n_compressed, index_topk)
+///   3. Upload n_valid_swa_arr + n_active_topk_arr
+///   4. v4f_attn_swa_topk_batched_f32 (single launch over all batch rows)
+///   5. Inverse RoPE batched
+///   6. FWHT rotate attn_out_raw → attn_out_raw_rot
+///   7. wo_per_group_batched_f32 (F32 wo_a only)
+///   8. FWHT rotate wo_a_out → wo_a_out_rot
+///   9. gemv_auto_batched(wo_b → attn_out_batch)
+///   10. swa_ring_write_batched
+///
+/// Errors out cleanly on non-F32 wo_a (Q8/MQ4 need separate per-group
+/// batched kernels) or when the compressor/indexer state isn't
+/// allocated.
+#[allow(dead_code)]
+fn attention_block_batched_mixed(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    start_pos: u32,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let ratio = layer.compress_ratio as usize;
+    assert!(ratio > 0, "attention_block_batched_mixed called on dense layer");
+
+    let attn_sink = layer.attn_sink.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_sink missing"))?;
+    let wo_a = layer.wo_a.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a missing"))?;
+    let wo_b = layer.wo_b.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_b missing"))?;
+
+    let n_kv = cfg.num_key_value_heads;
+    let win = cfg.sliding_window;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_groups = cfg.o_groups;
+    let o_lora_rank = cfg.o_lora_rank;
+    let groups_o_lora = n_groups * o_lora_rank;
+    let topk_max = cfg.index_topk;
+
+    // Lazy-alloc SWA rings.
+    {
+        let attn = &mut state._attention[layer_idx];
+        if attn.swa_k.is_none() {
+            attn.swa_k = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                .map_err(|e| format!("alloc swa_k l{layer_idx}: {e:?}"))?);
+        }
+        if attn.swa_v.is_none() {
+            attn.swa_v = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                .map_err(|e| format!("alloc swa_v l{layer_idx}: {e:?}"))?);
+        }
+        if attn.gathered_k.is_none() {
+            attn.gathered_k = Some(gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
+                .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?);
+        }
+    }
+
+    // 1. Stage per-batch SWA visibility window.
+    {
+        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+        gpu.swa_visibility_stage_batched(
+            swa_k, &pbs.kv_batch, &pbs.swa_staged_batch,
+            start_pos as i32, win as i32, head_dim as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_visibility_stage_batched l{layer_idx}: {e:?}"))?;
+    }
+
+    // 2. Per-batch sequential compressor + indexer + gather. We swap
+    //    state.* fields to point at per-row sub-views of the batched
+    //    scratch so the existing per-token functions work unchanged.
+    let n_valid_host: Vec<i32> = (0..batch_size)
+        .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
+        .collect();
+    let mut n_active_host: Vec<i32> = vec![0; batch_size];
+
+    // Snapshot the per-token state fields so we can restore after the loop.
+    let orig_tmp = state.tmp.take();
+    let orig_tmp_plain = state.tmp_plain.take();
+    let orig_q_lat = state.q_lat.take();
+    let orig_q_lat_rot = state.q_lat_rot.take();
+
+    let hidden = cfg.hidden_size;
+    let q_rank = cfg.q_lora_rank;
+    let mut loop_err: Option<String> = None;
+
+    for b in 0..batch_size {
+        let pos = start_pos + b as u32;
+        // Swap state to point at this batch row's slices.
+        state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
+        state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
+        state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
+        state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
+
+        // Main compressor (always for ratio > 0). Clone the tmp view
+        // to avoid borrowing state both immutably (tmp ref) and mutably
+        // (compressor_forward).
+        let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+        if let Err(e) = compressor_forward(
+            cfg, weights, state, gpu, layer_idx,
+            &tmp_view, pos, /*is_indexer=*/false,
+        ) {
+            loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
+            break;
+        }
+        // Indexer compressor (ratio=4 only) + indexer_forward (scoring + top-K).
+        let mut k_active: usize = 0;
+        if ratio == 4 {
+            let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+            if let Err(e) = compressor_forward(
+                cfg, weights, state, gpu, layer_idx,
+                &tmp_view2, pos, /*is_indexer=*/true,
+            ) {
+                loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
+                break;
+            }
+            let n_compressed = match indexer_forward(cfg, weights, state, gpu, layer_idx, pos) {
+                Ok(n) => n,
+                Err(e) => {
+                    loop_err = Some(format!("indexer_forward b={b} l{layer_idx}: {e}"));
+                    break;
+                }
+            };
+            if n_compressed > 0 {
+                // Gather top-K K/V into pbs.topk_staged_batch[b].
+                let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
+                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+                let k = topk_max.min(n_compressed);
+                let staged_row = pbs.topk_staged_batch.sub_offset(
+                    b * head_dim * topk_max, head_dim * topk_max);
+                if let Err(e) = gpu.v4f_topk_kv_gather_f32(
+                    main_kv_cache, topk_idx, &staged_row,
+                    k as i32, head_dim as i32, n_compressed as i32,
+                    topk_max as i32, 0, /*scale=*/1.0,
+                ) {
+                    loop_err = Some(format!("v4f_topk_kv_gather b={b} l{layer_idx}: {e:?}"));
+                    break;
+                }
+                k_active = k;
+            }
+        } else {
+            // ratio == 128: identity gather of all compressed entries.
+            let n_compressed = ((pos as usize + 1) / ratio).min(topk_max);
+            if n_compressed > 0 {
+                let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
+                let staged_row = pbs.topk_staged_batch.sub_offset(
+                    b * head_dim * topk_max, head_dim * topk_max);
+                if let Err(e) = gpu.v4f_topk_kv_gather_identity_f32(
+                    main_kv_cache, &staged_row,
+                    n_compressed as i32, head_dim as i32, topk_max as i32,
+                ) {
+                    loop_err = Some(format!("v4f_topk_kv_gather_identity b={b} l{layer_idx}: {e:?}"));
+                    break;
+                }
+                k_active = n_compressed;
+            }
+        }
+        n_active_host[b] = k_active as i32;
+    }
+
+    // Restore per-token state fields. Do this BEFORE bubbling the error
+    // so the state isn't left with sub-views into pbs.
+    state.tmp = orig_tmp;
+    state.tmp_plain = orig_tmp_plain;
+    state.q_lat = orig_q_lat;
+    state.q_lat_rot = orig_q_lat_rot;
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+
+    // 3. Upload per-batch valid-counts.
+    let n_valid_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+        .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
+    let n_active_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(n_active_host.as_ptr() as *const u8, batch_size * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.n_active_topk_arr.buf, n_active_bytes)
+        .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
+
+    // 4. Batched joint-softmax attention over SWA + topK + sink.
+    gpu.v4f_attn_swa_topk_batched_f32(
+        &pbs.q_batch,
+        &pbs.swa_staged_batch, &pbs.swa_staged_batch,    // K=V tied
+        &pbs.topk_staged_batch, &pbs.topk_staged_batch,
+        attn_sink,
+        &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
+        &pbs.attn_out_raw_batch,
+        n_heads as i32, head_dim as i32,
+        win as i32, topk_max as i32,
+        batch_size as i32,
+    ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+
+    // 5. Inverse RoPE.
+    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
+        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+            gpu.rope_tail_inverse_batched(
+                &pbs.attn_out_raw_batch, &pbs.positions,
+                n_heads as i32, head_dim as i32,
+                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
+                batch_size as i32,
+            ).map_err(|e| format!("rope_tail_inverse_batched l{layer_idx}: {e:?}"))?;
+        } else {
+            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                layer_rope_params(cfg, layer.compress_ratio);
+            gpu.rope_tail_yarn_interleaved_batched(
+                &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
+                n_heads as i32, 0,
+                head_dim as i32, cfg.qk_rope_head_dim as i32,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                corr_low, corr_high,
+                /*inverse=*/1, batch_size as i32,
+            ).map_err(|e| format!("rope_tail_yarn_inv_batched l{layer_idx}: {e:?}"))?;
+        }
+    }
+
+    // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
+    gpu.rotate_x_mq_batched(
+        &pbs.attn_out_raw_batch, &pbs.attn_out_raw_rot_batch,
+        n_heads * head_dim, batch_size,
+    ).map_err(|e| format!("rotate attn_out_raw l{layer_idx}: {e:?}"))?;
+
+    // 7. wo_a per-group batched (F32 only).
+    let per_group_in = (n_heads / n_groups) * head_dim;
+    match wo_a.dtype {
+        DType::F32 => {
+            gpu.wo_per_group_batched_f32(
+                wo_a, &pbs.attn_out_raw_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        _ => return Err(format!(
+            "attention_block_batched_mixed l{layer_idx}: wo_a.dtype={:?} not yet supported",
+            wo_a.dtype
+        )),
+    }
+
+    // 8. FWHT rotate wo_a_out → wo_a_out_rot.
+    gpu.rotate_x_mq_batched(
+        &pbs.wo_a_out_batch, &pbs.wo_a_out_rot_batch,
+        groups_o_lora, batch_size,
+    ).map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+
+    // 9. wo_b GEMV batched.
+    gemv_auto_batched(
+        gpu, wo_b, &pbs.wo_a_out_rot_batch, &pbs.wo_a_out_batch,
+        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size,
+    )?;
+
+    // 10. Advance the SWA ring.
+    {
+        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+        let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+        gpu.swa_ring_write_batched_f32(
+            &pbs.kv_batch, swa_k, n_kv as i32, head_dim as i32, win as i32,
+            start_pos as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_ring_write_batched (k) l{layer_idx}: {e:?}"))?;
+        gpu.swa_ring_write_batched_f32(
+            &pbs.kv_batch, swa_v, n_kv as i32, head_dim as i32, win as i32,
+            start_pos as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_ring_write_batched (v) l{layer_idx}: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
 /// Batched FFN: shared expert + routed-expert MoE, end-to-end.
 ///
 /// Computes per-batch ffn_out_batch[b, :] = shared_expert(hc_x_in[b])
@@ -3131,20 +3423,17 @@ pub fn forward_prefill_batch_chunk(
         // Tail-only RoPE on q_batch and kv_batch in-place.
         apply_tail_rope_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
 
-        // ── Attention block: pure-SWA for compress_ratio==0, bail for
-        //    mixed layers (indexer chain wiring is the next stage).
+        // ── Attention block: pure-SWA for compress_ratio==0, mixed
+        //    (SWA + indexer/identity topk) for compress_ratio>0.
         let layer = &weights.layers[layer_idx];
         if layer.compress_ratio == 0 {
             attention_block_batched_swa_only(
                 cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
             )?;
         } else {
-            return Err(format!(
-                "forward_prefill_batch_chunk: layer {layer_idx} has \
-                 compress_ratio={} — mixed-attention indexer chain \
-                 batched dispatch not yet wired.",
-                layer.compress_ratio
-            ));
+            attention_block_batched_mixed(
+                cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
+            )?;
         }
 
         // hc_attn_mix: integrate attn_out_batch into streams_batch.
