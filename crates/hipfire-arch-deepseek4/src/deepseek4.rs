@@ -238,6 +238,12 @@ pub struct DeepseekV4LayerWeights {
     pub compressor_wgate: Option<rdna_compute::GpuTensor>,
     pub compressor_norm:  Option<rdna_compute::GpuTensor>,
     pub compressor_ape:   Option<rdna_compute::GpuTensor>,  // [ratio, coff*head_dim]
+    /// F16-native copies of the compressor projections for the WMMA
+    /// GEMM path. Same data as `compressor_w{kv,gate}` but stored as
+    /// F16 bytes directly (no F32 decode). Populated when
+    /// `HIPFIRE_V4F_COMP_F16_WMMA` is enabled at load time.
+    pub compressor_wkv_f16:   Option<rdna_compute::GpuTensor>,
+    pub compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
 
     // Indexer sub-module — only on layers with compress_ratio == 4.
     // Selects top-k positions for sparse attention beyond SWA window.
@@ -245,6 +251,9 @@ pub struct DeepseekV4LayerWeights {
     pub indexer_weights_proj:   Option<rdna_compute::GpuTensor>,  // [idx_n_heads, hidden]
     pub indexer_compressor_wkv: Option<rdna_compute::GpuTensor>,  // [coff*idx_head_dim, hidden]
     pub indexer_compressor_wgate: Option<rdna_compute::GpuTensor>,
+    /// F16-native copies of the indexer compressor projections for WMMA.
+    pub indexer_compressor_wkv_f16:   Option<rdna_compute::GpuTensor>,
+    pub indexer_compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
     pub indexer_compressor_norm: Option<rdna_compute::GpuTensor>, // [idx_head_dim]
     pub indexer_compressor_ape: Option<rdna_compute::GpuTensor>,  // [ratio, coff*idx_head_dim]
 
@@ -317,8 +326,10 @@ impl DeepseekV4LayerWeights {
             wq_a: None, wq_b: None, wkv: None, wo_a: None, wo_b: None,
             compressor_wkv: None, compressor_wgate: None, compressor_norm: None,
             compressor_ape: None,
+            compressor_wkv_f16: None, compressor_wgate_f16: None,
             indexer_wq_b: None, indexer_weights_proj: None,
             indexer_compressor_wkv: None, indexer_compressor_wgate: None,
+            indexer_compressor_wkv_f16: None, indexer_compressor_wgate_f16: None,
             indexer_compressor_norm: None, indexer_compressor_ape: None,
             hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,

@@ -67,6 +67,29 @@ fn run_gemm_f32_per_output(gpu: &mut Gpu, iters: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn run_gemm_f16_wmma(gpu: &mut Gpu, iters: usize) -> Result<(), String> {
+    let m = 1024;
+    let k = 4096;
+    let b = 64;
+    // F16 weight: M*K*2 bytes — allocate as Raw to bypass dtype size.
+    let weight_bytes = m * k * 2;
+    let weight = gpu.zeros(&[weight_bytes], DType::Raw)
+        .map_err(|e| format!("alloc weight: {e:?}"))?;
+    let x = gpu.zeros(&[b * k * 2], DType::Raw)
+        .map_err(|e| format!("alloc x: {e:?}"))?;
+    let y = gpu.alloc_tensor(&[b, m], DType::F32)
+        .map_err(|e| format!("alloc y: {e:?}"))?;
+    // Bytes-per-iter: weight F16 + x F16 + y F32.
+    let kbytes = ((m * k * 2) + (b * k * 2) + (b * m * 4)) as f64 / 1024.0;
+    bench("gemm_f16_x_f16_wmma", iters, kbytes, || {
+        gpu.gemm_f16_x_f16_wmma(&weight, &x, &y, m, k, b)
+            .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))?;
+        gpu.hip.device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))
+    })?;
+    Ok(())
+}
+
 fn run_gemm_f32_per_output_v4(gpu: &mut Gpu, iters: usize) -> Result<(), String> {
     let m = 1024;
     let k = 4096;
@@ -277,6 +300,7 @@ fn main() -> Result<(), String> {
         "gemm_f32_bt32" => run_gemm_f32(&mut gpu, iters, "HIPFIRE_GEMM_F32_BT32", "1", "gemm_f32_bt32")?,
         "gemm_f32_per_output" => run_gemm_f32_per_output(&mut gpu, iters)?,
         "gemm_f32_per_output_v4" => run_gemm_f32_per_output_v4(&mut gpu, iters)?,
+        "gemm_f16_wmma" => run_gemm_f16_wmma(&mut gpu, iters)?,
         "gemm_hfq4" => run_gemm_hfq4(&mut gpu, iters)?,
         "wo_per_group_hfq4" => run_wo_per_group_hfq4(&mut gpu, iters)?,
         "moe_gateup_k4" => run_moe_gateup_k4(&mut gpu, iters, false)?,
@@ -290,6 +314,7 @@ fn main() -> Result<(), String> {
             std::env::set_var("HIPFIRE_GEMM_F32_BT32", "0");
             run_gemm_f32_per_output(&mut gpu, iters)?;
             run_gemm_f32_per_output_v4(&mut gpu, iters)?;
+            run_gemm_f16_wmma(&mut gpu, iters)?;
             run_gemm_hfq4(&mut gpu, iters)?;
             run_wo_per_group_hfq4(&mut gpu, iters)?;
             run_moe_gateup_k4(&mut gpu, iters, false)?;

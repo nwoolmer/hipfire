@@ -99,6 +99,38 @@ impl DeepseekV4 {
         Ok(t)
     }
 
+    /// Upload an F16-on-disk HFQ tensor as F16 bytes on GPU (no
+    /// conversion). Marks `dtype = F16`. Used for the WMMA GEMM path
+    /// that consumes F16 weights directly. Errors if the source isn't
+    /// F16 (quant_type != 1).
+    fn upload_quant_as_f16_native(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        if info.quant_type != 1 {
+            return Err(format!(
+                "deepseek4: '{name}' not F16 (quant_type={}); cannot upload as F16 native",
+                info.quant_type
+            ));
+        }
+        let n: usize = shape.iter().product();
+        if bytes.len() != n * 2 {
+            return Err(format!(
+                "deepseek4: '{name}' marked F16 but byte size {} != 2 × {n}",
+                bytes.len()
+            ));
+        }
+        let mut t = gpu.upload_raw(bytes, &shape)
+            .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
+        t.dtype = rdna_compute::DType::F16;
+        Ok(t)
+    }
+
     /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
     /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
     /// quantizer stored F16 bytes. The conversion cost is one host-side
@@ -384,14 +416,25 @@ impl Architecture for DeepseekV4 {
             // (gemv_f32 path) while default MQ4G256 quants land as Raw
             // (gemv_mq4g256_prerotated path). gemv_auto in forward.rs
             // branches on GpuTensor.dtype to pick the right kernel.
+            // Opt-in: keep F16-native parallel copies of the compressor
+            // projections for the WMMA GEMM path. Doubles compressor
+            // VRAM footprint but unlocks the 26× speedup measured in
+            // microbench (gemm_f16_x_f16_wmma vs gemm_f32_register_tiled).
+            let comp_f16_wmma = std::env::var("HIPFIRE_V4F_COMP_F16_WMMA")
+                .map(|s| s != "0").unwrap_or(true);
             if layer.compress_ratio > 0 {
                 layer.compressor_wkv   = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.wkv.weight"))?);
                 layer.compressor_wgate = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.wgate.weight"))?);
-                // compressor.norm is a 1D rmsnorm weight — always F16 in HFQ
-                // (kmap rule), kernel expects F32 input via
-                // upload_global_f16_as_f32.
+                if comp_f16_wmma {
+                    layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
+                        hfq, gpu,
+                        &format!("layers.{l}.attn.compressor.wkv.weight"))?);
+                    layer.compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
+                        hfq, gpu,
+                        &format!("layers.{l}.attn.compressor.wgate.weight"))?);
+                }
                 layer.compressor_norm  = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                     &format!("layers.{l}.attn.compressor.norm.weight"))?);
                 layer.compressor_ape   = Some(Self::upload_global_raw(hfq, gpu,
@@ -408,6 +451,14 @@ impl Architecture for DeepseekV4 {
                     &format!("layers.{l}.attn.indexer.compressor.wkv.weight"))?);
                 layer.indexer_compressor_wgate = Some(Self::upload_quant_or_f16(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.wgate.weight"))?);
+                if comp_f16_wmma {
+                    layer.indexer_compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
+                        hfq, gpu,
+                        &format!("layers.{l}.attn.indexer.compressor.wkv.weight"))?);
+                    layer.indexer_compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
+                        hfq, gpu,
+                        &format!("layers.{l}.attn.indexer.compressor.wgate.weight"))?);
+                }
                 layer.indexer_compressor_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu,
                     &format!("layers.{l}.attn.indexer.compressor.norm.weight"))?);
                 layer.indexer_compressor_ape = Some(Self::upload_global_raw(hfq, gpu,

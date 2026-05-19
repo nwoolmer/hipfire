@@ -2346,6 +2346,13 @@ pub struct PrefillBatchScratch {
     pub moe_sorted_krank: GpuTensor,       // [B * K_TOP] i32
     pub moe_sorted_expert: GpuTensor,      // [B * K_TOP] i32
     pub moe_expert_starts: GpuTensor,      // [n_exp + 1] i32
+    // ── F16 staging for WMMA compressor GEMMs ──
+    // F32 attention-norm output gets converted once per layer into
+    // these buffers, then the four compressor GEMMs (wkv/wgate ×
+    // main/idx) consume F16 inputs directly. Sized at [max_batch,
+    // hidden] like tmp_batch; 1/2 the per-element bytes of F32.
+    pub tmp_batch_f16:        GpuTensor,   // [B, hidden] F16 (stored as Raw)
+    pub tmp_plain_batch_f16:  GpuTensor,   // [B, hidden] F16 (stored as Raw)
 }
 
 impl PrefillBatchScratch {
@@ -2454,6 +2461,36 @@ impl PrefillBatchScratch {
             moe_sorted_krank: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank", r, log_vram)?,
             moe_sorted_expert: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_expert", r, log_vram)?,
             moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts", r, log_vram)?,
+            // F16 staging buffers: 2 bytes per element. Allocate as Raw
+            // with byte-count shape so DType::size() == 1 stays consistent.
+            tmp_batch_f16: {
+                let nbytes = max_batch * hidden * 2;
+                *r += nbytes as u64;
+                if log_vram {
+                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
+                        "tmp_batch_f16", nbytes,
+                        nbytes / (1024 * 1024), *r / (1024 * 1024));
+                }
+                let mut t = gpu.zeros(&[nbytes], DType::Raw)
+                    .map_err(|e| format!("PBS alloc tmp_batch_f16: {e:?}"))?;
+                t.dtype = DType::F16;
+                t.shape = vec![max_batch, hidden];
+                t
+            },
+            tmp_plain_batch_f16: {
+                let nbytes = max_batch * hidden * 2;
+                *r += nbytes as u64;
+                if log_vram {
+                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
+                        "tmp_plain_batch_f16", nbytes,
+                        nbytes / (1024 * 1024), *r / (1024 * 1024));
+                }
+                let mut t = gpu.zeros(&[nbytes], DType::Raw)
+                    .map_err(|e| format!("PBS alloc tmp_plain_batch_f16: {e:?}"))?;
+                t.dtype = DType::F16;
+                t.shape = vec![max_batch, hidden];
+                t
+            },
         });
         if log_vram {
             eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
@@ -2820,7 +2857,15 @@ fn attention_block_batched_mixed(
     // per (wkv|wgate) × (main|indexer). Wires through to
     // compressor_forward_prebatched in the per-position loop below.
     // Opt out via HIPFIRE_V4F_COMP_BATCHED_GEMV=0.
+    //
+    // WMMA fast path: when all four compressor weights have F16-native
+    // copies (`compressor_w{kv,gate}_f16` etc.), convert the F32 inputs
+    // to F16 once and run gemm_f16_x_f16_wmma — measured 26× faster
+    // than the F32 register-tiled path on V4F shapes (microbench).
+    // Opt out via HIPFIRE_V4F_COMP_F16_WMMA=0.
     let comp_batched = std::env::var("HIPFIRE_V4F_COMP_BATCHED_GEMV")
+        .map(|s| s != "0").unwrap_or(true);
+    let comp_f16_wmma = std::env::var("HIPFIRE_V4F_COMP_F16_WMMA")
         .map(|s| s != "0").unwrap_or(true);
     let main_coff = 2; // ratio=4 has overlap=true; ratio=128 has coff=1 → wastes half the buf.
     let main_proj_dim = main_coff * head_dim;
@@ -2832,27 +2877,66 @@ fn attention_block_batched_mixed(
         let comp_wgate = layer.compressor_wgate.as_ref()
             .ok_or_else(|| format!("comp_wgate l{layer_idx}"))?;
         let real_main_proj = if ratio == 4 { 2 * head_dim } else { head_dim };
-        gemv_auto_batched(
-            gpu, comp_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-            &pbs.comp_main_kv_batch, real_main_proj, hidden, batch_size,
-        )?;
-        gemv_auto_batched(
-            gpu, comp_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-            &pbs.comp_main_score_batch, real_main_proj, hidden, batch_size,
-        )?;
-        if ratio == 4 {
-            let idx_wkv = layer.indexer_compressor_wkv.as_ref()
-                .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?;
-            let idx_wgate = layer.indexer_compressor_wgate.as_ref()
-                .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
+        // WMMA route requires both main + idx (when ratio=4) F16 weights
+        // and works on F16 inputs.
+        let wkv_f16 = layer.compressor_wkv_f16.as_ref();
+        let wgate_f16 = layer.compressor_wgate_f16.as_ref();
+        let idx_wkv_f16 = layer.indexer_compressor_wkv_f16.as_ref();
+        let idx_wgate_f16 = layer.indexer_compressor_wgate_f16.as_ref();
+        let have_idx_f16 = ratio != 4 || (idx_wkv_f16.is_some() && idx_wgate_f16.is_some());
+        let use_wmma = comp_f16_wmma
+            && wkv_f16.is_some() && wgate_f16.is_some() && have_idx_f16;
+        if use_wmma {
+            // Stage F32 → F16 inputs once per layer.
+            let n_inputs = (batch_size * hidden) as i64;
+            gpu.convert_f32_to_f16(&pbs.tmp_batch, &pbs.tmp_batch_f16, n_inputs)
+                .map_err(|e| format!("convert_f32_to_f16 tmp l{layer_idx}: {e:?}"))?;
+            gpu.convert_f32_to_f16(&pbs.tmp_plain_batch, &pbs.tmp_plain_batch_f16, n_inputs)
+                .map_err(|e| format!("convert_f32_to_f16 tmp_plain l{layer_idx}: {e:?}"))?;
+            // V4F compressor uses FWHT-rotated input (tmp_batch) when the
+            // weight is MQ4-style, and plain input (tmp_plain_batch) when
+            // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
+            gpu.gemm_f16_x_f16_wmma(
+                wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_kv_batch,
+                real_main_proj, hidden, batch_size,
+            ).map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
+            gpu.gemm_f16_x_f16_wmma(
+                wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_score_batch,
+                real_main_proj, hidden, batch_size,
+            ).map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
+            if ratio == 4 {
+                gpu.gemm_f16_x_f16_wmma(
+                    idx_wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_kv_batch,
+                    idx_proj_dim, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
+                gpu.gemm_f16_x_f16_wmma(
+                    idx_wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_score_batch,
+                    idx_proj_dim, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
+            }
+        } else {
             gemv_auto_batched(
-                gpu, idx_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                &pbs.comp_idx_kv_batch, idx_proj_dim, hidden, batch_size,
+                gpu, comp_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                &pbs.comp_main_kv_batch, real_main_proj, hidden, batch_size,
             )?;
             gemv_auto_batched(
-                gpu, idx_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
-                &pbs.comp_idx_score_batch, idx_proj_dim, hidden, batch_size,
+                gpu, comp_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                &pbs.comp_main_score_batch, real_main_proj, hidden, batch_size,
             )?;
+            if ratio == 4 {
+                let idx_wkv = layer.indexer_compressor_wkv.as_ref()
+                    .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?;
+                let idx_wgate = layer.indexer_compressor_wgate.as_ref()
+                    .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
+                gemv_auto_batched(
+                    gpu, idx_wkv, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                    &pbs.comp_idx_kv_batch, idx_proj_dim, hidden, batch_size,
+                )?;
+                gemv_auto_batched(
+                    gpu, idx_wgate, &pbs.tmp_batch, &pbs.tmp_plain_batch,
+                    &pbs.comp_idx_score_batch, idx_proj_dim, hidden, batch_size,
+                )?;
+            }
         }
     }
     // The pre-batched buffers are stored at stride main_proj_dim (=1024)

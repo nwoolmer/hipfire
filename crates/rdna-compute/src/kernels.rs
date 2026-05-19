@@ -1749,6 +1749,16 @@ pub const GEMM_F32_PER_OUTPUT_SRC: &str =
 pub const GEMM_F32_PER_OUTPUT_V4_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_per_output_v4.hip");
 
+/// WMMA F16 × F16 → F32 GEMM with (B, M) output layout.
+/// Replaces gemm_f32_register_tiled for V4F compressor when weights
+/// stay F16 on device. Targets gfx1100+ wave32 WMMA.
+pub const GEMM_F16_X_F16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
+
+/// Bulk F32→F16 conversion for staging WMMA activations.
+pub const CONVERT_F32_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/convert_f32_to_f16.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for

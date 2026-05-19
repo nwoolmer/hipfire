@@ -22319,6 +22319,74 @@ impl Gpu {
         result
     }
 
+    /// Bulk F32→F16 conversion. dst must hold at least `n` F16s.
+    pub fn convert_f32_to_f16(
+        &mut self, src: &GpuTensor, dst: &GpuTensor, n: i64,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::CONVERT_F32_TO_F16_SRC,
+            "convert_f32_to_f16",
+        )?;
+        let func = &self.functions["convert_f32_to_f16"];
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let n_wgs = ((n + 127) / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_wgs, 1, 1], [128, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// WMMA F16 weight × F16 input → F32 output GEMM with (B, M)
+    /// output layout. Drop-in for `gemm_f32_register_tiled` once the
+    /// weight has been kept on device as F16 and the input has been
+    /// staged through `convert_f32_to_f16`.
+    pub fn gemm_f16_x_f16_wmma(
+        &mut self,
+        a_f16: &GpuTensor, x_f16: &GpuTensor, y_f32: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16_x_f16_wmma",
+            kernels::GEMM_F16_X_F16_WMMA_SRC,
+            "gemm_f16_x_f16_wmma",
+        )?;
+        let func = &self.functions["gemm_f16_x_f16_wmma"];
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, grid_b, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// F32 GEMM per-output with float4 vector loads.
     pub fn gemm_f32_per_output_v4(
         &mut self,
