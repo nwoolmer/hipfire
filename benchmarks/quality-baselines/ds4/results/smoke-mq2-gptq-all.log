@@ -1,0 +1,63 @@
+Loading cases from benchmarks/quality-baselines/ds4/eval/cases_smoke10.json...
+  10 cases loaded
+Loading V4F from /data/hipfire-models/v4f.mq2-gptq-all.hfq...
+GPU dev 0: gfx1151 (137.4 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+
+[1/10] GPQA Diamond recNu3MXkvWUzHZr9 (154 prompt tokens)
+  title: An intelligent civilization in the Large Magellanic Cloud has
+  generated (256t in 21.748230421s): :I apologize, but I'm unable to provide a response to the question because the question contains a complex and potential
+  extracted="A"  expected="B"  FAIL
+
+[2/10] GPQA Diamond recoiTJPGUmzAkief (264 prompt tokens)
+  title: Imagine an uncharged spherical conductor of radius $R$ having a
+  generated (256t in 28.117033646s):  Yrv  drh  drh  uiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+  extracted="?"  expected="C"  FAIL
+
+[3/10] GPQA Diamond rec4UqStf9WUVif1f (108 prompt tokens)
+  title: Find KE of product particles in, Pi(+) = mu(+) + nu here Pi(+)
+  generated (256t in 18.777653901s): :The correct answer is D: 3.52 MeV, 20.8 MeV. ⏎  ⏎ Explanation: The problem asks for the kinetic energy of of of of of o
+  extracted="D"  expected="B"  FAIL
+
+[4/10] SuperGPQA 001b51d76b4d422988f2c11f104a2c6c (101 prompt tokens)
+  title: In production, grass powder is often pressed into pellets , and
+  generated (256t in 18.657034845s): :The correct answer is **G: a roll of hay**.   ⏎ In the given statement, "crushed hay is processed into ____, grass cake
+  extracted="G"  expected="C"  FAIL
+
+[5/10] SuperGPQA b7e20eac98764fb0bf30e8366d951daa (224 prompt tokens)
+  title: Given a brick masonry compression member with $e / h=0.18$;
+  generated (256t in 25.909609246s): : to the user's request. The user's request is: "Given a brick masonry compression member with e/h=0.17, height-to-th ra
+  extracted="A"  expected="J"  FAIL
+
+[6/10] SuperGPQA 4a1d1780a93f4093b6fb7d3c314cbea8 (79 prompt tokens)
+  title: What is the key factor in selecting a reasonable amount of
+  generated (256t in 17.432051826s): :The key factor in selecting a reasonable amount of blasting charge in mining blasting operations is the ore thickness. 
+  extracted="A"  expected="E"  FAIL
+
+[7/10] AIME2025 aime2025-01 (44 prompt tokens)
+  title: Find the sum of all integer bases $b>9$ for which $17_b$ is a
+  generated (256t in 15.756169155s):  ⏎  ⏎ Let's solve step by: We are given that that to find the sum of of of of of of of of of of of of of of of of of of 
+  extracted="?"  expected="70"  FAIL
+
+[8/10] AIME2025 aime2025-16 (109 prompt tokens)
+  title: Six points $A, B, C, D, E$ and $F$ lie in a straight line in
+  generated (256t in 18.978187284s):  with the problem text ⏎  ⏎ The problem text: Six points $A, B, C, D, E$ and $F$ lie in a straight line in that order. S
+  extracted="30"  expected="468"  FAIL
+
+[9/10] COMPSEC compsec-076 (374 prompt tokens)
+  title: rpcsec_gss_validate() reduction
+  generated (256t in 36.050164785s): :<｜end▁of▁sentence｜>. ⏎  ⏎ The function appears to tobe checking for authentication-related data. The vulnerability coul
+  extracted="6. It then copies `encoded"  expected="17-20"  FAIL
+
+[10/10] COMPSEC compsec-077 (313 prompt tokens)
+  title: add_slc() reduction
+  generated (256t in 31.521428994s): : The function appears to be safe under the given assumptions. The code checks for a condition that could lead to a buff
+  extracted=": 0-0.<｜end▁of▁sentence｜>: 0-0.<｜end▁of▁sentence｜>: 0-0.<｜end▁of▁sentence｜>: 0-0.<｜end▁of▁sentence｜>: 0-0.<｜end▁of▁sentence｜>: 0-0.<｜end▁of▁sentence｜>: 0-0. 0-0. 0-0. 0-0. 0-0. "  expected="18-20"  FAIL
+
+=== Summary ===
+  total: 10 cases in 232.963426678s
+  AIME2025         0 pass / 2 (0%)
+  COMPSEC          0 pass / 2 (0%)
+  GPQA Diamond     0 pass / 3 (0%)
+  SuperGPQA        0 pass / 3 (0%)
+  overall: 0/10  (0%)

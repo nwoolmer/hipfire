@@ -1,0 +1,63 @@
+Loading cases from benchmarks/quality-baselines/ds4/eval/cases_smoke10.json...
+  10 cases loaded
+Loading V4F from /data/hipfire-models/v4f.antirezQ8.hfq...
+GPU dev 0: gfx1151 (137.4 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+
+[1/10] GPQA Diamond recNu3MXkvWUzHZr9 (154 prompt tokens)
+  title: An intelligent civilization in the Large Magellanic Cloud has
+  generated (256t in 32.487090174s): We are given: ⏎  ⏎ - Speed \( v = 0.99999987 \, c \) ⏎ - Lifetime of alien: 150 years (presumably in their own time, i.e
+  extracted="D"  expected="B"  FAIL
+
+[2/10] GPQA Diamond recoiTJPGUmzAkief (264 prompt tokens)
+  title: Imagine an uncharged spherical conductor of radius $R$ having a
+  generated (256t in 41.757566283s): We are analyzing the situation of a point charge \(+q\) placed inside a cavity inside a grounded or neutral spherical co
+  extracted="C"  expected="C"  PASS
+
+[3/10] GPQA Diamond rec4UqStf9WUVif1f (108 prompt tokens)
+  title: Find KE of product particles in, Pi(+) = mu(+) + nu here Pi(+)
+  generated (256t in 28.273448998s): We are given: ⏎  ⏎ - \( m_\pi = 139.6 \, \text{MeV} \) (rest mass of \(\pi^+\)) ⏎ - \( m_\mu = 105.7 \, \text{ \text{MeV
+  extracted="C"  expected="B"  FAIL
+
+[4/10] SuperGPQA 001b51d76b4d422988f2c11f104a2c6c (101 prompt tokens)
+  title: In production, grass powder is often pressed into pellets , and
+  generated (256t in 27.906990862s): The phrase "grass cake" suggests a compressed, solid form of processed grass, similar to how "grass powder" is pressed i
+  extracted="C"  expected="C"  PASS
+
+[5/10] SuperGPQA b7e20eac98764fb0bf30e8366d951daa (224 prompt tokens)
+  title: Given a brick masonry compression member with $e / h=0.18$;
+  generated (256t in 38.127328058s): Based on the given parameters—**e/h = 0.15–0.20**, **β = 17**, **seismic intensity 7**, and **Class II soil**—the struct
+  extracted="J"  expected="J"  PASS
+
+[6/10] SuperGPQA 4a1d1780a93f4093b6fb7d3c314cbea8 (79 prompt tokens)
+  title: What is the key factor in selecting a reasonable amount of
+  generated (256t in 25.80938184s): **Answer: B. blast pattern**<｜end▁of▁sentence｜><｜end▁of▁sentence｜><｜end▁of▁sentence｜>** ⏎  ⏎ **Explanation:**   ⏎ The ke
+  extracted="B"  expected="E"  FAIL
+
+[7/10] AIME2025 aime2025-01 (44 prompt tokens)
+  title: Find the sum of all integer bases $b>9$ for which $17_b$ is a
+  generated (256t in 23.171614009s): We are given that \( b > 9 \) and \( 17_b \) divides \( 97_b \). ⏎  ⏎ First, convert these numbers from base \( b \) to 
+  extracted="70"  expected="70"  PASS
+
+[8/10] AIME2025 aime2025-16 (109 prompt tokens)
+  title: Six points $A, B, C, D, E$ and $F$ lie in a straight line in
+  generated (256t in 28.841682631s): We are given six points \(A, B, C, D, E, F\) in order on a line, and a point \(G\) not on the line. We are given several
+  extracted="0"  expected="468"  FAIL
+
+[9/10] COMPSEC compsec-076 (374 prompt tokens)
+  title: rpcsec_gss_validate() reduction
+  generated (256t in 52.425336287s): Answer 20 ⏎  ⏎ The vulnerability is a buffer overflow on line 20. The `memcpy` copies `encoded_len` bytes into the fixed
+  extracted="Answer 20"  expected="17-20"  PASS
+
+[10/10] COMPSEC compsec-077 (313 prompt tokens)
+  title: add_slc() reduction
+  generated (256t in 46.489445857s): The primary bug is introduced at line **18**.   ⏎  ⏎ The function does not check whether `s->used + 3 exceeds SLCB_SIZE 
+  extracted="Answer:** 18<｜end▁of▁sentence｜><｜end▁of▁sentence｜><｜end▁of▁sentence｜>, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct answer is **18**.<｜end▁of▁sentence｜>quently, the correct"  expected="18-20"  PASS
+
+=== Summary ===
+  total: 10 cases in 345.310162986s
+  AIME2025         1 pass / 2 (50%)
+  COMPSEC          2 pass / 2 (100%)
+  GPQA Diamond     1 pass / 3 (33%)
+  SuperGPQA        2 pass / 3 (66%)
+  overall: 6/10  (60%)

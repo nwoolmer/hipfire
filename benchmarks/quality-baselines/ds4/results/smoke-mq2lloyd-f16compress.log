@@ -1,0 +1,63 @@
+Loading cases from benchmarks/quality-baselines/ds4/eval/cases_smoke10.json...
+  10 cases loaded
+Loading V4F from /data/hipfire-models/v4f.mq2lloyd-f16compress.hfq...
+GPU dev 0: gfx1151 (137.4 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+
+[1/10] GPQA Diamond recNu3MXkvWUzHZr9 (154 prompt tokens)
+  title: An intelligent civilization in the Large Magellanic Cloud has
+  generated (256t in 26.286428056s): We are given: ⏎  ⏎ - Speed \( v = 0.99999987 \, c \) ⏎ - The astronaut's age at the start: 22 years (from their perspect
+  extracted="D"  expected="B"  FAIL
+
+[2/10] GPQA Diamond recoiTJPGUmzAkief (264 prompt tokens)
+  title: Imagine an uncharged spherical conductor of radius $R$ having a
+  generated (256t in 34.302050154s): We can reason through the problem step by step. ⏎  ⏎ The spherical conductor is uncharged overall, but it has a cavity i
+  extracted="C"  expected="C"  PASS
+
+[3/10] GPQA Diamond rec4UqStf9WUVif1f (108 prompt tokens)
+  title: Find KE of product particles in, Pi(+) = mu(+) + nu here Pi(+)
+  generated (256t in 22.980096634s): We are given the decay: ⏎  ⏎ \[ ⏎ \pi^+ \to \mu^+ + \nu_\mu ⏎ \] ⏎  ⏎ The pion is at rest. The masses: ⏎ - \( m_\pi = 13
+  extracted="C"  expected="B"  FAIL
+
+[4/10] SuperGPQA 001b51d76b4d422988f2c11f104a2c6c (101 prompt tokens)
+  title: In production, grass powder is often pressed into pellets , and
+  generated (256t in 23.11806842s): The phrase "processed into ____, grass cake" suggests a form that is similar to a "cake" — something pressed and shaped 
+  extracted="C"  expected="C"  PASS
+
+[5/10] SuperGPQA b7e20eac98764fb0bf30e8366d951daa (224 prompt tokens)
+  title: Given a brick masonry compression member with $e / h=0.18$;
+  generated (256t in 31.358952624s): Based on the given conditions:   ⏎ - \( e/h = 0.10 \) (likely a typo in the problem statement; typical interpretation is
+  extracted="J"  expected="J"  PASS
+
+[6/10] SuperGPQA 4a1d1780a93f4093b6fb7d3c314cbea8 (79 prompt tokens)
+  title: What is the key factor in selecting a reasonable amount of
+  generated (256t in 21.05128934s): The key factor in selecting a reasonable amount of blasting charge in mining bl operations is **E. ore hardness**. ⏎  ⏎ 
+  extracted="E"  expected="E"  PASS
+
+[7/10] AIME2025 aime2025-01 (44 prompt tokens)
+  title: Find the sum of all integer bases $b>9$ for which $17_b$ is a
+  generated (256t in 18.923577347s): We are given that \(b > 9\) and \(17_b\) divides \(97_b\).   ⏎ First, convert these to base 10: ⏎  ⏎ \[ ⏎ 17_b = 1 \cdot
+  extracted="16"  expected="70"  FAIL
+
+[8/10] AIME2025 aime2025-16 (109 prompt tokens)
+  title: Six points $A, B, C, D, E$ and $F$ lie in a straight line in
+  generated (256t in 23.48894974s): We are given six points \(A, B, C, D, E, F\) in order on a line, and a point \(G\) not on the line. We are given several
+  extracted="0"  expected="468"  FAIL
+
+[9/10] COMPSEC compsec-076 (374 prompt tokens)
+  title: rpcsec_gss_validate() reduction
+  generated (256t in 43.573248689s): The primary bug is introduced at line **20**. The `memcpy` copies `encoded_len` bytes from `body` into the stack buffer 
+  extracted="Answer: 20<｜end▁of▁sentence｜><｜end▁of▁sentence｜>"  expected="17-20"  PASS
+
+[10/10] COMPSEC compsec-077 (313 prompt tokens)
+  title: add_slc() reduction
+  generated (256t in 38.28722363s): The primary bug is introduced at line 18. The function increments `s->used` in the expression `s->buf[s->used++]` before
+  extracted="Answer: 18**<｜end▁of▁sentence｜>C<｜end▁of▁sentence｜>, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug is introduced at line 18.<｜end▁of▁sentence｜>C, the bug"  expected="18-20"  PASS
+
+=== Summary ===
+  total: 10 cases in 283.384429221s
+  AIME2025         0 pass / 2 (0%)
+  COMPSEC          2 pass / 2 (100%)
+  GPQA Diamond     1 pass / 3 (33%)
+  SuperGPQA        3 pass / 3 (100%)
+  overall: 6/10  (60%)
