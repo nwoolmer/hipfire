@@ -2425,13 +2425,121 @@ pub fn forward_prefill_batch(
     if tokens.is_empty() {
         return Err("forward_prefill_batch: empty tokens slice".to_string());
     }
-    // Per-token fallback. Future Phase B2 chunks the loop into
-    // forward_prefill_batch_chunk calls of up to `_scratch.max_batch`.
+    // Per-token fallback until forward_prefill_batch_chunk is end-to-end.
     let mut last_logits = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
         last_logits = decode_step(cfg, weights, state, gpu, tok, start_pos + i as u32)?;
     }
     Ok(last_logits)
+}
+
+/// Single-chunk batched forward pass — Phase B2 work in progress.
+///
+/// Processes a chunk of `tokens.len()` ≤ `pbs.max_batch` positions
+/// starting at `start_pos` through one batched forward. Mirrors
+/// `decode_step` but with each per-layer stage swapped for its batched
+/// twin. Returns the logits at the LAST position only.
+///
+/// Currently a partial wiring — runs through the stages that have
+/// shipped batched bodies (embedding, HC stream init, q_lora,
+/// kv_joint, tail RoPE) then errors out at the first unbatched stage
+/// (the indexer + mixed attention dispatch). Each subsequent commit
+/// replaces one error path with a real batched body until the chunk
+/// runs end-to-end.
+///
+/// **Stages and their status (2026-05-18):**
+///   ✓ token-ids upload → pbs.tokens
+///   ✓ positions upload → pbs.positions
+///   ✓ batched embedding lookup → pbs.embed_batch
+///   ✓ HC streams broadcast init → pbs.streams_batch
+///   ✓ per-layer q_lora_batched (Phase B2)
+///   ✓ per-layer kv_joint_batched (Phase B2)
+///   ✓ per-layer apply_tail_rope_batched (Phase B2)
+///   ☐ per-layer mhc_pre_batched
+///   ☐ per-layer compressor (loop sequential per A4 deferral)
+///   ☐ per-layer indexer_forward_batched
+///   ☐ per-layer mixed attention (wire v4f_attn_swa_topk_batched)
+///   ☐ per-layer wo projection (gemv_auto_batched, two-stage O-LoRA)
+///   ☐ per-layer hc_attn_mix_batched
+///   ☐ per-layer ffn_routed_batched + hc_ffn_mix_batched
+///   ☐ final_norm + lm_head (last position only)
+///
+/// Until all stages are wired this function returns an error from the
+/// first unimplemented stage; callers should keep dispatching through
+/// `forward_prefill_batch`'s per-token fallback for now.
+#[allow(dead_code)]
+pub fn forward_prefill_batch_chunk(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    _state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    tokens: &[u32],
+    start_pos: u32,
+) -> Result<(), String> {
+    let n = tokens.len();
+    if n == 0 {
+        return Err("forward_prefill_batch_chunk: empty tokens".to_string());
+    }
+    if n > pbs.max_batch {
+        return Err(format!(
+            "forward_prefill_batch_chunk: chunk size {n} > max_batch {}",
+            pbs.max_batch
+        ));
+    }
+
+    // 1. Upload token ids and absolute positions for this chunk.
+    let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let token_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(token_ids_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.tokens.buf, token_bytes)
+        .map_err(|e| format!("htod tokens: {e:?}"))?;
+
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos as i32) + i as i32).collect();
+    let positions_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)
+        .map_err(|e| format!("htod positions: {e:?}"))?;
+
+    // 2. Batched embedding lookup → pbs.embed_batch [n, hidden].
+    let token_embd = weights.token_embd.as_ref()
+        .ok_or_else(|| "forward_prefill_batch_chunk: token_embd not uploaded".to_string())?;
+    gpu.embedding_lookup_q8_batched(token_embd, &pbs.embed_batch, &pbs.tokens, n, cfg.hidden_size)
+        .map_err(|e| format!("embedding_lookup_q8_batched: {e:?}"))?;
+
+    // 3. Broadcast embed → all 4 HC residual streams [n, hc_mult, hidden].
+    gpu.hc_streams_init_from_embed_batched(
+        &pbs.embed_batch, &pbs.streams_batch,
+        cfg.hidden_size as i32, cfg.hc_mult as i32, n as i32,
+    ).map_err(|e| format!("hc_streams_init_from_embed_batched: {e:?}"))?;
+
+    // 4. Per-layer loop — only the stages that have shipped batched
+    //    bodies run for now. The mhc_pre + attention + ffn + hc_mix
+    //    stages remain pending; this function will error before doing
+    //    anything useful until those land. The per-layer stages that
+    //    DO run write into pbs.{tmp_batch, tmp_plain_batch, q_lat_*,
+    //    q_batch, kv_batch}; consumers downstream of the bodies that
+    //    haven't shipped yet would read uninitialised slots, so we
+    //    bail out before any attention dispatch.
+    for layer_idx in 0..cfg.num_hidden_layers {
+        // Stage: q_lora_batched (consumes pbs.streams_batch indirectly
+        // via mhc_pre's hc_x_in output — once mhc_pre_batched exists.
+        // Until then we'd read uninit memory, so skip these stages and
+        // return the placeholder error below.)
+        let _ = layer_idx;
+        return Err(format!(
+            "forward_prefill_batch_chunk: layer 0 mhc_pre_batched not yet \
+             implemented — q_lora_batched/kv_joint_batched/apply_tail_rope_batched \
+             are wired but the chunk forward needs the mhc_pre_batched + \
+             attention + ffn + hc_mix batched bodies before any per-layer \
+             stage can run end-to-end. Continue via forward_prefill_batch's \
+             per-token fallback path."
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
