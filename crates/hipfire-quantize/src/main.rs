@@ -1774,7 +1774,10 @@ fn quantize_mq2g256_lloyd_weighted(
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
             if range > 0.0 {
-                let max_iter = 8;
+                // 16-iter cap matches the plain Lloyd path; per the
+                // lloyd_iteration_headroom probe, this reaches the MSE
+                // plateau on heavy-tailed + sparse distributions.
+                let max_iter = 16;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     // Weighted centroid update: cb[k] = sum_{i in k} w_i * v_i / sum_{i in k} w_i.
@@ -1866,25 +1869,44 @@ fn quantize_mq2g256_lloyd_gptq(
     assert!(blocks_per_row > 0, "col_weights too short");
     let mut output = vec![0u8; n_blocks * block_bytes];
 
-    // Tunable: forward-propagation damping. d=0.8 is the chosen
-    // default after a [0.3, 1.0] sweep on Qwen3.6-35B-A3B:
+    // Tunable: forward-propagation damping.
     //
-    //   d=0.3 → PPL 12.24 | 7 ok / 3 warn — fails fibonacci_c
-    //   d=0.5 → PPL 12.84 | 6 ok / 4 warn
-    //   d=0.8 → PPL 14.66 | 9 ok / 1 warn — passes fibonacci_c ← best
-    //   d=1.0 → PPL 18.28 | 9 ok / 1 warn
+    // 2026-05-19 update — damping default changed to 0.0 (was 0.8) after
+    // the gptq_damping_probe synthetic-data sweep showed monotonic MSE
+    // regression at every d>0, on every tested distribution including
+    // strongly-correlated AR(1) inputs (decay=0.9). The Qwen3.6-35B-A3B
+    // sweep below historically picked d=0.8 because the model was
+    // quantized with a REAL imatrix file → the imatrix-weighted codebook
+    // fit step paid for the noise the sequential pass injects. On models
+    // built with unit imatrix (V4F all-MQ2-GPTQ), the codebook fit
+    // degenerates to plain Lloyd and the sequential pass contributes ONLY
+    // noise — V4F mq2-gptq-all.hfq measured 1.9-3.3x worse PPL than
+    // mq2lloyd on wikitext2-test as a direct consequence. See
+    // project_gptq_lloyd_pretendgptq_finding memory + the probe results.
     //
-    // PPL favors low damping (less error accumulation in average
-    // likelihood); coherence favors moderate-high damping (fewer
-    // attractor traps). d=0.3 has the best PPL but FAILS the
-    // fibonacci_c prompt that originally motivated this work —
-    // PPL averages across prompts and hides catastrophic regression
-    // on specific high-value prompts. d=0.8 is the smallest damping
-    // that passes the full coherence battery. Override via env var.
+    //   d=0.3 → PPL 12.24 | 7 ok / 3 warn — fails fibonacci_c (Qwen3.6)
+    //   d=0.5 → PPL 12.84 | 6 ok / 4 warn (Qwen3.6)
+    //   d=0.8 → PPL 14.66 | 9 ok / 1 warn — passes fibonacci_c (Qwen3.6)
+    //   d=1.0 → PPL 18.28 | 9 ok / 1 warn (Qwen3.6)
+    //
+    // At d=0 the sequential pass is a no-op and the function is byte-
+    // identical to quantize_mq2g256_lloyd_weighted (which is the right
+    // thing to use directly if you don't need the GPTQ name in the
+    // pipeline log). Override via env var.
     let damping_env: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.8);
+        .unwrap_or(0.0);
+    if damping_env > 0.0 {
+        let has_real_imatrix = col_weights.iter().any(|&w| (w - 1.0).abs() > 1e-6);
+        if !has_real_imatrix {
+            eprintln!(
+                "warning: HIPFIRE_GPTQ_DAMPING={damping_env} with unit imatrix → \
+                 strictly worse than plain Lloyd (see gptq_damping_probe). \
+                 Either provide --imatrix or use --format mq4-mq2lloyd-native."
+            );
+        }
+    }
 
     output
         .par_chunks_mut(block_bytes)
@@ -1918,7 +1940,8 @@ fn quantize_mq2g256_lloyd_gptq(
             ];
             let range = sorted[255] - sorted[0];
             if range > 0.0 {
-                let max_iter = 8;
+                // 16-iter cap matches plain Lloyd; see lloyd_iteration_headroom.
+                let max_iter = 16;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut weighted_sums = [0.0f64; 4];
@@ -2038,10 +2061,13 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
             if range > 0.0 {
-                // Lloyd's iterations — cap at 8, early-exit on stable assignments.
-                // Empirically Lloyd's converges in 4-6 iter for FWHT-rotated weight
-                // distributions; the 12-iter cap was wasteful.
-                let max_iter = 8;
+                // Lloyd's iterations — cap at 16, early-exit on stable assignments.
+                // Synthetic-distribution sweep (see `lloyd_iteration_headroom` test,
+                // 2026-05-19) showed 8-iter cap leaves 0.4-0.9% MSE on the table
+                // for heavy-tailed and sparse-outlier distributions; 16-iter
+                // reaches the MSE plateau (32-iter gives 0% further). Free win on
+                // the next quant rebuild.
+                let max_iter = 16;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut sums = [0.0f64; 4];
