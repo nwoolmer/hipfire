@@ -2191,6 +2191,17 @@ pub struct PrefillBatchScratch {
     /// _batched on the attention side, and the FFN gate/up on the FFN
     /// side.
     pub hc_x_in_batch: GpuTensor,
+    /// Attention contribution `[max_batch, hidden]` produced by the
+    /// attention block (Q · K → softmax → V → wo). Consumed by
+    /// hc_attn_mix_batched as the `transform_out` argument.
+    pub attn_out_batch: GpuTensor,
+    /// FFN contribution `[max_batch, hidden]` produced by the routed
+    /// MoE FFN. Consumed by hc_ffn_mix_batched as `transform_out`.
+    pub ffn_out_batch: GpuTensor,
+    /// Temporary `[max_batch, hc_mult, hidden]` for the hc_mix output
+    /// before it's memcpy'd back into streams_batch. Mirrors the
+    /// sequential path's reuse of `state.q` as the mix-output buffer.
+    pub streams_out_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2237,8 +2248,60 @@ impl PrefillBatchScratch {
             hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch")?,
             hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch")?,
             hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch")?,
+            attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch")?,
+            ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch")?,
+            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch")?,
         })
     }
+}
+
+/// Batched twin of `hc_attn_mix` for Phase B2 chunk forward.
+///
+/// X_{l+1}[b] = comb[b] · X_l[b] + post[b] · attn_out[b]
+/// where comb, post are from the latest mhc_pre_batched(is_attn=true) call.
+/// The mix output is written into pbs.streams_out_batch, then copied
+/// back into pbs.streams_batch (mirrors the sequential pattern of
+/// staging into state.q before the d2d memcpy).
+#[allow(dead_code)]
+fn hc_attn_mix_batched(
+    cfg: &DeepseekV4Config,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<(), String> {
+    gpu.hc_mix_4stream_batched(
+        &pbs.streams_batch, &pbs.hc_comb_batch, &pbs.hc_post_batch,
+        &pbs.attn_out_batch, &pbs.streams_out_batch,
+        cfg.hidden_size as i32, batch_size as i32,
+    ).map_err(|e| format!("hc_mix_4stream_batched (attn): {e:?}"))?;
+
+    let bytes = batch_size * cfg.hc_mult * cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&pbs.streams_batch.buf, &pbs.streams_out_batch.buf, bytes)
+        .map_err(|e| format!("d2d streams_out → streams: {e:?}"))?;
+    Ok(())
+}
+
+/// Batched twin of `hc_ffn_mix`. Same shape as `hc_attn_mix_batched`
+/// but mixes the FFN-side post/comb (produced by the second
+/// mhc_pre_batched call with is_attn=false) and the FFN's transform
+/// output `pbs.ffn_out_batch`.
+#[allow(dead_code)]
+fn hc_ffn_mix_batched(
+    cfg: &DeepseekV4Config,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<(), String> {
+    gpu.hc_mix_4stream_batched(
+        &pbs.streams_batch, &pbs.hc_comb_batch, &pbs.hc_post_batch,
+        &pbs.ffn_out_batch, &pbs.streams_out_batch,
+        cfg.hidden_size as i32, batch_size as i32,
+    ).map_err(|e| format!("hc_mix_4stream_batched (ffn): {e:?}"))?;
+
+    let bytes = batch_size * cfg.hc_mult * cfg.hidden_size * 4;
+    gpu.memcpy_dtod_auto(&pbs.streams_batch.buf, &pbs.streams_out_batch.buf, bytes)
+        .map_err(|e| format!("d2d streams_out → streams: {e:?}"))?;
+    Ok(())
 }
 
 /// Batched twin of `mhc_pre` for Phase B2 chunk forward.
