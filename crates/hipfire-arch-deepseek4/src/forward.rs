@@ -2220,6 +2220,14 @@ pub struct PrefillBatchScratch {
     /// v4f_attn_swa_topk_batched_f32; consumed by inverse RoPE + the
     /// O-LoRA wo_a/wo_b projection chain.
     pub attn_out_raw_batch: GpuTensor,
+    /// FWHT-rotated attn_out_raw `[max_batch, n_heads * head_dim]`.
+    /// Input to per-group wo_a batched GEMV (MQ4 weight path).
+    pub attn_out_raw_rot_batch: GpuTensor,
+    /// wo_a output `[max_batch, n_groups, o_lora_rank]`.
+    pub wo_a_out_batch: GpuTensor,
+    /// FWHT-rotated wo_a output `[max_batch, n_groups * o_lora_rank]`.
+    /// Input to wo_b batched GEMV (MQ4 weight path).
+    pub wo_a_out_rot_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2274,6 +2282,9 @@ impl PrefillBatchScratch {
             n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr")?,
             n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr")?,
             attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch")?,
+            attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch")?,
+            wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch")?,
+            wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch")?,
         })
     }
 }
@@ -2301,6 +2312,184 @@ fn hc_attn_mix_batched(
     let bytes = batch_size * cfg.hc_mult * cfg.hidden_size * 4;
     gpu.memcpy_dtod_auto(&pbs.streams_batch.buf, &pbs.streams_out_batch.buf, bytes)
         .map_err(|e| format!("d2d streams_out → streams: {e:?}"))?;
+    Ok(())
+}
+
+/// Pure-SWA batched attention block (compress_ratio == 0 layers).
+///
+/// Stages:
+///   1. Lazy-alloc state._attention[L].swa_k / swa_v rings (per layer)
+///   2. swa_visibility_stage_batched: pre-chunk ring + within-chunk
+///      kv_batch → pbs.swa_staged_batch [B, head_dim, swa_window]
+///   3. Upload per-batch n_valid_swa_arr
+///   4. v4f_attn_swa_batched (K=V tied: pass swa_staged for both args)
+///      → pbs.attn_out_raw_batch
+///   5. Inverse tail RoPE (plain or YaRN per HIPFIRE_V4F_NO_YARN)
+///   6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch
+///   7. wo_per_group_batched_f32 → pbs.wo_a_out_batch (F32 wo_a only)
+///   8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch
+///   9. gemv_auto_batched(wo_b, ..., pbs.attn_out_batch)
+///   10. swa_ring_write_batched: advance ring with chunk's KVs
+///
+/// hc_attn_mix_batched is called by the chunk-forward caller after
+/// this returns (mirrors the sequential ordering).
+#[allow(dead_code)]
+fn attention_block_batched_swa_only(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    start_pos: u32,
+    batch_size: usize,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let attn_sink = layer.attn_sink.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} attn_sink missing"))?;
+    let wo_a = layer.wo_a.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_a missing"))?;
+    let wo_b = layer.wo_b.as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wo_b missing"))?;
+
+    let n_kv = cfg.num_key_value_heads;
+    let win = cfg.sliding_window;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let n_groups = cfg.o_groups;
+    let o_lora_rank = cfg.o_lora_rank;
+    let groups_o_lora = n_groups * o_lora_rank;
+
+    // 1. Lazy-alloc the per-layer SWA ring (zero-init: pre-chunk
+    //    visibility for early positions reads zero history correctly).
+    {
+        let attn = &mut state._attention[layer_idx];
+        if attn.swa_k.is_none() {
+            attn.swa_k = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                .map_err(|e| format!("alloc swa_k l{layer_idx}: {e:?}"))?);
+        }
+        if attn.swa_v.is_none() {
+            attn.swa_v = Some(gpu.zeros(&[n_kv, head_dim, win], DType::F32)
+                .map_err(|e| format!("alloc swa_v l{layer_idx}: {e:?}"))?);
+        }
+    }
+    let swa_k_ref = state._attention[layer_idx].swa_k.as_ref().unwrap().buf.as_ptr();
+    let swa_v_ref = state._attention[layer_idx].swa_v.as_ref().unwrap().buf.as_ptr();
+    let _ = (swa_k_ref, swa_v_ref); // borrow workaround handled below
+
+    // 2. Stage per-batch SWA visibility window from pre-chunk ring +
+    //    within-chunk kv_batch. V4F K=V tied so we only stage once and
+    //    pass swa_staged_batch as both K and V args.
+    {
+        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+        gpu.swa_visibility_stage_batched(
+            swa_k, &pbs.kv_batch, &pbs.swa_staged_batch,
+            start_pos as i32, win as i32, head_dim as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_visibility_stage_batched l{layer_idx}: {e:?}"))?;
+    }
+
+    // 3. Compute and upload per-batch n_valid_swa_arr.
+    //    n_valid_swa[b] = min(start_pos + b + 1, swa_window).
+    let n_valid_host: Vec<i32> = (0..batch_size)
+        .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
+        .collect();
+    let n_valid_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+        .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
+
+    // 4. v4f_attn_swa_batched. o_groups passed through for ABI parity
+    //    (unused inside the kernel).
+    gpu.v4f_attn_swa_batched(
+        &pbs.q_batch, &pbs.swa_staged_batch, &pbs.swa_staged_batch,
+        attn_sink, &pbs.n_valid_swa_arr, &pbs.attn_out_raw_batch,
+        n_heads as i32, head_dim as i32, n_groups as i32, win as i32,
+        batch_size as i32,
+    ).map_err(|e| format!("v4f_attn_swa_batched l{layer_idx}: {e:?}"))?;
+
+    // 5. Inverse tail RoPE on attn_out_raw_batch.
+    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
+        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+            gpu.rope_tail_inverse_batched(
+                &pbs.attn_out_raw_batch, &pbs.positions,
+                n_heads as i32, head_dim as i32,
+                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
+                batch_size as i32,
+            ).map_err(|e| format!("rope_tail_inverse_batched l{layer_idx}: {e:?}"))?;
+        } else {
+            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                layer_rope_params(cfg, layer.compress_ratio);
+            // n_heads_k=0: K already written + tail-rope'd at kv_joint
+            // time; only un-rotate Q-tail-equivalents in attn_out.
+            gpu.rope_tail_yarn_interleaved_batched(
+                &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
+                n_heads as i32, 0,
+                head_dim as i32, cfg.qk_rope_head_dim as i32,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                corr_low, corr_high,
+                /*inverse=*/1, batch_size as i32,
+            ).map_err(|e| format!("rope_tail_yarn_interleaved_batched (inv) l{layer_idx}: {e:?}"))?;
+        }
+    }
+
+    // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
+    //    The full [B, n_heads * head_dim] vector at once.
+    gpu.rotate_x_mq_batched(
+        &pbs.attn_out_raw_batch, &pbs.attn_out_raw_rot_batch,
+        n_heads * head_dim, batch_size,
+    ).map_err(|e| format!("rotate attn_out_raw_batch l{layer_idx}: {e:?}"))?;
+
+    // 7. wo_a per-group batched. F32 weights only for now.
+    let per_group_in = (n_heads / n_groups) * head_dim;
+    match wo_a.dtype {
+        DType::F32 => {
+            // Use rotated input for MQ4 path; we have F32, so plain input.
+            // wo_a_per_group expects [B, G, K] input — the rotated buffer
+            // IS [B, n_heads * head_dim] which views as [B, G, K] with
+            // K = (n_heads / G) * head_dim = per_group_in.
+            gpu.wo_per_group_batched_f32(
+                wo_a, &pbs.attn_out_raw_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        _ => return Err(format!(
+            "attention_block_batched_swa_only l{layer_idx}: wo_a.dtype={:?} not yet \
+             supported (only F32 wo_a has a per-group batched kernel). Q8 and MQ4 \
+             wo_a variants need wo_per_group_batched_{{q8_0,mq4g256}} kernels.",
+            wo_a.dtype
+        )),
+    }
+
+    // 8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch.
+    gpu.rotate_x_mq_batched(
+        &pbs.wo_a_out_batch, &pbs.wo_a_out_rot_batch,
+        groups_o_lora, batch_size,
+    ).map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+
+    // 9. wo_b GEMV batched: wo_a_out_rot_batch → attn_out_batch.
+    //    Standard non-block-diagonal GEMV; gemv_auto_batched handles
+    //    F32/Q8/MQ4 dispatch.
+    gemv_auto_batched(
+        gpu, wo_b, &pbs.wo_a_out_rot_batch, &pbs.wo_a_out_batch,
+        &pbs.attn_out_batch, cfg.hidden_size, groups_o_lora, batch_size,
+    )?;
+
+    // 10. Advance the SWA ring with this chunk's KVs for future steps.
+    {
+        let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
+        let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
+        gpu.swa_ring_write_batched_f32(
+            &pbs.kv_batch, swa_k, n_kv as i32, head_dim as i32, win as i32,
+            start_pos as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_ring_write_batched (k) l{layer_idx}: {e:?}"))?;
+        gpu.swa_ring_write_batched_f32(
+            &pbs.kv_batch, swa_v, n_kv as i32, head_dim as i32, win as i32,
+            start_pos as i32, batch_size as i32,
+        ).map_err(|e| format!("swa_ring_write_batched (v) l{layer_idx}: {e:?}"))?;
+    }
+
     Ok(())
 }
 
@@ -2705,7 +2894,7 @@ pub fn forward_prefill_batch(
 pub fn forward_prefill_batch_chunk(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
-    _state: &mut DeepseekV4State,
+    state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     pbs: &PrefillBatchScratch,
     tokens: &[u32],
@@ -2771,18 +2960,38 @@ pub fn forward_prefill_batch_chunk(
         // Tail-only RoPE on q_batch and kv_batch in-place.
         apply_tail_rope_batched(cfg, weights, pbs, gpu, layer_idx, n)?;
 
-        // ── Pending: attention block ───────────────────────────────
-        // Need (per layer): SWA ring write batched + indexer score/
-        // gather batched + v4f_attn_swa_topk_batched_f32 dispatch +
-        // rope_tail_inverse + per-group O-LoRA wo_a/wo_b batched.
-        // Then attn_out_batch is ready; hc_attn_mix_batched updates
-        // streams_batch. Then mhc_pre_batched(is_attn=false) +
-        // ffn_routed_batched + hc_ffn_mix_batched complete the layer.
+        // ── Attention block: pure-SWA for compress_ratio==0, bail for
+        //    mixed layers (indexer chain wiring is the next stage).
+        let layer = &weights.layers[layer_idx];
+        if layer.compress_ratio == 0 {
+            attention_block_batched_swa_only(
+                cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,
+            )?;
+        } else {
+            return Err(format!(
+                "forward_prefill_batch_chunk: layer {layer_idx} has \
+                 compress_ratio={} — mixed-attention indexer chain \
+                 batched dispatch not yet wired.",
+                layer.compress_ratio
+            ));
+        }
+
+        // hc_attn_mix: integrate attn_out_batch into streams_batch.
+        hc_attn_mix_batched(cfg, pbs, gpu, n)?;
+
+        // FFN side: mhc_pre with is_attn=false, then ffn_routed_batched,
+        // then hc_ffn_mix_batched.
+        mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/false, n)?;
+
+        // ── Pending: ffn_routed_batched (V4F MoE position-batched
+        //    GEMV variants don't exist yet) + hc_ffn_mix_batched.
         return Err(format!(
-            "forward_prefill_batch_chunk: layer {layer_idx} reached attention \
-             stage — per-batch SWA ring write + indexer + v4f_attn_swa_topk_-
-             batched + O-LoRA wo + ffn_routed_batched not yet wired. \
-             Callers should fall back to per-token decode_step for now."
+            "forward_prefill_batch_chunk: layer {layer_idx} reached FFN — \
+             ffn_routed_batched not yet wired. The V4F MoE GEMV kernels \
+             (v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed, \
+              v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed) \
+             are k_top-batched per single position; need new \
+             _position_batched variants that add an outer B dim."
         ));
     }
 
