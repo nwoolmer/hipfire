@@ -1698,3 +1698,8 @@ pub const HC_MIX_4STREAM_BATCHED_SRC: &str =
 /// HC_INPUT_MAP_SRC; batch dim parallelizes cleanly across blockIdx.y.
 pub const HC_INPUT_MAP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_input_map_batched.hip");
+
+/// Broadcast batched embedding rows into the 4 HC residual streams
+/// (Phase B2, 2026-05-18). Replaces the per-token loop of memcpys.
+pub const HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_streams_init_from_embed_batched.hip");

@@ -20720,6 +20720,49 @@ impl Gpu {
         }
     }
 
+    /// Phase B2 — Broadcast batched embed `[B, hidden]` into all `hc_mult`
+    /// slots of the residual-streams buffer `[B, hc_mult, hidden]`. Single
+    /// kernel launch in place of B × hc_mult d2d memcpys.
+    #[allow(dead_code)]
+    pub fn hc_streams_init_from_embed_batched(
+        &mut self,
+        embed: &GpuTensor,
+        streams: &GpuTensor,
+        hidden: i32,
+        hc_mult: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hc_streams_init_from_embed_batched",
+            kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC,
+            "hc_streams_init_from_embed_batched",
+        )?;
+        let func = &self.functions["hc_streams_init_from_embed_batched"];
+        let ep = embed.buf.as_ptr();
+        let sp = streams.buf.as_ptr();
+        let mut h = hidden;
+        let mut hm = hc_mult;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut hm as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((hidden + 255) / 256) as u32, batch_size as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Phase A5 — Batched HC 4-stream residual mix. Per batch position b:
     /// `x_out[b, s, d] = sum_t(A[b, s, t] * x_in[b, t, d]) + scale[b, s] * transform_out[b, d]`.
     /// At batch_size == 1, byte-identical to hc_mix_4stream.
