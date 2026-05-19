@@ -5928,6 +5928,92 @@ mod gptq_damping_probe {
         out
     }
 
+    /// Dequant for MQ3-Lloyd (qt=20): 16 B fp16 codebook (8 entries) +
+    /// 96 B 3-bit packed indices = 112 B / 256 weights.
+    fn dequantize_mq3g256_lloyd_to_f32(
+        data: &[u8], n_weights: usize, signs1: &[f32], signs2: &[f32],
+    ) -> Vec<f32> {
+        let group_size = 256;
+        let block_bytes = 112;
+        let n_blocks = (n_weights + group_size - 1) / group_size;
+        assert!(data.len() >= n_blocks * block_bytes);
+        let mut out = vec![0.0f32; n_weights];
+        for b in 0..n_blocks {
+            let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+            let mut cb = [0.0f32; 8];
+            for k in 0..8 {
+                cb[k] = f16_to_f32(u16::from_le_bytes([blk[2 * k], blk[2 * k + 1]]));
+            }
+            let mut group = [0.0f32; 256];
+            for chunk in 0..32 {
+                let bo = 16 + chunk * 3;
+                let b0 = blk[bo]; let b1 = blk[bo + 1]; let b2 = blk[bo + 2];
+                let mut q = [0u8; 8];
+                q[0] = b0 & 7;
+                q[1] = (b0 >> 3) & 7;
+                q[2] = ((b0 >> 6) & 3) | ((b1 & 1) << 2);
+                q[3] = (b1 >> 1) & 7;
+                q[4] = (b1 >> 4) & 7;
+                q[5] = ((b1 >> 7) & 1) | ((b2 & 3) << 1);
+                q[6] = (b2 >> 2) & 7;
+                q[7] = (b2 >> 5) & 7;
+                for j in 0..8 {
+                    group[chunk * 8 + j] = cb[q[j] as usize];
+                }
+            }
+            cpu_inv_fwht_256(&mut group, signs1, signs2);
+            let actual = (n_weights - b * 256).min(256);
+            for j in 0..actual {
+                out[b * 256 + j] = group[j];
+            }
+        }
+        out
+    }
+
+    /// Quantifies the MSE cost of antirez's MQ3 → MQ2 down-projection
+    /// downgrade. Procedure: take a synthetic V4F-realistic weight
+    /// distribution, quantize via MQ3-Lloyd (treat its dequant as the
+    /// best-fit-available reference), then RE-quantize that dequant via
+    /// MQ2-Lloyd. MSE delta = "what antirez loses by dropping MQ3 down".
+    ///
+    /// Result feeds the question: is the antirez precision tax (2/3 × MQ2
+    /// + 1/3 × MQ3 ≈ 2.7 bpw vs 2.25 bpw all-MQ2, ~13 GB on a 256-expert
+    /// 43-layer V4F) buying meaningful per-tensor MSE reduction, or is
+    /// the antirez win at high ctx mostly from Q8 attention?
+    fn antirez_downgrade_cost(label: &str, weights: &[f32]) {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let n = weights.len();
+        let mq3_bytes = quantize_mq3g256_lloyd(weights, &signs1, &signs2);
+        let mq3_recon = dequantize_mq3g256_lloyd_to_f32(&mq3_bytes, n, &signs1, &signs2);
+        let mq2_bytes = quantize_mq2g256_lloyd(weights, &signs1, &signs2);
+        let mq2_recon = dequantize_mq2g256_lloyd_to_f32(&mq2_bytes, n, &signs1, &signs2);
+        // Direct MSE against the synthetic input (ground truth):
+        let mq3_mse = mse(weights, &mq3_recon);
+        let mq2_mse = mse(weights, &mq2_recon);
+        let downgrade_pct = ((mq2_mse - mq3_mse) / mq3_mse) * 100.0;
+        eprintln!("  {label} (n={n})");
+        eprintln!("    MQ3-Lloyd (3.5 bpw) MSE = {mq3_mse:.6e}");
+        eprintln!("    MQ2-Lloyd (2.25 bpw) MSE = {mq2_mse:.6e}");
+        eprintln!("    MQ3→MQ2 downgrade cost: {downgrade_pct:+.1}% MSE");
+    }
+
+    #[test]
+    fn antirez_mq3_to_mq2_downgrade_cost() {
+        // Tests on the same V4F-realistic distributions as the GPTQ probe.
+        eprintln!("\n=== Antirez MQ3-down → MQ2-down downgrade cost ===");
+        antirez_downgrade_cost("Gaussian 16x256",
+            &gaussian_samples(16 * 256, 0xc001cafe));
+        let mut htw = gaussian_samples(16 * 256, 0xfeed);
+        let tail = gaussian_samples((16 * 256) / 20, 0xbeef);
+        for (i, t) in tail.iter().enumerate() { htw[i * 20] = t * 3.0; }
+        antirez_downgrade_cost("Heavy-tailed 16x256", &htw);
+        let mut sw = gaussian_samples(16 * 256, 0x5_a55e);
+        for v in sw.iter_mut() { *v *= 0.1; }
+        for i in 0..(16 * 256 / 20) { sw[i * 20] *= 30.0; }
+        antirez_downgrade_cost("Sparse + outliers 16x256", &sw);
+    }
+
     #[test]
     fn gptq_on_correlated_pre_fwht() {
         // The whole point of GPTQ is to exploit channel correlation.
