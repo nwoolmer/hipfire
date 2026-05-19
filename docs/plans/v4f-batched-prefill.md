@@ -263,6 +263,64 @@ The hard part. Once these are working, the rest is mechanical.
   **Total estimated remaining for end-to-end batched prefill:**
   5-7 days of focused work. Roughly equal-effort phases.
 
+  **B2 second-half checkpoint (2026-05-18, continued):**
+
+  After the first checkpoint, another 11 batched kernels + Rust
+  launchers shipped — covers the entire attention-block staging
+  surface plus the per-group O-LoRA wo_a primitive:
+
+  *Attention block primitives (all shipped):*
+  - `swa_visibility_stage_batched` — dual-source [B, head_dim, swa_window]
+    staging from PRE-CHUNK ring + within-chunk kv_batch
+  - `swa_ring_write_batched` — chunk-end ring advance
+  - `indexer_relu_score_batched` — per-batch scoring against shared
+    compressed-K cache (H heads, LDS reduction)
+  - `v4f_topk_kv_gather_batched` — per-batch top-K K/V gather
+  - `v4f_topk_kv_gather_identity_batched` — ratio=128 variant (no top-K)
+  - `rope_tail_inverse_batched` — post-attention V de-rotation (non-YaRN)
+  - `wo_per_group_batched_f32` — block-diagonal F32 GEMV
+    `y[b, g, r] = Σ_k wo_a[g, r, k] · x_in[b, g, k]`; one launch in
+    place of B·G separate gemv_f32 calls
+
+  *PrefillBatchScratch is now 21 GPU tensor fields:* embed_batch,
+  streams_batch, tokens, tmp_batch, tmp_plain_batch, q_lat_batch,
+  q_lat_rot_batch, q_batch, q_head_ones, kv_batch, positions,
+  hc_c_batch, hc_pre_batch, hc_post_batch, hc_comb_batch,
+  hc_x_in_batch, attn_out_batch, ffn_out_batch, streams_out_batch,
+  swa_staged_batch, topk_staged_batch, n_valid_swa_arr,
+  n_active_topk_arr, attn_out_raw_batch.
+
+  *forward_prefill_batch_chunk status (end of session):*
+  - ✓ token-ids + positions upload, batched embedding, HC stream init
+  - ✓ per-layer mhc_pre + q_lora + kv_joint + tail-rope (attention-side)
+  - ✗ bails at layer 0 attention dispatch: pure-SWA path needs final
+    integration (steps 1-7 listed in the error message)
+
+  **What it would take to land end-to-end batched prefill from here:**
+  1. **Pure-SWA path attention dispatch wiring** (~half day): swa_ring
+     lazy-alloc per layer, swa_visibility_stage call, n_valid_swa upload,
+     v4f_attn_swa_batched dispatch, rope_tail_inverse_batched,
+     wo_per_group_batched_f32 + gemv_auto_batched(wo_b),
+     hc_attn_mix_batched, swa_ring_write_batched advance.
+  2. **Mixed-attention path** (~1-2 days): adds the indexer-Q chain
+     (wq_a_idx/wq_b_idx batched + indexer_relu_score_batched +
+     indexer_top_k_batched + v4f_topk_kv_gather_batched OR
+     v4f_topk_kv_gather_identity_batched) + the compressor commit
+     sequential loop (per A4 deferral) + v4f_attn_swa_topk_batched
+     dispatch.
+  3. **MoE FFN batched** (~2-3 days): V4F-specific position-batched
+     MoE GEMV variants (`v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_-
+     position_batched`, `..._down_residual_scaled_indexed_position_-
+     batched`) + per-batch top-K-bias-aware router + per-batch silu+rotate.
+  4. **Integration + byte-equality test** (~half day) — call from
+     `forward_prefill_batch`, verify against per-token decode_step
+     at small B.
+
+  **Total: 4-6 days for end-to-end working batched prefill on V4F**, of
+  which steps 1+2+4 (≈2-3 days) deliver attention-block batched
+  speedup; step 3 unlocks the MoE FFN batched speedup which is the
+  bigger absolute win on V4F.
+
 * **B3: `forward_prefill_batch()` top-level entry** — 🟡 **SCAFFOLD 2026-05-18**
   - Public entry point in `forward.rs` with stable signature
     `(cfg, weights, state, gpu, tokens, start_pos, &mut PrefillBatchScratch)
