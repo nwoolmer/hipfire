@@ -1668,3 +1668,16 @@ pub const V4F_TOPK_KV_GATHER_IDENTITY_SRC: &str =
 /// softmax (with attn_sink as an additional entry).
 pub const V4F_ATTN_SWA_TOPK_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa_topk.hip");
+
+/// V4F batched indexer-extended SWA attention (Phase A1, 2026-05-18).
+/// Processes B query positions in parallel via grid dim Y. Each batch
+/// position has its own SWA / top-K K/V slices and valid-count scalars.
+/// At batch=1, byte-identical to V4F_ATTN_SWA_TOPK_SRC.
+pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_topk_batched.hip");
+
+/// V4F batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
+/// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
+/// path. Same launch shape and byte-equality contract at batch=1.
+pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_batched.hip");

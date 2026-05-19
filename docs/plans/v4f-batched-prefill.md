@@ -1,0 +1,172 @@
+# V4F batched-prefill plan (2026-05-19)
+
+Status: active. Currently the **single biggest perf opportunity** on V4F.
+Blocks downstream MQ8 work (faster iteration on every subsequent quant test).
+
+## Why this matters
+
+V4F currently has **no batched prefill** — each prompt token is processed
+sequentially via the same `decode_step` path. At long context, decode is
+bandwidth-bound on weights, so prefill tok/s == decode tok/s at the same
+position. This dominates wall time for any long-prompt workflow.
+
+Measured today (mq2lloyd-f16compress, post-session-optimizations):
+
+| Position | tok/s |
+|---|---|
+| ~128 | 15.94 |
+| ~1024 | 12.21 |
+| ~2048 | 7.18 |
+| ~3800 | ~4 (from `long_code_audit` timing) |
+
+The `long_code_audit` case from antirez's 5-case NLL test (3844 prompt
+tokens + 4 target tokens) took ~15 min per quant. Without batched
+prefill, every quant comparison run is dominated by this sequential
+weight-streaming-per-token cost.
+
+**Expected speedup with batched prefill**: 15-40× at prefill, depending on
+batch size and per-layer kernel batching quality. This transforms
+downstream iteration:
+
+| Test | Sequential prefill | With batched (est.) |
+|---|---|---|
+| 5-case NLL scoring | 30 min | ~3 min |
+| Long-context fact-recall | 12 min/quant | ~1.5 min |
+| Smoke 10-case eval | 5 min/quant | 2-3 min |
+| Imatrix collection (4690 prompts, ctx=32768) | days | hours |
+
+## Architecture
+
+V4F's `forward.rs::decode_step` is a per-token state-machine. Batched
+prefill processes a batch of `B` prompt positions in parallel through
+one forward pass per layer. Weight loads are amortized — load once,
+matrix-multiply against `B` input vectors (a small matmul per layer
+instead of B separate GEMVs).
+
+### What's already in place (reusable)
+
+| Component | Status | Reuse for V4F? |
+|---|---|---|
+| `kernels/src/attention_flash_*_batched.hip` (causal, multi-tile) | ✓ | Yes for SWA layers |
+| `kernels/src/attention_q8_0_kv_batched.hip` | ✓ | Yes for ratio-128 layers |
+| `kernels/src/gemv_mq2g256_lloyd_moe_*_batched.hip` | ✓ | Yes for routed-expert FFN |
+| `kernels/src/embedding_*_batched.hip`, `argmax_batched.hip` | ✓ | Yes |
+| `qwen35::forward_prefill_batch` (full pipeline driver) | ✓ | **Template to follow** |
+| `qwen35::prefill_moe_ffn_body_batched` | ✓ | Direct pattern for V4F MoE |
+| `KvCache` batched-fill semantics (`llama.rs`) | ✓ | Mostly transferable |
+
+### What's V4F-specific (new code required)
+
+| Component | Why | Scope |
+|---|---|---|
+| Indexer top-K (batched) | V4F's compressed-KV indexer scores all compressed rows per query position and picks top-K. Each batch position needs its own top-K. | New kernel `indexer_top_k_batched`. Pattern: `[B, n_compressed]` scores → `[B, K]` indices. ~1 day. |
+| Mixed-attention batched (SWA + topk + sink) | Fused softmax over `[SWA + topk_active + sink]` keys, per batch position. | New kernel `v4f_attn_swa_topk_batched`. Parallel softmax across `(B, n_total)`. ~2 days. |
+| Compressor commit batched | Writes one compressed-KV row per `ratio` positions. Some batch positions may trigger commit, others not. | Conditional batched write. ~1 day. |
+| HC (Hyper-Connection) ops batched | 4-stream HC mix per token. qwen35 doesn't have HC, so no template. | ~2-3 days. |
+| `forward_prefill_batch` driver in V4F's `forward.rs` | Orchestrates all batched kernels. | Port pattern from `qwen35.rs:3715`. ~3-5 days. |
+| `PrefillBatchScratch` state | Amortize per-call allocations across chunks. | Mirror `qwen35::PrefillBatchScratch`. ~1 day. |
+| Test harness | byte-equality with sequential path on representative prompts. | Port `prefill_batch_matches_sequential` from qwen35 tests. ~1 day. |
+
+## Phase breakdown
+
+### Phase A — V4F-specific batched kernels (5-7 days)
+
+The hard part. Once these are working, the rest is mechanical.
+
+* **A1: `v4f_attn_swa_topk_batched.hip`** ✅ **DONE 2026-05-18**
+  - Parallel softmax across `(head, batch_position)`
+  - Joint softmax over `[swa_n_valid + topk_active]` per query
+  - Batched K/V reads from caches (each batch position has its own slot)
+  - Per-batch valid counts via `n_valid_swa_arr[B]`, `n_active_topk_arr[B]` i32 device buffers
+  - Test: `test_v4f_attn_swa_topk_batched` — byte-equality at B=1/4/32 ✓ (max_abs=0.000e0 at every size)
+
+* **A2: `v4f_attn_swa_batched.hip`** ✅ **DONE 2026-05-18** — pure-SWA twin for non-indexer layers
+  - Identical launch shape to A1 minus the topk branch
+  - Test: `test_v4f_attn_swa_batched` — byte-equality at B=1/4/32 ✓
+
+* **A3: `indexer_top_k_batched.hip`** (~1 day)
+  - Per-batch-position top-K selection over compressed rows
+  - Parallel argmax-with-mask iteration (similar to sequential top-K)
+
+* **A4: `compressor_commit_batched.hip`** (~1 day)
+  - Conditional row-write to compressed cache based on `(pos % ratio == ratio - 1)`
+  - Some batch positions trigger, others don't
+
+* **A5: HC ops batched** (~2 days)
+  - `hc_mix_4stream_batched`, `hc_input_map_4stream_batched`
+  - Both are per-position 4-stream transforms; batch dim parallelizes cleanly
+
+### Phase B — Driver + scratch + wiring (4-6 days)
+
+* **B1: `PrefillBatchScratch` struct in `forward.rs`** — pre-allocated GPU tensors sized for the max batch; reused across chunks. ~1 day.
+
+* **B2: `forward_prefill_batch_chunk()` function** — single-chunk batched forward pass. Mirrors `decode_step` but for B positions at once. ~3 days.
+
+* **B3: `forward_prefill_batch()` top-level entry** — chunks the prompt by `max_batch`, calls `_chunk` repeatedly, manages `start_pos` advance. ~1-2 days.
+
+* **B4: Integration with existing `decode_step`** — after prefill, decode mode takes over at `start_pos + prompt_len`. ~0.5 day.
+
+### Phase C — Correctness validation (2-3 days)
+
+* **C1: Byte-equality test** — `forward_prefill_batch(prompt[0..N])` followed by one `decode_step(prompt[N])` should produce the same logits as N+1 sequential `decode_step`s. Test at multiple ctx points (128, 1024, 4096). ~1 day.
+
+* **C2: PPL sanity** — wikitext-2 PPL via batched prefill should match sequential within FMA-order noise (~0.1%). ~0.5 day.
+
+* **C3: Long-context fact-recall** — `v4f_long_context_test.rs` should pass with batched prefill. ~0.5 day.
+
+* **C4: Quality test alignment** — 5-case NLL scorer should produce identical numbers via batched prefill. ~0.5 day.
+
+### Phase D — Performance polish (2-3 days)
+
+* **D1: Chunk size tuning** — find the max batch that fits in working memory without slowing per-token effective time. ~1 day.
+
+* **D2: KV-cache batched fill optimization** — minimize the per-position writes via vectorized cache-fill kernels. ~1 day.
+
+* **D3: Cleanup + profile pass** — make sure no remaining sequential bottleneck inside the per-chunk path. ~0.5 day.
+
+## Acceptance criteria
+
+1. **Correctness**: byte-equality (or FMA-order ε) between batched and
+   sequential prefill on at least 5 representative prompts spanning short /
+   medium / long context, both pure-SWA and mixed-attention layers.
+
+2. **Performance**: ≥10× prefill speedup at ctx=2048, ≥15× at ctx=4096.
+
+3. **Quality regression-free**: wikitext-2 PPL via batched prefill within
+   ±0.5% of sequential at ctx=128/1024/2048.
+
+4. **Long-context test passes**: `v4f_long_context_test` recovers all 16
+   facts using batched prefill.
+
+5. **Quality scoring identical**: 5-case NLL numbers via batched prefill
+   match sequential to ε.
+
+## Risks + mitigations
+
+| Risk | Mitigation |
+|---|---|
+| V4F-specific kernels have subtle SWA-mask / topk-mask bugs at batch=1 vs batch=N | Test byte-equality at batch=1 first (should match sequential exactly); incrementally raise batch size |
+| LDS / shared-mem pressure at large batch sizes | Start with batch=32, profile occupancy via `gfx-kernel-metadata` skill, tune downward if needed |
+| HC ops don't parallelize cleanly across batch (have per-position state) | Investigate dependencies; may need to keep HC sequential and only batch the GEMVs |
+| Compressor commit semantics break with multi-position chunk crossing a commit boundary | Carefully handle per-chunk position arithmetic; test with prompt lengths that cross multiple commit boundaries |
+| Tokenizer / chat-template integration assumes per-token decode | Prefill returns logits at LAST position only initially; per-token logits as optional |
+
+## Effort estimate
+
+| Phase | Days |
+|---|---|
+| A — V4F-specific batched kernels | 5-7 |
+| B — Driver + scratch + wiring | 4-6 |
+| C — Correctness validation | 2-3 |
+| D — Performance polish | 2-3 |
+| **Total** | **13-19 days** |
+
+Realistic calendar window: **2-4 weeks** including iteration on bugs.
+
+## Status tracking
+
+This plan is the source of truth for the work. Update phase-status here as
+sub-tasks complete. Task tracker entries:
+- #91 — Top-level batched prefill (active, blocking #87-90)
+- #87 — V4F-MQ8 quant build (blocked on #91)
+- #88, #89, #90 — MQ8 kernel work (blocked on #91)

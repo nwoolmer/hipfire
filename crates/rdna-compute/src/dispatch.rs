@@ -20185,6 +20185,77 @@ impl Gpu {
         }
     }
 
+    /// V4F batched indexer-extended SWA attention. Processes B query
+    /// positions in one launch. Each batch row has its own SWA K/V slice
+    /// (`[batch, head_dim, swa_window]`), top-K K/V slice (`[batch,
+    /// head_dim, topk_window]`), and per-row valid-count scalars
+    /// (`n_valid_swa_arr[batch]`, `n_active_topk_arr[batch]`, i32 GPU
+    /// buffers). attn_sink and the host-side scalars are shared across
+    /// the batch. At batch_size == 1 the math is byte-identical to
+    /// `v4f_attn_swa_topk_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_topk_batched_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor, swa_v: &GpuTensor,
+        topk_k: &GpuTensor, topk_v: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32, head_dim: i32,
+        swa_window: i32, topk_window: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_attn_swa_topk_batched",
+            kernels::V4F_ATTN_SWA_TOPK_BATCHED_SRC,
+            "v4f_attn_swa_topk_batched_f32",
+        )?;
+        let func = &self.functions["v4f_attn_swa_topk_batched_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let tkp = topk_k.buf.as_ptr();
+        let tvp = topk_v.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tkp as *const _ as *mut c_void,
+            &tvp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F head HC mix — compute the per-stream `pre` weights for the
     /// 4-stream → hidden projection before lm_head. Matches upstream
     /// `ParallelHead.hc_head`.
@@ -20360,6 +20431,64 @@ impl Gpu {
             self.hip.launch_kernel(
                 func,
                 [n_heads as u32, 1, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V4F batched pure-SWA attention. Twin of `v4f_attn_swa_topk_batched_f32`
+    /// for layers without an indexer top-K path. At batch_size == 1 the
+    /// math is byte-identical to `v4f_attn_swa`.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+        window: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_swa_batched",
+            kernels::V4F_ATTN_SWA_BATCHED_SRC, "v4f_attn_swa_batched")?;
+        let func = &self.functions["v4f_attn_swa_batched"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut wn = window;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
                 [head_dim as u32, 1, 1],
                 0,
                 self.stream_ref(),
