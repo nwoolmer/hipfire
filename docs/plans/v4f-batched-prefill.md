@@ -135,15 +135,21 @@ The hard part. Once these are working, the rest is mechanical.
   - `rotate_x_mq_batched` (k_top-batched, reusable per position)
 
   *High-priority NEW kernels (these block prefill speedup):*
-  - **gemv_auto family** — currently dispatches per-dtype to `gemv_f32`,
-    `gemv_q8_0`, `gemv_mq4g256_prerotated`. None has a position-batched
-    variant. Used 10× in `decode_step` (q_lora ×3, kv_joint, compressors ×2,
-    indexer ×2, final_norm, router). The amortized-weight-load win is the
-    biggest single perf opportunity in the chunk forward.
-    - For V4F's `mq2lloyd-f16compress` build the relevant variant is
-      `gemv_mq2g256_lloyd_*_batched` (does not yet exist for the
-      non-MoE-indexed call sites; the MoE indexed variants for B=1
-      already exist as `v4f_gemv_*`).
+  - **gemv_auto family — mostly WIRING work, not new kernels.** The
+    `gemv_auto` dispatcher selects `gemv_f32` / `gemv_q8_0` /
+    `gemv_mq4g256_prerotated` per weight dtype. Batched GEMM equivalents
+    already exist for the two common V4F dtypes:
+    - `gemm_f32_batched` (dispatch.rs:19024) — F16-→F32 attention/compressor
+      projections
+    - `gemm_q8_0_batched` (dispatch.rs:13013) — Q8 attention projections
+    - `gemm_hfq4g256_*` family — MQ4 path (10+ variants tuned per arch)
+    Need a new `gemv_auto_batched` dispatcher in V4F's forward.rs that
+    routes per-dtype to these GEMM-batched kernels. ~1 day, no new HIP
+    kernels required for these dtypes.
+    - **NEW kernel still needed for MQ3-Lloyd / MQ2-Lloyd dense weights**
+      if any V4F build uses them outside MoE (the antirezQ8 / Q4 builds
+      do not; the MQ2-Lloyd build only uses MQ2-Lloyd for routed experts).
+      Defer until we have a V4F build that needs it.
   - **V4F MoE position-batched** — `v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed`
     and `..._down_residual_scaled_indexed` are k_top-batched per single
     position. Need new `_position_batched` arms that add a B dim so the
