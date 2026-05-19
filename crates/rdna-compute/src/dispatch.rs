@@ -20650,6 +20650,55 @@ impl Gpu {
         }
     }
 
+    /// Inverse tail RoPE — BATCHED. Per batch row b reads positions[b]
+    /// and applies the inverse rotation (negated sin) to the last n_rot
+    /// dims of each head. Byte-identical to `rope_tail_inverse` at
+    /// batch_size == 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_tail_inverse_batched(
+        &mut self,
+        x: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_inverse_batched",
+            kernels::ROPE_TAIL_INVERSE_BATCHED_SRC,
+            "rope_tail_inverse_batched_f32",
+        )?;
+        let func = &self.functions["rope_tail_inverse_batched_f32"];
+        let xp = x.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(half + 31) / 32, batch_size as u32, 1],
+                [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// SWA visibility staging — BATCHED. For each batch position b at
     /// absolute position `start_pos + b`, build a contiguous visibility
     /// window from the pre-chunk SWA ring + within-chunk `kv_batch`.

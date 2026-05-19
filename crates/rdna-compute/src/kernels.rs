@@ -1665,6 +1665,11 @@ pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
 pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
 
+/// Inverse tail RoPE on attention output — BATCHED (Phase B2,
+/// 2026-05-18). Per-batch positions; mirrors rope_tail_inverse_f32.
+pub const ROPE_TAIL_INVERSE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_inverse_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
