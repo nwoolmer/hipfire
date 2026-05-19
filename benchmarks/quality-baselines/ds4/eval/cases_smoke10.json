@@ -1,0 +1,140 @@
+[
+  {
+    "source": "GPQA Diamond",
+    "id": "recNu3MXkvWUzHZr9",
+    "domain": "Physics",
+    "title": "An intelligent civilization in the Large Magellanic Cloud has",
+    "question": "An intelligent civilization in the Large Magellanic Cloud has engineered an extraordinary spacecraft capable of traveling at a substantial fraction of the speed of light. The average lifetime of these aliens is roughly 150 solar years. Now, having Earth as their destination in mind, they are determined to travel with this spacecraft at a constant speed of 0.99999987*c, where c is the speed of light. Approximately, how long will it take for their 22 years old astronaut (from the point of view of the astronaut) to reach the Earth using this incredibly fast spacecraft?",
+    "answer": "B",
+    "choices": [
+      "72 years",
+      "81 years",
+      "The astronaut will die before reaching to the Earth.",
+      "77 years"
+    ]
+  },
+  {
+    "source": "GPQA Diamond",
+    "id": "recoiTJPGUmzAkief",
+    "domain": "Physics",
+    "title": "Imagine an uncharged spherical conductor of radius $R$ having a",
+    "question": "Imagine an uncharged spherical conductor of radius $R$ having a small spherical cavity inside. The centre of the cavity is separated by a distance $s$ from the centre of the spherical conductor. The radius of the cavity is $r$, and $r<R$. Now consider a small amount of positive charge $+q$ is somehow placed somewhere inside the cavity. What is the magnitude of the electric field $\\vec{E}$ at a point P (outside the spherical conductor) of distance $L$ from the centre of the spherical conductor? Note, the distance of the point P from the centre of the cavity is $l$. Here, l, L > R. The angle between $l$ and $s$ is $\\theta$",
+    "answer": "C",
+    "choices": [
+      "$E = \\dfrac{1}{4 \\pi \\epsilon_o} \\dfrac{q}{(l-s \\cos\\theta)^2}$",
+      "$E = \\dfrac{1}{4 \\pi \\epsilon_o} \\dfrac{q}{l^2}$",
+      "$E = \\dfrac{1}{4 \\pi \\epsilon_o} \\dfrac{q}{L^2}$",
+      "$E = \\dfrac{1}{4 \\pi \\epsilon_o} \\dfrac{q}{(l+s \\cos\\theta)^2}$"
+    ]
+  },
+  {
+    "source": "GPQA Diamond",
+    "id": "rec4UqStf9WUVif1f",
+    "domain": "Physics",
+    "title": "Find KE of product particles in, Pi(+) = mu(+) + nu here Pi(+)",
+    "question": "Find KE of product particles in,\nPi(+) = mu(+) + nu\nhere Pi(+) is stationary.\nRest mass of Pi(+) & mu(+) is 139.6 MeV & 105.7 MeV respectively.",
+    "answer": "B",
+    "choices": [
+      "7.2 MeV, 32.8 MeV",
+      "4.12 MeV, 29.8 MeV",
+      "2.84 MeV, 26.8 MeV",
+      "3.52 MeV, 20.8 MeV"
+    ]
+  },
+  {
+    "source": "SuperGPQA",
+    "id": "001b51d76b4d422988f2c11f104a2c6c",
+    "domain": "Agronomy",
+    "title": "In production, grass powder is often pressed into pellets , and",
+    "question": "In production, grass powder is often pressed into pellets , and crushed hay is processed into ____, grass cake.",
+    "answer": "C",
+    "choices": [
+      "a sheet of paper",
+      "a box of flowers",
+      "a block of grass",
+      "a pot of mud",
+      "a pile of dirt",
+      "a bush of herbs",
+      "a roll of hay",
+      "a stack of leaves",
+      "a sack of grain",
+      "a bundle of sticks"
+    ]
+  },
+  {
+    "source": "SuperGPQA",
+    "id": "b7e20eac98764fb0bf30e8366d951daa",
+    "domain": "Engineering",
+    "title": "Given a brick masonry compression member with $e / h=0.18$;",
+    "question": "Given a brick masonry compression member with $e / h=0.18$; height-to-thickness ratio $\\beta=17$, seismic fortification intensity of 7 degrees, and Class $\\mathbf{II}$ site soil, please select a masonry structural component plan that is safe and reliable, economically reasonable, and convenient for construction is().",
+    "answer": "J",
+    "choices": [
+      "Rammed earth wall with a smooth finish and vibration resistance core",
+      "Fired-clay bricks laid with vertical hollow cores and cement grout",
+      "Double-wythe brickwork with no additional structural reinforcement",
+      "Interlocked clay tiles with hydraulic cement overlay layer",
+      "Plain brickwork with an external stucco finish for added resistance",
+      "Solid concrete blocks with a thin layer of non-structural mortar",
+      "Lightweight aerated concrete blocks with surface bonding agent",
+      "Masonry wall with external veneer and minimal reinforcement component",
+      "Hollow-core brick masonry with unbonded reinforcing bars",
+      "Composite masonry of brickwork and reinforced concrete surface layer or reinforced mortar layer"
+    ]
+  },
+  {
+    "source": "SuperGPQA",
+    "id": "4a1d1780a93f4093b6fb7d3c314cbea8",
+    "domain": "Engineering",
+    "title": "What is the key factor in selecting a reasonable amount of",
+    "question": "What is the key factor in selecting a reasonable amount of blasting charge in mining blasting operations?",
+    "answer": "E",
+    "choices": [
+      "ore thickness",
+      "blast pattern",
+      "mine depth",
+      "mine ventilation",
+      "ore hardness",
+      "ore grade",
+      "ore density",
+      "mine area",
+      "ore composition",
+      "blast timing"
+    ]
+  },
+  {
+    "source": "AIME2025",
+    "id": "aime2025-01",
+    "domain": "Number Theory",
+    "title": "Find the sum of all integer bases $b>9$ for which $17_b$ is a",
+    "question": "Find the sum of all integer bases $b>9$ for which $17_b$ is a divisor of $97_b.$",
+    "answer": "70",
+    "choices": []
+  },
+  {
+    "source": "AIME2025",
+    "id": "aime2025-16",
+    "domain": "Geometry",
+    "title": "Six points $A, B, C, D, E$ and $F$ lie in a straight line in",
+    "question": "Six points $A, B, C, D, E$ and $F$ lie in a straight line in that order. Suppose that $G$ is a point not on the line and that $AC = 26$, $BD = 22$, $CE = 31$, $DF = 33$, $AF = 73$, $CG = 40$, and $DG = 30$. Find the area of $\\triangle BGE$.",
+    "answer": "468",
+    "choices": []
+  },
+  {
+    "source": "COMPSEC",
+    "id": "compsec-076",
+    "domain": "FreeBSD / librpcsec_gss",
+    "title": "rpcsec_gss_validate() reduction",
+    "question": "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe function validates a per-request authentication blob before passing it to the GSS layer.\n\nCode:\n```c\n 1: #define AUTH_STACK_MAX 256\n 2: \n 3: static bool check_rpcsec_packet(const uint8_t *wire, size_t wire_left)\n 4: {\n 5:     if (wire_left < 4)\n 6:         return false;\n 7: \n 8:     uint32_t body_len = get_be32(wire);      // attacker-controlled length field\n 9:     const uint8_t *body = wire + 4;\n10:     uint8_t scratch[AUTH_STACK_MAX];\n11: \n12:     /* XDR opaque values are padded to 4-byte alignment on the wire. */\n13:     uint32_t pad = (4 - (body_len & 3)) & 3;\n14:     uint32_t encoded_len = body_len + pad;\n15: \n16:     /* This check only proves the source bytes exist in the packet. */\n17:     if (encoded_len > wire_left - 4)\n18:         return false;\n19: \n20:     memcpy(scratch, body, encoded_len);\n21:     return gss_verify_mic(scratch, body_len);\n22: }\n```",
+    "answer": "17-20",
+    "choices": []
+  },
+  {
+    "source": "COMPSEC",
+    "id": "compsec-077",
+    "domain": "GNU Inetutils telnetd",
+    "title": "add_slc() reduction",
+    "question": "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThis helper is called once for each Special Line Character option received in a TELNET LINEMODE negotiation.\n\nCode:\n```c\n 1: #define SLCBUF_SIZE 108\n 2: #define SLC_NCHARS 18\n 3: \n 4: struct slc_state {\n 5:     unsigned char buf[SLCBUF_SIZE];\n 6:     size_t used;\n 7: };\n 8: \n 9: static void add_slc(struct slc_state *s,\n10:                     unsigned char func,\n11:                     unsigned char flags,\n12:                     unsigned char value)\n13: {\n14:     if (func <= SLC_NCHARS)\n15:         return;                    // ignore ordinary entries here\n16: \n17:     /* Store one SLC triplet for later reply construction. */\n18:     s->buf[s->used++] = func;\n19:     s->buf[s->used++] = flags;\n20:     s->buf[s->used++] = value;\n21: }\n```",
+    "answer": "18-20",
+    "choices": []
+  }
+]

@@ -34,10 +34,27 @@ use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
-fn parse_jsonl_line(line: &str) -> Option<(String, String, String)> {
-    // Minimal JSON object parser for `{"id": "...", "prompt": "...", "target": "..."}`.
-    // Avoids pulling in serde_json as a per-example dep. Handles standard
-    // backslash-escapes (\n, \t, \", \\, \uXXXX); errors out on anything weird.
+/// Parsed case from the JSONL input.
+/// `target_bytes_per_step` is None when the JSONL uses the legacy text-only
+/// `target` field — in that case the scorer falls back to tokenizer.encode(target).
+struct ParsedCase {
+    id: String,
+    prompt: String,
+    /// Set when JSONL provides `target_token_bytes`: a list of byte arrays, one
+    /// per token from the upstream API's `steps[].token.bytes` field. Using
+    /// these directly avoids re-tokenization boundary drift.
+    target_bytes_per_step: Option<Vec<Vec<u8>>>,
+    /// Set when JSONL uses the legacy `target` (assembled text) field.
+    target_text: Option<String>,
+}
+
+fn parse_jsonl_line(line: &str) -> Option<ParsedCase> {
+    // Minimal JSON object parser supporting:
+    //   {"id": "...", "prompt": "...", "target": "..."}                  (legacy)
+    //   {"id": "...", "prompt": "...", "target_token_bytes": [[65,100,97], ...]}
+    //
+    // For target_token_bytes, expects an array of arrays of integers 0-255.
+    // Other keys ignored. Handles standard backslash-escapes in strings.
     fn skip_ws(b: &[u8], i: &mut usize) {
         while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r') {
             *i += 1;
@@ -97,29 +114,99 @@ fn parse_jsonl_line(line: &str) -> Option<(String, String, String)> {
         else { None }
     }
 
+    fn parse_uint(b: &[u8], i: &mut usize) -> Option<u32> {
+        skip_ws(b, i);
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() { *i += 1; }
+        if *i == start { return None; }
+        std::str::from_utf8(&b[start..*i]).ok()?.parse().ok()
+    }
+    fn parse_byte_array(b: &[u8], i: &mut usize) -> Option<Vec<u8>> {
+        skip_ws(b, i);
+        if *i >= b.len() || b[*i] != b'[' { return None; }
+        *i += 1;
+        let mut out = Vec::new();
+        loop {
+            skip_ws(b, i);
+            if *i < b.len() && b[*i] == b']' { *i += 1; return Some(out); }
+            let v = parse_uint(b, i)?;
+            if v > 255 { return None; }
+            out.push(v as u8);
+            skip_ws(b, i);
+            if *i < b.len() && b[*i] == b',' { *i += 1; continue; }
+        }
+    }
+    fn parse_byte_array_array(b: &[u8], i: &mut usize) -> Option<Vec<Vec<u8>>> {
+        skip_ws(b, i);
+        if *i >= b.len() || b[*i] != b'[' { return None; }
+        *i += 1;
+        let mut out = Vec::new();
+        loop {
+            skip_ws(b, i);
+            if *i < b.len() && b[*i] == b']' { *i += 1; return Some(out); }
+            let arr = parse_byte_array(b, i)?;
+            out.push(arr);
+            skip_ws(b, i);
+            if *i < b.len() && b[*i] == b',' { *i += 1; continue; }
+        }
+    }
+    /// Skip an arbitrary JSON value when we don't care about it (numbers,
+    /// strings, arrays, objects, true/false/null). Used to step over unknown
+    /// keys when the value isn't one we explicitly parse.
+    fn skip_value(b: &[u8], i: &mut usize) -> Option<()> {
+        skip_ws(b, i);
+        if *i >= b.len() { return None; }
+        match b[*i] {
+            b'"' => { let _ = parse_string(b, i)?; }
+            b'[' | b'{' => {
+                let open = b[*i]; let close = if open == b'[' { b']' } else { b'}' };
+                let mut depth = 1; *i += 1;
+                while *i < b.len() && depth > 0 {
+                    if b[*i] == b'"' { let _ = parse_string(b, i); continue; }
+                    if b[*i] == open { depth += 1; }
+                    else if b[*i] == close { depth -= 1; }
+                    *i += 1;
+                }
+            }
+            _ => {
+                // Number / bool / null — scan to next , or } or ]
+                while *i < b.len() && b[*i] != b',' && b[*i] != b'}' && b[*i] != b']' { *i += 1; }
+            }
+        }
+        Some(())
+    }
+
     let b = line.as_bytes();
     let mut i = 0;
     expect_byte(b, &mut i, b'{')?;
     let mut id = None;
     let mut prompt = None;
-    let mut target = None;
+    let mut target_text = None;
+    let mut target_bytes_per_step = None;
     loop {
         skip_ws(b, &mut i);
         if i < b.len() && b[i] == b'}' { break; }
         let key = parse_string(b, &mut i)?;
         expect_byte(b, &mut i, b':')?;
-        let val = parse_string(b, &mut i)?;
         match key.as_str() {
-            "id" => id = Some(val),
-            "prompt" => prompt = Some(val),
-            "target" => target = Some(val),
-            _ => {} // ignore unknown keys
+            "id" => id = Some(parse_string(b, &mut i)?),
+            "prompt" => prompt = Some(parse_string(b, &mut i)?),
+            "target" => target_text = Some(parse_string(b, &mut i)?),
+            "target_token_bytes" => {
+                target_bytes_per_step = Some(parse_byte_array_array(b, &mut i)?);
+            }
+            _ => { skip_value(b, &mut i)?; }
         }
         skip_ws(b, &mut i);
         if i < b.len() && b[i] == b',' { i += 1; continue; }
         break;
     }
-    Some((id?, prompt?, target?))
+    Some(ParsedCase {
+        id: id?,
+        prompt: prompt?,
+        target_bytes_per_step,
+        target_text,
+    })
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -225,23 +312,52 @@ fn main() -> Result<(), String> {
     let mut n_cases: usize = 0;
     let t_start = Instant::now();
 
+    let mut multi_token_warnings: usize = 0;
     for (line_no, line_res) in reader.lines().enumerate() {
         let line = line_res.map_err(|e| format!("read line {line_no}: {e}"))?;
         if line.trim().is_empty() { continue; }
-        let (id, prompt, target) = parse_jsonl_line(&line)
+        let case = parse_jsonl_line(&line)
             .ok_or_else(|| format!("parse jsonl line {line_no}: {line}"))?;
+        let ParsedCase { id, prompt, target_bytes_per_step, target_text } = case;
 
         // Build the full prompt STRING per the DeepSeek-V4 reference encoder
         // (`encode_messages(thinking_mode="chat")`), then tokenize in one shot.
-        // This is the only way to guarantee identical tokenization to the API
-        // — the tokenizer's special-token logic sees the full context and
-        // emits the same id sequence the upstream API saw.
         let full_prompt = format!(
-            "<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜></think>",
-            prompt = prompt
+            "<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜></think>"
         );
         let prompt_tokens: Vec<u32> = tokenizer.encode(&full_prompt);
-        let target_tokens: Vec<u32> = tokenizer.encode(&target);
+
+        // Resolve target tokens. Preferred path: use the upstream API's exact
+        // byte sequences per step → each is a SINGLE token in DeepSeek's vocab,
+        // we look it up by re-tokenizing the byte sequence (interpreted as UTF-8)
+        // and expecting one token id back. Avoids re-tokenization boundary drift.
+        // Fallback: tokenize the assembled `target` string.
+        let target_tokens: Vec<u32> = if let Some(byte_steps) = target_bytes_per_step {
+            let mut ids: Vec<u32> = Vec::with_capacity(byte_steps.len());
+            for (step_idx, b) in byte_steps.iter().enumerate() {
+                // Decode bytes as UTF-8 (replace invalid sequences — these
+                // happen for tokens that are partial multi-byte chars).
+                let s: String = String::from_utf8_lossy(b).into_owned();
+                let encoded = tokenizer.encode(&s);
+                if encoded.len() != 1 {
+                    multi_token_warnings += 1;
+                    if multi_token_warnings <= 5 {
+                        eprintln!("warn: {id} step {step_idx} bytes={b:?} \
+                                   decodes to {s:?} which tokenizes to {} tokens \
+                                   ({encoded:?}) — using all of them",
+                                  encoded.len());
+                    }
+                    ids.extend(encoded);
+                } else {
+                    ids.push(encoded[0]);
+                }
+            }
+            ids
+        } else if let Some(text) = target_text {
+            tokenizer.encode(&text)
+        } else {
+            return Err(format!("case {id}: needs `target` or `target_token_bytes`"));
+        };
 
         if prompt_tokens.len() + target_tokens.len() + 1 >= ctx_size {
             eprintln!("{id}: prompt+target ({}+{}) exceeds ctx={ctx_size}, skipping",
@@ -323,6 +439,12 @@ fn main() -> Result<(), String> {
     eprintln!("  old Q4:         avg_nll = 0.177358   (cases=100)");
     eprintln!("  Q4 imatrix:     avg_nll = 0.173895   (-1.95%)");
     eprintln!("antirez does NOT publish a Q2 reference — these are first-of-kind.");
+    if multi_token_warnings > 0 {
+        eprintln!();
+        eprintln!("note: {multi_token_warnings} target-byte-step(s) tokenized to >1 token.");
+        eprintln!("       Likely tokenizer-vocab disagreement between hipfire and upstream.");
+        eprintln!("       Numbers above include those extra tokens; comparable but inflated.");
+    }
 
     Ok(())
 }
