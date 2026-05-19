@@ -22319,6 +22319,110 @@ impl Gpu {
         result
     }
 
+    /// F32 GEMM per-output with float4 vector loads.
+    pub fn gemm_f32_per_output_v4(
+        &mut self,
+        a: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_per_output_v4",
+            kernels::GEMM_F32_PER_OUTPUT_V4_SRC,
+            "gemm_f32_per_output_v4",
+        )?;
+        let func = &self.functions["gemm_f32_per_output_v4"];
+        let mut ap = a.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [m as u32, batch_size as u32, 1],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// F32 GEMM with grid = (M, B) — saturates DRAM via per-output
+    /// workgroup parallelism. Same output as gemm_f32_register_tiled,
+    /// different scheduling.
+    pub fn gemm_f32_per_output(
+        &mut self,
+        a: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f32_per_output",
+            kernels::GEMM_F32_PER_OUTPUT_SRC,
+            "gemm_f32_per_output",
+        )?;
+        let func = &self.functions["gemm_f32_per_output"];
+        let mut ap = a.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [m as u32, batch_size as u32, 1],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// DRAM-peak microbench. Streams n_float4 float4s src→dst.
+    pub fn microbench_dram_read_copy(
+        &mut self,
+        src: &GpuTensor, dst: &GpuTensor, n_float4: i64,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "microbench_dram_read_copy",
+            kernels::MICROBENCH_DRAM_PEAK_SRC,
+            "microbench_dram_read_copy",
+        )?;
+        let func = &self.functions["microbench_dram_read_copy"];
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut nf4 = n_float4;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut nf4 as *mut _ as *mut c_void,
+        ];
+        // 256 threads/wg, each handles 4 float4 = 16 floats → 4096 floats/wg.
+        let floats_per_wg = 4096i64;
+        let n_floats = n_float4 * 4;
+        let n_wgs = ((n_floats + floats_per_wg - 1) / floats_per_wg) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_wgs, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// V4F MoE routing counting-sort by expert id. Single block of 256
     /// threads runs count → exclusive prefix-sum → scatter, all in shared
     /// memory. Output arrays are sized [B*K_TOP] and [n_exp+1].

@@ -1729,6 +1729,26 @@ pub const GEMM_F32_REGISTER_TILED_BT32_SRC: &str =
 pub const GEMM_F32_REGISTER_TILED_W2_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_register_tiled_w2.hip");
 
+/// DRAM bandwidth ceiling microbenchmark. Each workgroup issues 4
+/// outstanding float4 loads per thread (= 16 GB/s/wave at peak)
+/// and writes them through. Used to measure achievable DRAM BW on
+/// gfx1151 as a reference for tuning real kernels.
+pub const MICROBENCH_DRAM_PEAK_SRC: &str =
+    include_str!("../../../kernels/src/microbench_dram_peak.hip");
+
+/// F32 GEMM with grid = (M, B) — one workgroup per output element.
+/// Mirrors the MoE-GEMV pattern that saturates DRAM at 192 GB/s,
+/// providing 65k workgroups for V4F shapes instead of the 8k that
+/// `gemm_f32_register_tiled` produces with BATCH_TILE=8.
+pub const GEMM_F32_PER_OUTPUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_per_output.hip");
+
+/// F32 GEMM per-output with float4 vector loads. Same grid as
+/// gemm_f32_per_output but issues 16-byte loads → fewer, fatter
+/// memory transactions, less instruction-issue pressure.
+pub const GEMM_F32_PER_OUTPUT_V4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_per_output_v4.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for
