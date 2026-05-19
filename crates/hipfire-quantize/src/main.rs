@@ -6524,6 +6524,39 @@ mod hfq_block_diag {
         Some((range, spacing_var, h_bits))
     }
 
+    fn cpu_inv_fwht_local(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+        super::cpu_inv_fwht_256(x, signs1, signs2);
+    }
+
+    fn dequant_mq3_lloyd(data: &[u8], n_weights: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+        let group_size = 256;
+        let block_bytes = 112;
+        let n_blocks = (n_weights + group_size - 1) / group_size;
+        let mut out = vec![0.0f32; n_weights];
+        for b in 0..n_blocks {
+            let blk = &data[b * block_bytes..(b + 1) * block_bytes];
+            let mut cb = [0.0f32; 8];
+            for k in 0..8 {
+                cb[k] = f16_to_f32(u16::from_le_bytes([blk[2*k], blk[2*k+1]]));
+            }
+            let mut group = [0.0f32; 256];
+            for chunk in 0..32 {
+                let bo = 16 + chunk * 3;
+                let b0 = blk[bo]; let b1 = blk[bo+1]; let b2 = blk[bo+2];
+                let q = [
+                    b0 & 7, (b0 >> 3) & 7, ((b0 >> 6) & 3) | ((b1 & 1) << 2),
+                    (b1 >> 1) & 7, (b1 >> 4) & 7, ((b1 >> 7) & 1) | ((b2 & 3) << 1),
+                    (b2 >> 2) & 7, (b2 >> 5) & 7,
+                ];
+                for j in 0..8 { group[chunk * 8 + j] = cb[q[j] as usize]; }
+            }
+            cpu_inv_fwht_local(&mut group, signs1, signs2);
+            let actual = (n_weights - b * 256).min(256);
+            for j in 0..actual { out[b * 256 + j] = group[j]; }
+        }
+        out
+    }
+
     fn qt_name(qt: u8) -> &'static str {
         match qt {
             1 => "F16", 2 => "F32", 3 => "Q8F16", 5 => "Q8HFQ",
@@ -6533,6 +6566,82 @@ mod hfq_block_diag {
             21 => "HFP4G32", 24 => "MFP4G32",
             _ => "?",
         }
+    }
+
+    /// Sample a real V4F MQ2-Lloyd tensor, dequant a few blocks, and
+    /// report the distribution shape. Compares against the synthetic
+    /// distributions used in fwht_value_audit + GPTQ probes to see which
+    /// our V4F weights actually resemble.
+    #[test]
+    #[ignore]
+    fn hfq_dist_sample() {
+        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
+            .unwrap_or_else(|_| "/data/hipfire-models/v4f.mq2lloyd-f16compress.hfq".to_string());
+        let path = Path::new(&path_str);
+        let (mmap, tensors) = parse_hfq(path).expect("parse hfq");
+
+        // Take 8 different routed-expert tensors (w1, w2, w3 from a few
+        // layers/experts) and one attention tensor + one shared tensor.
+        let sample_names = [
+            "layers.5.ffn.experts.0.w1.weight",     // gate (mid layer)
+            "layers.5.ffn.experts.0.w2.weight",     // down
+            "layers.5.ffn.experts.0.w3.weight",     // up
+            "layers.20.ffn.experts.50.w1.weight",   // gate (later layer)
+            "layers.20.ffn.experts.50.w2.weight",
+            "layers.40.ffn.experts.100.w2.weight",  // down (deep layer)
+            "layers.5.ffn.shared_experts.w2.weight", // shared down
+            "layers.5.attn.wo_b.weight",             // attention output
+        ];
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        eprintln!("\n=== Real V4F weight distribution stats (4096 weights per tensor) ===");
+        eprintln!("{:55} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "tensor", "qt", "mean", "stddev", "p99/sd", "kurtosis");
+        for sname in sample_names {
+            let t_idx = tensors.iter().position(|t| t.name == sname);
+            let t = match t_idx { Some(i) => &tensors[i], None => continue };
+            // Sample first 16 blocks = 4096 weights. Skip unsupported qts.
+            let block_bytes = match t.quant_type {
+                19 => 72, 20 => 112, 3 => 34,
+                _ => { eprintln!("  {:55} {:>2} (skip qt)", sname, t.quant_type); continue; }
+            };
+            let n_blocks = (t.data_size / block_bytes).min(16);
+            if n_blocks == 0 { continue; }
+            let n_w = n_blocks * 256;
+            let recon: Vec<f32> = if t.quant_type == 19 {
+                let raw = &mmap[t.data_offset..t.data_offset + n_blocks * 72];
+                super::dequantize_mq2g256_lloyd_to_f32(raw, n_w, &signs1, &signs2)
+            } else if t.quant_type == 20 {
+                let raw = &mmap[t.data_offset..t.data_offset + n_blocks * 112];
+                dequant_mq3_lloyd(raw, n_w, &signs1, &signs2)
+            } else {
+                eprintln!("  {:55} {:>2} (unsupported qt for dequant, skipping)",
+                    sname, t.quant_type);
+                continue;
+            };
+            // Compute stats.
+            let n = recon.len() as f64;
+            let mean = recon.iter().map(|&x| x as f64).sum::<f64>() / n;
+            let var = recon.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n;
+            let stddev = var.sqrt();
+            // Kurtosis (Pearson) — measures heavy-tailedness; Gaussian = 3.
+            let mu4 = recon.iter().map(|&x| (x as f64 - mean).powi(4)).sum::<f64>() / n;
+            let kurt = mu4 / var.powi(2);
+            // p99/sd — ratio of 99th percentile abs value to sd.
+            let mut absvals: Vec<f64> = recon.iter().map(|&x| (x as f64 - mean).abs()).collect();
+            absvals.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99 = absvals[(absvals.len() * 99 / 100).min(absvals.len() - 1)];
+            let p99_over_sd = p99 / stddev;
+            eprintln!("{:55} {:>2} {:>10.4e} {:>10.4e} {:>10.3} {:>10.3}",
+                sname, t.quant_type, mean, stddev, p99_over_sd, kurt);
+        }
+        // Reference values from synthetic distributions:
+        eprintln!("\nReference (synthetic):");
+        eprintln!("  Gaussian:            p99/sd ≈ 2.33    kurtosis ≈ 3.0");
+        eprintln!("  Heavy-tailed (5% × 3): p99/sd ≈ 2.5-3   kurtosis ≈ 3-6");
+        eprintln!("  Sparse outliers:     p99/sd ≈ 10+     kurtosis ≈ 30+");
+        eprintln!("  Bimodal:             p99/sd ≈ 1.5-2   kurtosis < 3 (platykurtic)");
     }
 
     #[test]
