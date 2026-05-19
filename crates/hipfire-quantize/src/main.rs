@@ -6063,6 +6063,91 @@ mod gptq_damping_probe {
         run_huber_sweep("Gaussian 16x256", &gaussian_samples(16 * 256, 0xc001cafe));
     }
 
+    /// Test "weight-norm proxy imatrix": a calibration-free approximation
+    /// using column 2-norm of the weight matrix itself as the per-channel
+    /// importance signal. Real AWQ uses sum_t |a_tj|^2; we substitute
+    /// sum_i |w_ij|^2. Both produce a [K]-shaped vector that's used to
+    /// weight the Lloyd codebook fit.
+    ///
+    /// If this gives meaningful MSE improvement over uniform Lloyd on
+    /// heavy-tailed distributions, it's a viable calibration-free path
+    /// to better V4F quants. Bench-falsified if it doesn't beat uniform
+    /// by a clear margin.
+    fn weight_norm_proxy_imatrix(weights: &[f32], m: usize, k: usize) -> Vec<f32> {
+        let mut col_norms = vec![0.0f32; k];
+        for r in 0..m {
+            for j in 0..k {
+                let w = weights[r * k + j];
+                col_norms[j] += w * w;
+            }
+        }
+        for v in col_norms.iter_mut() {
+            *v = v.sqrt();
+        }
+        // Normalize so geometric mean is 1.0 (matches AWQ convention).
+        let mut sum_log = 0.0f64;
+        for &v in &col_norms {
+            sum_log += (v.max(1e-12) as f64).ln();
+        }
+        let mean_log = sum_log / k as f64;
+        for v in col_norms.iter_mut() {
+            *v = ((*v as f64).ln() - mean_log).exp() as f32;
+        }
+        col_norms
+    }
+
+    fn run_weight_norm_proxy_sweep(label: &str, weights: &[f32], m: usize, k: usize) {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let n = weights.len();
+        eprintln!("\n=== {label} (m={m}, k={k}, n={n}) ===");
+        // Uniform Lloyd baseline.
+        let ref_bytes = quantize_mq2g256_lloyd(weights, &signs1, &signs2);
+        let ref_recon = dequantize_mq2g256_lloyd_to_f32(&ref_bytes, n, &signs1, &signs2);
+        let ref_mse = mse(weights, &ref_recon);
+        eprintln!("  Uniform Lloyd                MSE = {ref_mse:.6e}");
+        // Weight-norm proxy imatrix.
+        let col_imatrix = weight_norm_proxy_imatrix(weights, m, k);
+        let proxy_bytes = quantize_mq2g256_lloyd_weighted(weights, &col_imatrix, &signs1, &signs2);
+        let proxy_recon = dequantize_mq2g256_lloyd_to_f32(&proxy_bytes, n, &signs1, &signs2);
+        let proxy_mse = mse(weights, &proxy_recon);
+        let delta = ((proxy_mse - ref_mse) / ref_mse) * 100.0;
+        eprintln!("  Weight-norm-proxy Lloyd      MSE = {proxy_mse:.6e}  ({delta:+.2}% vs uniform)");
+    }
+
+    #[test]
+    fn weight_norm_proxy_imatrix_sweep() {
+        // Generate synthetic [m, k] matrices that mimic V4F's expert
+        // shapes (m=2048, k=4096 for gate; m=4096, k=2048 for down).
+        // Use heavy-tailed and sparse-outlier variants to stress the
+        // proxy.
+        let m = 2048;
+        let k = 4096;
+        let n = m * k;
+        eprintln!("\n=== Weight-norm proxy imatrix sweep ===");
+        run_weight_norm_proxy_sweep(
+            "Gaussian [2048, 4096]",
+            &gaussian_samples(n, 0xc001cafe), m, k,
+        );
+        // Heavy-tailed: 5% of weights drawn from N(0, 3).
+        let mut htw = gaussian_samples(n, 0xfeed);
+        let tail_count = n / 20;
+        let tail = gaussian_samples(tail_count, 0xbeef);
+        for (i, t) in tail.iter().enumerate() {
+            htw[i * 20] = t * 3.0;
+        }
+        run_weight_norm_proxy_sweep("Heavy-tailed [2048, 4096]", &htw, m, k);
+        // Per-column variance heterogeneity: make column j scale with j/k.
+        let mut col_het = gaussian_samples(n, 0xc011c011);
+        for r in 0..m {
+            for j in 0..k {
+                let scale = 0.1 + 1.9 * (j as f32 / k as f32);
+                col_het[r * k + j] *= scale;
+            }
+        }
+        run_weight_norm_proxy_sweep("Per-column var heterogeneity", &col_het, m, k);
+    }
+
     #[test]
     fn lloyd_iteration_headroom() {
         // The production 8-iter cap may or may not converge on heavy-tailed
