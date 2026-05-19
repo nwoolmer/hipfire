@@ -6116,6 +6116,271 @@ mod gptq_damping_probe {
     }
 }
 
+/// Real-V4F per-block diagnostic. Reads an HFQ file directly via memmap2
+/// (bypasses the hipfire-runtime hfq reader which currently has a broken
+/// arch dep — keeps this probe self-contained inside hipfire-quantize).
+/// For each MQ2-Lloyd (qt=19) and MQ3-Lloyd (qt=20) tensor, samples up to
+/// MAX_SAMPLE_BLOCKS blocks and computes per-block stats:
+///   - codebook range (max_cb - min_cb)
+///   - codepoint spacing variance (how uneven the codebook is)
+///   - index entropy (uniform = 2 bits for MQ2, log2(8)=3 for MQ3)
+/// Then ranks tensors by mean per-block range to identify which tensors
+/// have the highest dynamic range (= hardest to compress at given bpw).
+///
+/// Run with: cargo test --release -p hipfire-quantize --
+///           --ignored hfq_block_range_diag -- --nocapture
+///
+/// Reads path from HIPFIRE_QUANT_DIAG_PATH env var (default points at
+/// the local v4f.antirezQ8 snapshot — has both MQ2 gate_up and MQ3 down).
+#[cfg(test)]
+mod hfq_block_diag {
+    use super::*;
+    use memmap2::Mmap;
+    use std::fs::File;
+    use std::path::Path;
+
+    struct TensorInfo {
+        name: String,
+        quant_type: u8,
+        shape: Vec<u32>,
+        data_offset: usize,
+        data_size: usize,
+    }
+
+    fn parse_hfq(path: &Path) -> std::io::Result<(Mmap, Vec<TensorInfo>)> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        assert_eq!(&mmap[0..4], b"HFQM", "Not HFQ");
+        let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        // Find JSON end by brace-matching.
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut json_end = 0usize;
+        for (i, &b) in mmap[metadata_offset..data_offset].iter().enumerate() {
+            if esc { esc = false; continue; }
+            if in_str { if b == b'\\' { esc = true; continue; } if b == b'"' { in_str = false; } continue; }
+            if b == b'"' { in_str = true; continue; }
+            if b == b'{' { depth += 1; }
+            if b == b'}' { depth -= 1; if depth == 0 { json_end = i + 1; break; } }
+        }
+        let mut pos = metadata_offset + json_end;
+        let idx_n = u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()) as usize;
+        assert_eq!(idx_n, n_tensors);
+        pos += 4;
+        let mut tensors = Vec::with_capacity(n_tensors);
+        let mut cum = data_offset;
+        for _ in 0..n_tensors {
+            let name_len = u16::from_le_bytes(mmap[pos..pos+2].try_into().unwrap()) as usize;
+            pos += 2;
+            let name = String::from_utf8_lossy(&mmap[pos..pos+name_len]).into_owned();
+            pos += name_len;
+            let quant_type = mmap[pos]; pos += 1;
+            let n_dims = mmap[pos] as usize; pos += 1;
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()));
+                pos += 4;
+            }
+            // Skip group_size u32.
+            pos += 4;
+            let data_size = u64::from_le_bytes(mmap[pos..pos+8].try_into().unwrap()) as usize;
+            pos += 8;
+            tensors.push(TensorInfo { name, quant_type, shape, data_offset: cum, data_size });
+            cum += data_size;
+        }
+        Ok((mmap, tensors))
+    }
+
+    fn classify(name: &str) -> &'static str {
+        if name.contains("ffn.experts.") && name.ends_with("w1.weight") { return "routed.w1 (gate)"; }
+        if name.contains("ffn.experts.") && name.ends_with("w2.weight") { return "routed.w2 (down)"; }
+        if name.contains("ffn.experts.") && name.ends_with("w3.weight") { return "routed.w3 (up)"; }
+        if name.contains("shared_experts.w1") { return "shared.w1"; }
+        if name.contains("shared_experts.w2") { return "shared.w2"; }
+        if name.contains("shared_experts.w3") { return "shared.w3"; }
+        if name.ends_with("attn.wq_a.weight") || name.ends_with("attn.wq_b.weight") { return "attn.q"; }
+        if name.ends_with("attn.wkv.weight") { return "attn.kv"; }
+        if name.ends_with("attn.wo_a.weight") || name.ends_with("attn.wo_b.weight") { return "attn.wo"; }
+        if name.contains("compressor.wkv") || name.contains("compressor.wgate") { return "compressor"; }
+        if name.contains("indexer.") { return "indexer"; }
+        "other"
+    }
+
+    /// Stats per block at MQ2 (4 codepoints, 8 B codebook + 64 B indices = 72 B/group).
+    fn block_stats_mq2(data: &[u8]) -> Option<(f32, f32, f32)> {
+        if data.len() < 8 { return None; }
+        let mut cb = [0.0f32; 4];
+        for k in 0..4 {
+            cb[k] = f16_to_f32(u16::from_le_bytes([data[2*k], data[2*k+1]]));
+        }
+        let lo = cb.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = cb.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = hi - lo;
+        let mean = cb.iter().sum::<f32>() / 4.0;
+        let spacing_var = cb.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / 4.0;
+        // Index histogram.
+        let mut hist = [0u32; 4];
+        for i in 0..64 {
+            let b = data[8 + i];
+            for j in 0..4 { hist[((b >> (j*2)) & 0x3) as usize] += 1; }
+        }
+        let total: u32 = hist.iter().sum();
+        let mut h_bits = 0.0f32;
+        for &c in &hist {
+            if c > 0 {
+                let p = c as f32 / total as f32;
+                h_bits -= p * p.log2();
+            }
+        }
+        Some((range, spacing_var, h_bits))
+    }
+
+    /// Stats per block at MQ3 (8 codepoints, 16 B codebook + 96 B indices = 112 B/group).
+    fn block_stats_mq3(data: &[u8]) -> Option<(f32, f32, f32)> {
+        if data.len() < 16 { return None; }
+        let mut cb = [0.0f32; 8];
+        for k in 0..8 {
+            cb[k] = f16_to_f32(u16::from_le_bytes([data[2*k], data[2*k+1]]));
+        }
+        let lo = cb.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = cb.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = hi - lo;
+        let mean = cb.iter().sum::<f32>() / 8.0;
+        let spacing_var = cb.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / 8.0;
+        // Reconstruct indices.
+        let mut hist = [0u32; 8];
+        for chunk in 0..32 {
+            let bo = 16 + chunk * 3;
+            let b0 = data[bo]; let b1 = data[bo+1]; let b2 = data[bo+2];
+            let q = [
+                b0 & 7, (b0 >> 3) & 7, ((b0 >> 6) & 3) | ((b1 & 1) << 2),
+                (b1 >> 1) & 7, (b1 >> 4) & 7, ((b1 >> 7) & 1) | ((b2 & 3) << 1),
+                (b2 >> 2) & 7, (b2 >> 5) & 7,
+            ];
+            for v in q { hist[v as usize] += 1; }
+        }
+        let total: u32 = hist.iter().sum();
+        let mut h_bits = 0.0f32;
+        for &c in &hist {
+            if c > 0 {
+                let p = c as f32 / total as f32;
+                h_bits -= p * p.log2();
+            }
+        }
+        Some((range, spacing_var, h_bits))
+    }
+
+    fn qt_name(qt: u8) -> &'static str {
+        match qt {
+            1 => "F16", 2 => "F32", 3 => "Q8F16", 5 => "Q8HFQ",
+            6 => "HFQ4G256", 7 => "HFQ4G128", 13 => "MQ4G256",
+            14 => "MQ8G256", 15 => "MQ6G256", 17 => "MQ3G256",
+            18 => "MQ2G256", 19 => "MQ2G256Lloyd", 20 => "MQ3G256Lloyd",
+            21 => "HFP4G32", 24 => "MFP4G32",
+            _ => "?",
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn hfq_inventory() {
+        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
+            .unwrap_or_else(|_| "/data/hipfire-models/v4f.antirezQ8.hfq".to_string());
+        let path = Path::new(&path_str);
+        eprintln!("opening {path:?}");
+        let (_mmap, tensors) = parse_hfq(path).expect("parse hfq");
+        eprintln!("{} tensors", tensors.len());
+        // Bucket by (family, qt).
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<(&'static str, u8), (u64, u64)> = BTreeMap::new();
+        let mut total_bytes: u64 = 0;
+        for t in &tensors {
+            let fam = classify(&t.name);
+            let e = counts.entry((fam, t.quant_type)).or_default();
+            e.0 += 1; e.1 += t.data_size as u64;
+            total_bytes += t.data_size as u64;
+        }
+        eprintln!("{:30} {:>14} {:>8} {:>14}", "family", "qt", "count", "bytes");
+        for ((fam, qt), (cnt, bytes)) in &counts {
+            eprintln!("{:30} {:>2} {:12} {:>8} {:>14}",
+                fam, qt, qt_name(*qt), cnt, bytes);
+        }
+        eprintln!("\ntotal data bytes: {} ({:.2} GiB)",
+            total_bytes, total_bytes as f64 / (1024.0_f64.powi(3)));
+    }
+
+    #[test]
+    #[ignore]
+    fn hfq_block_range_diag() {
+        let path_str = std::env::var("HIPFIRE_QUANT_DIAG_PATH")
+            .unwrap_or_else(|_| "/data/hipfire-models/v4f.antirezQ8.hfq".to_string());
+        let path = Path::new(&path_str);
+        eprintln!("opening {path:?}");
+        let (mmap, tensors) = parse_hfq(path).expect("parse hfq");
+        eprintln!("{} tensors, file mapped", tensors.len());
+
+        // Bucket by (family, qt) → list of (mean_range, mean_var, mean_entropy, n_blocks).
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<(&'static str, u8), Vec<(f32, f32, f32, usize)>> = BTreeMap::new();
+
+        // Sample at most this many blocks per tensor; routed-expert tensors are
+        // huge (~1 MB each in the layer's batched blob form, 256 experts × 43
+        // layers = ~30k tensors). Cap CPU time.
+        const MAX_BLOCKS_PER_TENSOR: usize = 64;
+
+        for t in &tensors {
+            if t.quant_type != 19 && t.quant_type != 20 { continue; }
+            let block_bytes = if t.quant_type == 19 { 72 } else { 112 };
+            let raw = &mmap[t.data_offset..t.data_offset + t.data_size];
+            let n_blocks = t.data_size / block_bytes;
+            if n_blocks == 0 { continue; }
+            let stride = (n_blocks / MAX_BLOCKS_PER_TENSOR.min(n_blocks)).max(1);
+            let mut sum_range = 0.0f64;
+            let mut sum_var = 0.0f64;
+            let mut sum_h = 0.0f64;
+            let mut n_sampled = 0usize;
+            let mut bi = 0;
+            while bi < n_blocks {
+                let blk = &raw[bi * block_bytes..(bi + 1) * block_bytes];
+                let stats = if t.quant_type == 19 {
+                    block_stats_mq2(blk)
+                } else {
+                    block_stats_mq3(blk)
+                };
+                if let Some((r, v, h)) = stats {
+                    sum_range += r as f64;
+                    sum_var += v as f64;
+                    sum_h += h as f64;
+                    n_sampled += 1;
+                }
+                bi += stride;
+            }
+            if n_sampled == 0 { continue; }
+            let fam = classify(&t.name);
+            buckets.entry((fam, t.quant_type)).or_default().push((
+                (sum_range / n_sampled as f64) as f32,
+                (sum_var / n_sampled as f64) as f32,
+                (sum_h / n_sampled as f64) as f32,
+                n_sampled,
+            ));
+        }
+
+        eprintln!("\n=== Per-family block stats (sampled {MAX_BLOCKS_PER_TENSOR}/tensor) ===");
+        eprintln!("{:30} {:3} {:>6} {:>10} {:>10} {:>10}", "family", "qt", "tensors", "mean_range", "mean_var", "mean_entropy");
+        for ((fam, qt), entries) in &buckets {
+            let n_tensors = entries.len();
+            let mean_range = entries.iter().map(|(r, _, _, _)| *r as f64).sum::<f64>() / n_tensors as f64;
+            let mean_var = entries.iter().map(|(_, v, _, _)| *v as f64).sum::<f64>() / n_tensors as f64;
+            let mean_h = entries.iter().map(|(_, _, h, _)| *h as f64).sum::<f64>() / n_tensors as f64;
+            eprintln!("{:30} {:3} {:>6} {:>10.4} {:>10.4} {:>10.4}",
+                fam, qt, n_tensors, mean_range, mean_var, mean_h);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
