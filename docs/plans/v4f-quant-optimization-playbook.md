@@ -6,13 +6,28 @@ and an imatrix file generated against them.
 
 ## Baseline state on disk
 
-PPL on wikitext2-test, current files in `/data/hipfire-models/`:
+PPL on wikitext2-test, current files at `/data/hipfire-models/` and
+`/home/nick/.hipfire/models/`:
 
-| ctx  | mq2lloyd-f16compress | mq2-gptq-all | antirezQ8 |
-|------|----------------------|--------------|-----------|
-| 128  | 11.58                | 38.74        | 11.67     |
-| 1024 |  7.33                | 14.36        |  7.10     |
-| 2048 |  6.28                | 11.89        |  6.01     |
+| ctx  | mq2lloyd-f16compress | fp4fix (Lloyd+MQ4 compressor) | mq2-gptq-all | antirezQ8 |
+|------|----------------------|--------------------------------|--------------|-----------|
+| 128  | 11.58                | 20.96                          | 38.74        | 11.67     |
+| 1024 |  7.33                | 10.91                          | 14.36        |  7.10     |
+| 2048 |  6.28                |  8.76                          | 11.89        |  6.01     |
+
+The fp4fix file (Lloyd-routed + MQ4G256 compressor) was added to the
+table 2026-05-19 to give an isolation point: it has the same compressor
+quantization as mq2-gptq-all but plain Lloyd on routed experts. The
+deltas split the mq2-gptq-all regression into two clean axes:
+
+* **F16 → MQ4 compressor alone**: +81% PPL @ ctx=128, +49% @ 1024,
+  +40% @ 2048. Per `project_v4f_compressor_must_stay_f16` — compressor
+  + indexer tensors are by far the most quant-sensitive in V4F.
+* **GPTQ-Lloyd algorithm on top of MQ4 compressor**: +85% @ ctx=128,
+  +32% @ 1024, +36% @ 2048.
+
+So mq2-gptq-all has TWO compounding bugs, each contributing roughly
+half of its total regression.
 
 Inventory (from `hfq_inventory` probe in `hfq_block_diag` test module):
 
@@ -28,6 +43,19 @@ Inventory (from `hfq_inventory` probe in `hfq_block_diag` test module):
 implement the antirez asymmetric routed-expert split (gate_up=MQ2 +
 down=MQ3). All routed experts are MQ2-Lloyd. The "antirez" name only
 captures Q8 attention. The TRUE antirez recipe has never been built.
+
+## Universal rule for any V4F rebuild
+
+**Compressor + indexer tensors MUST stay F16** (quant_type 1). Inspect
+the inventory before shipping any rebuild — if the compressor row
+shows qt=13 (MQ4G256) instead of qt=1 (F16), expect +40-81% PPL
+regression. The 450 MB savings is never worth it on V4F.
+
+The quantizer's default behaviour preserves F16 for these tensors;
+mq2-gptq-all and fp4fix both inadvertently compressed them via some
+prior build path that has since been fixed. Always run `hfq_inventory`
+on the output and confirm compressor row is F16 before committing the
+artifact.
 
 ## Action 1 — Build the true antirez recipe (highest expected payoff)
 
