@@ -162,23 +162,35 @@ But per the probe, even with real imatrix the d > 0 sequential pass costs
 which the simpler `mq4-mq2lloyd-imatrix` (Action 3) delivers without the
 GPTQ noise tax.
 
-## Action 5 — Pre-FWHT Lloyd refactor (research-level, defer)
+## Action 5 — Pre-FWHT Lloyd refactor — **FALSIFIED, removed**
 
-Would unlock the full imatrix benefit by doing Lloyd-imatrix in the
-natural channel basis, then applying FWHT to centroids for the on-disk
-format. Substantial pipeline work:
+Tested 2026-05-19 via `prefwht_imatrix_lloyd_value` probe. Pre-FWHT
+imatrix-Lloyd is +95.7% WORSE than post-FWHT uniform Lloyd on
+activation-weighted gemv error. Root cause: FWHT's variance-
+equalization across positions is load-bearing for the 4-codepoint MQ2
+codebook — heterogeneous-stddev columns can't share a codebook
+pre-FWHT. The decorrelation-only framing was incomplete.
 
-- New `quantize_mq2g256_lloyd_prefwht_imatrix` function
-- Runtime kernel changes (centroid math is now in the rotated basis at
-  runtime, but on-disk values stay rotated — kernel is unchanged if we
-  apply FWHT to centroids at quant time)
-- Validation harness comparing pre-FWHT-imatrix-Lloyd vs current
-  post-FWHT-imatrix-Lloyd PPL
+Implication for imatrix on V4F: the current FWHT-based MQ2 format
+fundamentally limits how much value imatrix can deliver. To unlock
+real imatrix benefit, the rotation step itself needs to change to
+something that preserves channel-importance — QuaRot / SpinQuant-
+style learned per-tensor rotation, or no rotation with higher bpw.
+Both are research-level changes; not pursued in this loop.
 
-Expected payoff: another 10-20% MSE improvement on top of Action 3,
-which would translate to ~5% PPL improvement at high ctx.
+## Action 6 — Don't bother with imatrix on the current FWHT format
 
-Defer until Actions 1-3 are done and prove value.
+A direct consequence of the Action 5 falsification + the
+`weight_norm_proxy_imatrix_sweep` zero-benefit finding. Even with a
+perfectly-calibrated real imatrix file, the FWHT post-rotation
+washes out the per-channel signal before it reaches the codebook
+update. The empirical post-FWHT imatrix-Lloyd RESULT is +5% WORSE
+than uniform Lloyd in the activation-weighted A/B (probe data on file).
+
+Save the multi-hour imatrix collection unless it's needed for a
+different (non-FWHT-MQ2) format. The current `--format
+mq4-mq2lloyd-imatrix` is unlikely to beat `--format mq4-mq2lloyd-native`
+on V4F in practice.
 
 ## Optimizations already shipped (commits in feat/deepseek4-v4f)
 
