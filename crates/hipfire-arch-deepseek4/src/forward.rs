@@ -2168,6 +2168,10 @@ pub struct PrefillBatchScratch {
     /// Joint KV `[max_batch, kv_dim]` where `kv_dim = n_kv_heads * head_dim`.
     /// wkv output, then kv_norm RMSNormed in place.
     pub kv_batch: GpuTensor,
+    /// Per-batch absolute KV positions `[max_batch]` stored as F32 (the
+    /// rope_tail_*_batched kernels read it as i32). Uploaded once per
+    /// chunk: positions[b] = start_pos + b.
+    pub positions: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2208,8 +2212,59 @@ impl PrefillBatchScratch {
             q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch")?,
             q_head_ones,
             kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
+            positions:       alloc(gpu, &[max_batch], "positions")?,
         })
     }
+}
+
+/// Batched twin of `apply_tail_rope` for Phase B2 chunk forward.
+///
+/// Per batch position b: applies V4F's tail-only RoPE on the last
+/// `qk_rope_head_dim` dims of each head in pbs.q_batch and pbs.kv_batch.
+/// Reads positions[b] from `pbs.positions` (caller responsible for
+/// pre-uploading `start_pos + b` per batch row at chunk start).
+///
+/// Per-layer YaRN parameters resolved via `layer_rope_params` exactly as
+/// in the sequential path. Honours `HIPFIRE_V4F_NO_YARN=1` (single-theta
+/// path via `rope_tail_interleaved_batched`).
+#[allow(dead_code)]
+fn apply_tail_rope_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+        gpu.rope_tail_interleaved_batched(
+            &pbs.q_batch, &pbs.kv_batch, &pbs.positions,
+            cfg.num_attention_heads as i32,
+            cfg.num_key_value_heads as i32,
+            cfg.head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            cfg.rope_theta,
+            batch_size as i32,
+        ).map_err(|e| format!("rope_tail_interleaved_batched (no-yarn): {e:?}"))?;
+        return Ok(());
+    }
+
+    let layer = &weights.layers[layer_idx];
+    let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+        layer_rope_params(cfg, layer.compress_ratio);
+
+    gpu.rope_tail_yarn_interleaved_batched(
+        &pbs.q_batch, &pbs.kv_batch, &pbs.positions,
+        cfg.num_attention_heads as i32,
+        cfg.num_key_value_heads as i32,
+        cfg.head_dim as i32,
+        cfg.qk_rope_head_dim as i32,
+        freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+        /*inverse=*/0,
+        batch_size as i32,
+    ).map_err(|e| format!("rope_tail_yarn_interleaved_batched l{layer_idx}: {e:?}"))?;
+
+    Ok(())
 }
 
 /// Batched twin of `kv_joint` for Phase B2 chunk forward.

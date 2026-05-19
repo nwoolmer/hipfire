@@ -1627,6 +1627,16 @@ pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
 pub const ROPE_TAIL_YARN_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip");
 
+/// Tail-only RoPE — BATCHED (Phase B2, 2026-05-18). Per-batch positions
+/// from a device array; rotation on the LAST n_rot dims of each head.
+pub const ROPE_TAIL_INTERLEAVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved_batched.hip");
+
+/// YaRN-aware tail RoPE — BATCHED (Phase B2, 2026-05-18). Batched twin
+/// of ROPE_TAIL_YARN_INTERLEAVED_SRC.
+pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
