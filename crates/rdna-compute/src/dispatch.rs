@@ -20650,6 +20650,59 @@ impl Gpu {
         }
     }
 
+    /// V4F indexer score — BATCHED. Per batch position b scores every
+    /// compressed slot against `q[b, :, :]` using `weights[b, :]`. The
+    /// k_cache is shared across batch. Output is `scores[B, N]`.
+    /// Byte-identical to `indexer_relu_score_f32` at batch_size == 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn indexer_relu_score_batched_f32(
+        &mut self,
+        q: &GpuTensor,             // [B, H, D]
+        k_cache: &GpuTensor,       // [N, D] shared
+        weights: &GpuTensor,       // [B, H]
+        scores: &GpuTensor,        // [B, N] output
+        n_idx_heads: i32,          // H
+        idx_head_dim: i32,         // D
+        n_compressed: i32,         // N
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "indexer_relu_score_batched",
+            kernels::INDEXER_RELU_SCORE_BATCHED_SRC,
+            "indexer_relu_score_batched_f32",
+        )?;
+        let func = &self.functions["indexer_relu_score_batched_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut d  = idx_head_dim;
+        let mut nc = n_compressed;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_compressed as u32, batch_size as u32, 1],
+                [n_idx_heads as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F top-K K/V gather — BATCHED. Per batch position b uses its
     /// own top-K index list `topk_idx[b, :]` (typically produced by
     /// `indexer_top_k_batched`) and writes into its own slice of the

@@ -1676,6 +1676,11 @@ pub const ROPE_TAIL_INVERSE_BATCHED_SRC: &str =
 pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/v4f_topk_kv_gather_batched.hip");
 
+/// V4F indexer score — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// score against the shared compressed-K cache.
+pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_batched.hip");
+
 /// V4F head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
