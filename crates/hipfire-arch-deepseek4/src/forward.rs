@@ -2532,12 +2532,14 @@ fn attention_block_batched_swa_only(
         n_heads * head_dim, batch_size,
     ).map_err(|e| format!("rotate attn_out_raw_batch l{layer_idx}: {e:?}"))?;
 
-    // 7. wo_a per-group batched. F32 has a register-tiled kernel;
-    //    other dtypes (MQ4, Q8) loop sequentially per (batch, group)
-    //    via gemv_auto. This is correct for any dtype but slow when
-    //    weights are MQ4/Q8 — a future optimization writes
-    //    wo_per_group_batched_{mq4g256,q8_0} kernels.
+    // 7. wo_a per-group batched.
+    //    F32     → wo_per_group_batched_f32 (single launch).
+    //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch, MQ4 prerotated).
+    //    Q8_0    → per-(B, G) sequential gemv_auto loop (still TODO).
+    // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
+    let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
+        .map(|s| s != "0").unwrap_or(true);
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -2546,11 +2548,20 @@ fn attention_block_batched_swa_only(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
         }
+        DType::Raw if wo_a_batched => {
+            // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
+            gpu.wo_per_group_batched_hfq4g256(
+                wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
+        }
         _ => {
-            // Per-(batch, group) sequential fallback. attn_out_raw_batch
-            // and attn_out_raw_rot_batch are both [B, n_heads * head_dim]
-            // viewable as [B, G, per_group_in]. wo_a is [G * o_lora_rank,
-            // per_group_in] — per-group slice rows [g*o_lora_rank..].
+            // Per-(batch, group) sequential fallback for Q8 and the
+            // opt-out path. attn_out_raw_batch and attn_out_raw_rot_batch
+            // are both [B, n_heads * head_dim] viewable as
+            // [B, G, per_group_in]. wo_a is [G * o_lora_rank, per_group_in]
+            // — per-group slice rows [g*o_lora_rank..].
             for b in 0..batch_size {
                 for g in 0..n_groups {
                     let in_off = b * n_heads * head_dim + g * per_group_in;
@@ -2558,9 +2569,6 @@ fn attention_block_batched_swa_only(
                     let raw_view = pbs.attn_out_raw_batch.sub_offset(in_off, per_group_in);
                     let out_off = b * n_groups * o_lora_rank + g * o_lora_rank;
                     let out_view = pbs.wo_a_out_batch.sub_offset(out_off, o_lora_rank);
-                    // Per-group weight slice (M = o_lora_rank, K = per_group_in).
-                    // For quantized/Raw dtypes, dtype.size() == 1 byte so
-                    // sub_offset takes byte offsets directly.
                     let wo_a_view = match wo_a.dtype {
                         DType::Q8_0 => {
                             let per_g_bytes = (o_lora_rank * per_group_in / 32) * 34;
@@ -2936,9 +2944,14 @@ fn attention_block_batched_mixed(
         n_heads * head_dim, batch_size,
     ).map_err(|e| format!("rotate attn_out_raw l{layer_idx}: {e:?}"))?;
 
-    // 7. wo_a per-group batched. F32: register-tiled kernel. Others:
-    //    per-(batch, group) sequential gemv_auto fallback.
+    // 7. wo_a per-group batched.
+    //    F32     → wo_per_group_batched_f32 (single launch).
+    //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
+    //    Q8_0    → per-(B, G) sequential gemv_auto loop.
+    // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
+    let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
+        .map(|s| s != "0").unwrap_or(true);
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -2946,6 +2959,13 @@ fn attention_block_batched_mixed(
                 n_groups as i32, o_lora_rank as i32, per_group_in as i32,
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        DType::Raw if wo_a_batched => {
+            gpu.wo_per_group_batched_hfq4g256(
+                wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
         }
         _ => {
             for b in 0..batch_size {

@@ -1697,6 +1697,12 @@ pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
 
+/// V4F per-group O-LoRA batched GEMV for HFQ4G256-packed wo_a.
+/// Single launch in place of B × G separate gemv_mq4g256_prerotated calls.
+/// Collapses ~11k dispatch calls/chunk down to 43 in the V4F prefill path.
+pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256.hip");
+
 /// V4F MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =

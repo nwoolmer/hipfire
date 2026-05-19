@@ -20800,6 +20800,56 @@ impl Gpu {
         }
     }
 
+    /// V4F per-group O-LoRA batched GEMV — HFQ4G256-packed wo_a.
+    /// Sibling of `wo_per_group_batched_f32` for the MQ4 case. Input
+    /// `x_in` must be FWHT-pre-rotated. Single launch in place of B×G
+    /// gemv_mq4g256_prerotated calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_hfq4g256(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 256 * 136] bytes
+        x_in: &GpuTensor,    // [B, G, K] FWHT-rotated
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "wo_per_group_batched_hfq4g256",
+            kernels::WO_PER_GROUP_BATCHED_HFQ4G256_SRC,
+            "wo_per_group_batched_hfq4g256",
+        )?;
+        let func = &self.functions["wo_per_group_batched_hfq4g256"];
+        let wp = wo_a.buf.as_ptr();
+        let xp = x_in.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_size as u32, g as u32],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F identity gather — BATCHED. For ratio=128 layers without an
     /// indexer: copies the same `kv_cache[0..K, :]` into every batch
     /// row's slab. Same shape as v4f_topk_kv_gather_batched_f32 but
