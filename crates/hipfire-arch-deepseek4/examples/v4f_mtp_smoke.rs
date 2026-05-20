@@ -26,7 +26,8 @@
 //!   HIPFIRE_V4F_MTP_ADDON=PATH  optional addon HFQ override
 
 use hipfire_arch_deepseek4::{
-    forward::decode_step, spec_decode::{speculative_decode_step, logits_argmax},
+    forward::{decode_step, mtp_forward},
+    spec_decode::{speculative_decode_step, logits_argmax},
     DeepseekV4, DeepseekV4State,
 };
 use hipfire_runtime::arch::Architecture;
@@ -78,15 +79,54 @@ fn main() -> Result<(), String> {
     }
     eprintln!("MTP layer loaded ✓");
 
-    // ── Prefill ───────────────────────────────────────────────────────
+    // ── Prefill (main + MTP) ──────────────────────────────────────────
+    //
+    // For MTP attention to have prompt context during spec-decode windows,
+    // the MTP layer's SWA cache (state._attention[num_hidden_layers]) must
+    // also be populated during prefill — NOT just the main 0..N-1 layers.
+    //
+    // At each prefill position i, after main forward produces h_i, we know
+    // the NEXT prompt token T_{i+1} (since this is prefill). Run mtp_forward
+    // with (hidden=h_i, next_token=T_{i+1}, position=i) — this is the
+    // V3 §4 contract for MTP step k=1 — and lets the MTP attn_stub write
+    // its SWA slot i.
+    //
+    // The LAST prefill position (i = N-1) is skipped because the "next
+    // token" T_N isn't known yet (it's what main is about to predict).
+    // That leaves a 1-slot gap in MTP SWA at position N-1; for short
+    // prompts (N < window=128) the slot reads as zero-init and contributes
+    // negligibly to attention. For long prompts, an extra MTP step using
+    // the predicted T_N would close this — TODO if needed.
     let prompt_tokens = tokenizer.encode(&prompt);
-    eprintln!("Prefilling {} prompt tokens...", prompt_tokens.len());
-    let mut pos: u32 = 0;
+    eprintln!("Prefilling {} prompt tokens (main + MTP)...", prompt_tokens.len());
     let mut last_logits = vec![];
     let pp_start = Instant::now();
-    for &t in &prompt_tokens {
-        last_logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos)?;
-        pos += 1;
+    for i in 0..prompt_tokens.len() {
+        let pos = i as u32;
+        last_logits = decode_step(
+            &cfg, &weights, &mut state, &mut gpu, prompt_tokens[i], pos,
+        )?;
+        // decode_step captured h_i into state.mtp_last_hidden and advanced
+        // state.n_tokens to i+1. Roll back to i so the MTP forward's
+        // attn_stub writes the correct SWA ring slot, then restore.
+        if i + 1 < prompt_tokens.len() {
+            // Decouple the borrow: hidden lives in state, mtp_forward takes
+            // &mut state. SAFETY: the GEMV chain in mtp_forward reads
+            // mtp_last_hidden via mtp_h_norm_scratch (written in step 3
+            // before the read into h_proj at step 4), then capture_mtp_hidden
+            // overwrites mtp_last_hidden in step 7 — reads complete before
+            // writes on the same stream.
+            let hidden_ptr: *const rdna_compute::GpuTensor =
+                state.mtp_last_hidden.as_ref().unwrap();
+            let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
+            let next_tok = prompt_tokens[i + 1];
+            let saved_n = state.n_tokens;
+            state.n_tokens = pos as u64;
+            let _ = mtp_forward(
+                &cfg, &weights, &mut state, &mut gpu, hidden, next_tok, pos,
+            )?;
+            state.n_tokens = saved_n;
+        }
     }
     eprintln!("Prefill done in {:.2}s, n_tokens={}",
         pp_start.elapsed().as_secs_f64(), state.n_tokens);
@@ -96,7 +136,7 @@ fn main() -> Result<(), String> {
     // (i.e. the hidden at that position predicts last_token). After prefill
     // of N tokens, the last decode_step ran at position N-1; its hidden h_{N-1}
     // was captured to state.mtp_last_hidden and predicts last_token (= T_N).
-    let mut last_position = pos - 1;
+    let mut last_position = prompt_tokens.len() as u32 - 1;
     let mut all_emitted: Vec<u32> = vec![last_token];
 
     // ── Speculative-decode windows ────────────────────────────────────
