@@ -561,34 +561,17 @@ fn compressor_forward_impl(
     // 8.30 ppl, ctx=1024: 10.38 → 8.76 ppl) outweigh the modest
     // short-context regression (ctx=128: 14.69 → 16.83 ppl).
     // Env opt-out: HIPFIRE_V4F_NO_MAIN_ROPE=1.
-    if state.comp_pos_buf.is_none() {
-        state.comp_pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("alloc comp_pos_buf l{layer_idx}: {e:?}"))?);
-    }
+    // Per-layer compressor rope pos comes from the pre-computed pos_array.
+    // Slot 1 = main_comp_rope_pos (mid-of-window by default; respects the
+    // HIPFIRE_V4F_COMP_ROPE_POS env var read once in precompute_positions).
+    // Slot 2 = indexer_comp_rope_pos (always start-of-window).
+    let slot = if is_indexer { 2 } else { 1 };
+    let pos_slice = pos_slot(state, layer_idx, slot)?;
+    // Keep state.comp_pos_buf populated for any external reader; the value
+    // here is the same slice we're about to pass into the rope kernels.
+    state.comp_pos_buf = Some(pos_slice);
     let pos_buf = state.comp_pos_buf.as_ref().unwrap();
-    // rope_pos for compressed K: PPL sweep showed clear differences.
-    //   mid (default): middle of window — best for ctx ≤ 1024
-    //   start        : start of window — best for ctx > 1024 (small delta)
-    //   end          : current position (end of window)
-    //
-    // Average PPL across [128,256,512,1024,2048]:
-    //   no-rope: 13.65  |  start: 12.97  |  mid: 11.99  |
-    //
-    // Indexer scoring uses `start` regardless (matches the position used
-    // when committing to indexer cache); only the MAIN compressor cache
-    // RoPE position is configurable here.
-    let rope_pos: i32 = match std::env::var("HIPFIRE_V4F_COMP_ROPE_POS").ok().as_deref() {
-        Some("end") => position as i32,
-        Some("start") => ((position as usize) / ratio * ratio) as i32,
-        _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32, // mid
-    };
-    // Indexer compressor always uses start-of-window (matches indexer Q
-    // rotation derivation).
-    let rope_pos_indexer = ((position as usize) / ratio * ratio) as i32;
-    let final_rope_pos = if is_indexer { rope_pos_indexer } else { rope_pos };
-    let pos_bytes = final_rope_pos.to_le_bytes();
-    gpu.memcpy_htod_auto(&pos_buf.buf, &pos_bytes)
-        .map_err(|e| format!("htod comp_pos_buf l{layer_idx}: {e:?}"))?;
+    let _ = (position, ratio); // values now consumed in precompute_positions
 
     if is_indexer {
         gpu.rope_tail_interleaved(
@@ -1036,6 +1019,12 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // HIP-graphs prerequisite: lift the ~130 per-token pos_buf
+    // `memcpy_htod` calls out of the per-layer code into a single
+    // bulk write at decode-step entry. Per-layer kernels then read
+    // their slot via `pos_slot(state, layer_idx, slot)`.
+    precompute_positions(cfg, state, gpu, position)?;
+
     // 1. Token embedding → initial residual streams.
     //    V4F uses `hc_mult = 4` parallel streams. Init pattern is
     //    [embed, 0, 0, 0] (paper-specified; verify against the V4F
@@ -2682,16 +2671,16 @@ fn apply_tail_rope(
     position: u32,
     layer_idx: usize,
 ) -> Result<(), String> {
-    // Lazy-alloc pos_buf and write current position. Use F32 alloc;
-    // the kernel reinterprets the 4-byte slot as int.
-    if state.pos_buf.is_none() {
-        state.pos_buf = Some(gpu.alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("alloc pos_buf: {e:?}"))?);
-    }
+    // Position is pre-loaded into `state.pos_array_device` at decode_step
+    // entry (single htod for all layers). Slice the qk_pos slot for this
+    // layer. Also seed the legacy `state.pos_buf` field so other code
+    // paths that still read it (inverse RoPE on attn_out, indexer) work
+    // unchanged — they get the SAME slice. The per-layer memcpy_htod is
+    // gone, lifting it out of any future HIP-graph captured region.
+    let pos_slice = pos_slot(state, layer_idx, 0)?;
+    state.pos_buf = Some(pos_slice);
     let pos_buf = state.pos_buf.as_ref().unwrap();
-    let pos_bytes = (position as i32).to_le_bytes();
-    gpu.memcpy_htod_auto(&pos_buf.buf, &pos_bytes)
-        .map_err(|e| format!("htod pos_buf: {e:?}"))?;
+    let _ = position; // silence unused; precompute_positions already used it
 
     let q  = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
@@ -2897,6 +2886,102 @@ fn q_lora(
 ///
 /// Allocates `state.residual_streams` and `state.embed_scratch`
 /// lazily on first call.
+/// Per-layer slot count in `pos_array_*`. Layout per layer:
+///   [0] qk_pos              = position
+///   [1] main_comp_rope_pos  = mid-of-window  (depends on ratio + COMP_ROPE_POS env)
+///   [2] indexer_comp_rope_pos = start-of-window
+/// Used by the HIP-graphs-friendly position-array path (default in
+/// `decode_step` since 2026-05-21). Direct-dispatch path uses the same
+/// array but doesn't strictly need the stable host source.
+pub(crate) const POS_SLOTS_PER_LAYER: usize = 3;
+
+/// Compute per-layer derived positions and update `state.pos_array_*`.
+///
+/// Single host-to-device copy of the entire `[(num_layers + 1) * 3]` i32
+/// array, with `pos_array_host` as the stable source pointer (required so
+/// captured graph nodes re-read valid values on replay).
+///
+/// Reads env vars HIPFIRE_V4F_COMP_ROPE_POS once into a cache (TODO:
+/// migrate to OnceLock once we settle on a fixed default).
+pub(crate) fn precompute_positions(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    position: u32,
+) -> Result<(), String> {
+    let total_slots = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
+
+    // Lazy-alloc device buffer + stable host source (Box<[i32]>).
+    if state.pos_array_device.is_none() {
+        state.pos_array_device = Some(
+            gpu.alloc_tensor(&[total_slots], DType::F32)
+                .map_err(|e| format!("alloc pos_array_device: {e:?}"))?,
+        );
+    }
+    if state.pos_array_host.is_none() {
+        state.pos_array_host = Some(vec![0i32; total_slots].into_boxed_slice());
+    }
+
+    // Read env vars once per call (compile-time const + env cache would be
+    // better; this is intentionally a single read, not 43× per-layer reads).
+    let comp_rope_mode = std::env::var("HIPFIRE_V4F_COMP_ROPE_POS").ok();
+    let comp_rope_mode = comp_rope_mode.as_deref();
+
+    let pos_array_host = state.pos_array_host.as_mut().unwrap();
+    for layer_idx in 0..=cfg.num_hidden_layers {
+        // Per-layer compress_ratio; MTP layer (idx == num_hidden_layers)
+        // has compress_ratio = 0 by V4F construction (no compressor).
+        let ratio = if layer_idx < cfg.num_hidden_layers {
+            cfg.compress_ratios[layer_idx] as usize
+        } else {
+            0
+        };
+        let base = layer_idx * POS_SLOTS_PER_LAYER;
+        pos_array_host[base + 0] = position as i32;
+        if ratio > 0 {
+            let main_rope_pos: i32 = match comp_rope_mode {
+                Some("end") => position as i32,
+                Some("start") => ((position as usize) / ratio * ratio) as i32,
+                _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
+            };
+            // Indexer always uses start-of-window (matches the indexer Q
+            // rotation derivation in compressor_forward).
+            let indexer_rope_pos = ((position as usize) / ratio * ratio) as i32;
+            pos_array_host[base + 1] = main_rope_pos;
+            pos_array_host[base + 2] = indexer_rope_pos;
+        } else {
+            pos_array_host[base + 1] = 0;
+            pos_array_host[base + 2] = 0;
+        }
+    }
+
+    // ONE htod for the whole array. Source is the stable Box<[i32]> on
+    // the heap, so captured graph nodes can re-read it on replay.
+    let pos_array_device = state.pos_array_device.as_ref().unwrap();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            pos_array_host.as_ptr() as *const u8,
+            pos_array_host.len() * 4,
+        )
+    };
+    gpu.memcpy_htod_auto(&pos_array_device.buf, bytes)
+        .map_err(|e| format!("htod pos_array: {e:?}"))?;
+    Ok(())
+}
+
+/// Slice the pos_array for a given layer's slot. Caller passes the slot
+/// constant (0=qk_pos, 1=main_comp_rope, 2=indexer_comp_rope).
+pub(crate) fn pos_slot(
+    state: &DeepseekV4State,
+    layer_idx: usize,
+    slot: usize,
+) -> Result<rdna_compute::GpuTensor, String> {
+    let arr = state.pos_array_device.as_ref()
+        .ok_or_else(|| "pos_array_device not initialised".to_string())?;
+    let offset = layer_idx * POS_SLOTS_PER_LAYER + slot;
+    Ok(arr.sub_offset(offset, 1))
+}
+
 fn init_residual_streams(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,

@@ -600,6 +600,12 @@ pub struct DeepseekV4State {
     /// Position counter for RoPE. Stored as a 1-element F32 GpuTensor
     /// where we write the i32 position bits via memcpy_htod (the
     /// rope_tail kernel reinterprets the bytes as int via cast).
+    ///
+    /// HIP-graphs note: in the graph-capture path (`HIPFIRE_V4F_GRAPH=1`)
+    /// this buffer is a sub_offset slice of `pos_array_device`, written
+    /// ONCE per token at decode_step entry from `pos_array_host`. In the
+    /// legacy direct-dispatch path it's a standalone [1] F32 buffer that
+    /// gets overwritten per layer.
     pub pos_buf: Option<rdna_compute::GpuTensor>,
 
     /// Separate position buffer for the indexer compressor's tail-RoPE
@@ -609,6 +615,21 @@ pub struct DeepseekV4State {
     /// current `position`. Sharing one buffer would clobber the value
     /// the main-attn inverse rope reads.
     pub comp_pos_buf: Option<rdna_compute::GpuTensor>,
+
+    /// HIP-graphs prerequisite: per-layer pre-computed position array
+    /// `[(num_hidden_layers + 1) * 3]` i32 (stored as F32 bits — kernels
+    /// reinterpret). Layout per layer: `[qk_pos, main_comp_rope_pos,
+    /// indexer_comp_rope_pos]`. Filled ONCE per decode_step from
+    /// `pos_array_host`, then sliced for per-layer kernel reads. Lets us
+    /// lift the ~130 per-token `memcpy_htod` pos_buf writes out of the
+    /// captured region so a single graph replay covers an entire decode.
+    pub pos_array_device: Option<rdna_compute::GpuTensor>,
+
+    /// Stable-pointer host source for `pos_array_device`. Heap-allocated
+    /// `Box<[i32]>` so the underlying address stays valid across graph
+    /// replays — captured memcpy nodes re-read this pointer on each replay
+    /// and find the values we wrote for the current position.
+    pub pos_array_host: Option<Box<[i32]>>,
 
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
@@ -745,6 +766,8 @@ impl DeepseekV4State {
             kv: None,
             pos_buf: None,
             comp_pos_buf: None,
+            pos_array_device: None,
+            pos_array_host: None,
             attn_out: None,
             ffn_out: None,
             ffn_x_rot: None,
