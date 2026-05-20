@@ -26,8 +26,8 @@
 //!   HIPFIRE_V4F_MTP_ADDON=PATH  optional addon HFQ override
 
 use hipfire_arch_deepseek4::{
-    forward::{decode_step, mtp_forward},
-    spec_decode::{speculative_decode_step, logits_argmax},
+    forward::{decode_step, mtp_forward, PrefillBatchScratch},
+    spec_decode::{speculative_decode_step_with_pbs, logits_argmax},
     DeepseekV4, DeepseekV4State,
 };
 use hipfire_runtime::arch::Architecture;
@@ -78,6 +78,12 @@ fn main() -> Result<(), String> {
         return Err("MTP weights not loaded — HFQ missing mtp.0.* tensors. Re-quant with --format v4f-q8-mtp or supply <base>.mtp-addon.hfq alongside the base.".to_string());
     }
     eprintln!("MTP layer loaded ✓");
+
+    // Allocate spec-decode batched scratch ONCE. The internal
+    // `forward_prefill_batch_chunk` + `final_norm_and_head_all_batched`
+    // both want a `PrefillBatchScratch`. Allocating it per spec call
+    // (the old default) costs ~30 GpuTensor allocations per window.
+    let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, k.max(8))?;
 
     // ── Prefill (main + MTP) ──────────────────────────────────────────
     //
@@ -163,9 +169,10 @@ fn main() -> Result<(), String> {
     for w in 0..windows {
         let win_start = Instant::now();
 
-        // Drive K MTP drafts + a B=K verify pass.
-        let res = speculative_decode_step(
-            &cfg, &weights, &mut state, &mut gpu,
+        // Drive K MTP drafts + a B=K verify pass. Reuses the
+        // session-wide PBS to avoid per-window allocation overhead.
+        let res = speculative_decode_step_with_pbs(
+            &cfg, &weights, &mut state, &mut gpu, &pbs,
             last_token, last_position, /*last_hidden=*/ None, k,
         )?;
 

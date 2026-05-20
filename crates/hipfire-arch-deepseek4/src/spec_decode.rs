@@ -57,12 +57,52 @@ pub struct SpecStepResult {
 ///
 /// Stub status: returns an error from the first `mtp_forward` call
 /// until M3 lands.
+/// Same as [`speculative_decode_step`] but takes a caller-owned PBS scratch
+/// instead of allocating one per call. Allocating PBS internally (~30 small
+/// GpuTensor allocations) costs measurable milliseconds at small K — caching
+/// it once at session setup and passing it in eliminates that.
+#[allow(clippy::too_many_arguments)]
+pub fn speculative_decode_step_with_pbs(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &forward::PrefillBatchScratch,
+    last_token: u32,
+    last_position: u32,
+    last_hidden: Option<&rdna_compute::GpuTensor>,
+    k: usize,
+) -> Result<SpecStepResult, String> {
+    speculative_decode_impl(
+        cfg, weights, state, gpu, Some(pbs),
+        last_token, last_position, last_hidden, k,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn speculative_decode_step(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
+    last_token: u32,
+    last_position: u32,
+    last_hidden: Option<&rdna_compute::GpuTensor>,
+    k: usize,
+) -> Result<SpecStepResult, String> {
+    speculative_decode_impl(
+        cfg, weights, state, gpu, None,
+        last_token, last_position, last_hidden, k,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn speculative_decode_impl(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    cached_pbs: Option<&forward::PrefillBatchScratch>,
     last_token: u32,
     last_position: u32,
     last_hidden: Option<&rdna_compute::GpuTensor>,
@@ -173,14 +213,27 @@ pub fn speculative_decode_step(
         .collect();
     debug_assert_eq!(verify_tokens.len(), k);
 
-    let pbs = forward::PrefillBatchScratch::new(gpu, cfg, k)?;
+    // Use the caller-provided PBS if available; otherwise allocate one.
+    // The owned variant exists so single-shot callers / tests still work
+    // without threading a PBS through; the cached variant is the perf-
+    // critical path used by tight spec-decode loops.
+    let owned_pbs: Option<forward::PrefillBatchScratch> = match cached_pbs {
+        Some(_) => None,
+        None => Some(forward::PrefillBatchScratch::new(gpu, cfg, k)?),
+    };
+    let pbs: &forward::PrefillBatchScratch = cached_pbs
+        .unwrap_or_else(|| owned_pbs.as_ref().unwrap());
+    if pbs.max_batch < k {
+        return Err(format!(
+            "spec_decode: cached PBS max_batch ({}) < k ({})", pbs.max_batch, k));
+    }
     forward::forward_prefill_batch_chunk(
-        cfg, weights, state, gpu, &pbs, &verify_tokens, last_position + 1,
+        cfg, weights, state, gpu, pbs, &verify_tokens, last_position + 1,
     )?;
 
     // ── 4. Per-position top-1 from the verifier ───────────────────────
     let all_logits = forward::final_norm_and_head_all_batched(
-        cfg, weights, state, &pbs, gpu, k,
+        cfg, weights, state, pbs, gpu, k,
     )?;
     let main_top1: Vec<u32> = all_logits.iter()
         .map(|logits| logits_argmax(logits) as u32)
