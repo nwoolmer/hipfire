@@ -17,7 +17,10 @@
 //!   HIPFIRE_V4F_TOP_K=N        top-K filter before softmax (default 40; 0 = full vocab)
 //!   HIPFIRE_V4F_SEED=N         PRNG seed (default: time-based)
 
-use hipfire_arch_deepseek4::{forward::decode_step, DeepseekV4, DeepseekV4State};
+use hipfire_arch_deepseek4::{
+    forward::{decode_step, forward_prefill_batch_chunked, PrefillBatchScratch},
+    DeepseekV4, DeepseekV4State,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -113,6 +116,13 @@ fn main() -> Result<(), String> {
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let mut state = DeepseekV4State::new(&cfg)?;
 
+    // Batched prefill scratch — allocated once, reused for every turn.
+    // B=64 matches the bench memory ("V4F batched prefill 23.2 → 44 tok/s @ B=64").
+    // PrefillBatchScratch::new prints VRAM cost when HIPFIRE_V4F_PBS_VRAM=1.
+    let pbs_max_batch: usize = std::env::var("HIPFIRE_V4F_PP_BATCH")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+    let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
+
     eprintln!("V4F ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
     eprintln!("Config: layers={} hidden={} vocab={} window={}",
         cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.sliding_window);
@@ -160,14 +170,23 @@ fn main() -> Result<(), String> {
         eprintln!("[prompt: {} tokens (pos {} → {})]",
             prompt_token_count, pos, pos + prompt_token_count as u32);
 
-        // PP: feed prompt tokens through decode_step; keep the last
-        // token's logits to pick the first generated token.
+        // PP: batched chunked forward at B=pbs.max_batch. Returns the
+        // last position's logits so TG can pick the first generated
+        // token. ~3-4× faster than sequential decode_step for prompts
+        // longer than the chunk size; falls back to per-token decode
+        // internally if a chunk's path errors.
+        //
+        // `decode_step` increments state.n_tokens internally; the batched
+        // path uses start_pos directly and does NOT touch state.n_tokens.
+        // We update it manually below so the subsequent TG decode_step
+        // calls write SWA at the right ring slots.
         let pp_start = Instant::now();
-        let mut last_logits = vec![];
-        for &t in &prompt_tokens {
-            last_logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos)?;
-            pos += 1;
-        }
+        let start_pp_pos = pos;
+        let last_logits = forward_prefill_batch_chunked(
+            &cfg, &weights, &mut state, &mut gpu, &prompt_tokens, start_pp_pos, &pbs,
+        )?;
+        pos = start_pp_pos + prompt_tokens.len() as u32;
+        state.n_tokens = pos as u64;
         let pp_elapsed = pp_start.elapsed();
 
         // TG: sample + decode loop.
