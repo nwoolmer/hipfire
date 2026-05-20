@@ -51,7 +51,22 @@ fn gemv_auto(
     match weight.dtype {
         DType::F32 => gpu.gemv_f32(weight, x_plain, y)
             .map_err(|e| format!("gemv_f32: {e:?}")),
-        DType::F16 => gemv_f16_x_decode(gpu, weight, x_plain, y, m, k),
+        // F16: gemv_f16_xf32 keeps F32 input precision (reads F16 weight,
+        // casts in-loop, F32 multiply-accumulate). The legacy
+        // gemv_f16_x_decode path converts F32→F16 input before WMMA,
+        // losing ~13 mantissa bits — that made F16 measure worse than Q8
+        // for downstream tasks. Opt back to lossy WMMA via
+        // HIPFIRE_V4F_F16_WMMA=1 for perf comparison.
+        DType::F16 => {
+            let use_wmma = std::env::var("HIPFIRE_V4F_F16_WMMA")
+                .map(|s| s == "1").unwrap_or(false);
+            if use_wmma {
+                gemv_f16_x_decode(gpu, weight, x_plain, y, m, k)
+            } else {
+                gpu.gemv_f16_xf32(weight, x_plain, y, m, k)
+                    .map_err(|e| format!("gemv_f16_xf32: {e:?}"))
+            }
+        }
         // Q8 decode (B=1) stays on the scalar `gemv_q8_0` kernel. Empirically
         // measured: the WMMA path at B=1 wastes 15/16 of the 16×16 output
         // tile on unused N-axis columns, while scalar gemv_q8_0 produces

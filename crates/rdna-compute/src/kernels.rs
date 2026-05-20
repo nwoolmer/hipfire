@@ -897,6 +897,10 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
+/// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
+pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
