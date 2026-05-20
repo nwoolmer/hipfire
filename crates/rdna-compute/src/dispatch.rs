@@ -1205,22 +1205,23 @@ impl Gpu {
         self.memcpy_dtod_at_auto(dst, 0, src, 0, size)
     }
 
-    /// H→D copy that picks async on the active stream when capturing.
+    /// H→D copy that picks async on the active stream when available.
     ///
-    /// During hipGraph capture (`capture_mode == true`), operations on the
-    /// legacy/null stream are forbidden because they would create a blocking
-    /// dependency with the capturing stream. This method routes to
-    /// `memcpy_htod_async` on the active (capturing) stream when in capture
-    /// mode, falling back to sync `memcpy_htod` otherwise.
+    /// - If `capture_mode == true` (hipGraph capture): MUST use async on
+    ///   the active stream — operations on the legacy/null stream are
+    ///   forbidden inside capture.
+    /// - Else if `active_stream.is_some()`: use async on that stream —
+    ///   subsequent kernels submitted to the same stream will be ordered
+    ///   after this transfer, and the host doesn't block. This unblocks
+    ///   the per-chunk h2d uploads in V4F prefill (Phase C).
+    /// - Else: fall back to sync `memcpy_htod`.
     pub fn memcpy_htod_auto(
         &self,
         dst: &hip_bridge::DeviceBuffer,
         src: &[u8],
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.capture_mode {
-            let stream = self.active_stream.as_ref()
-                .expect("capture mode requires an active stream");
+        if let Some(stream) = self.active_stream.as_ref() {
             self.hip.memcpy_htod_async(dst, src, stream)
         } else {
             self.hip.memcpy_htod(dst, src)

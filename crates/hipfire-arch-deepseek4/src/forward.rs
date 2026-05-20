@@ -516,7 +516,7 @@ fn compressor_forward_impl(
     let rope_pos_indexer = ((position as usize) / ratio * ratio) as i32;
     let final_rope_pos = if is_indexer { rope_pos_indexer } else { rope_pos };
     let pos_bytes = final_rope_pos.to_le_bytes();
-    gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
+    gpu.memcpy_htod_auto(&pos_buf.buf, &pos_bytes)
         .map_err(|e| format!("htod comp_pos_buf l{layer_idx}: {e:?}"))?;
 
     if is_indexer {
@@ -740,7 +740,7 @@ fn compressor_forward_batched(
             std::slice::from_raw_parts(positions_host.as_ptr() as *const u8,
                                        n_events_capped * 4)
         };
-        gpu.hip.memcpy_htod(&pbs.comp_positions.buf, pos_bytes)
+        gpu.memcpy_htod_auto(&pbs.comp_positions.buf, pos_bytes)
             .map_err(|e| format!("htod comp positions l{layer_idx}: {e:?}"))?;
 
         let no_main_rope = std::env::var("HIPFIRE_V4F_NO_MAIN_ROPE")
@@ -1348,11 +1348,11 @@ fn ffn_routed(
             // Legacy CPU/H2D path. topk_ids and wts populated above.
             let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
             let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-            gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
+            gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
                 .map_err(|e| format!("htod topk_indices l{layer_idx}: {e:?}"))?;
             let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
             let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-            gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
+            gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
                 .map_err(|e| format!("htod topk_weights l{layer_idx}: {e:?}"))?;
         } else {
             // GPU top-K: bias-aware select + normalize + route_scale in one
@@ -1523,11 +1523,11 @@ fn ffn_hash_routed(
     let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
     let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
     let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-    gpu.hip.memcpy_htod(&topk_idx_dev.buf, &idx_bytes)
+    gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
         .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
     let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
     let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-    gpu.hip.memcpy_htod(&topk_w_dev.buf, &w_bytes)
+    gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
         .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
 
     let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
@@ -2297,7 +2297,7 @@ fn apply_tail_rope(
     }
     let pos_buf = state.pos_buf.as_ref().unwrap();
     let pos_bytes = (position as i32).to_le_bytes();
-    gpu.hip.memcpy_htod(&pos_buf.buf, &pos_bytes)
+    gpu.memcpy_htod_auto(&pos_buf.buf, &pos_bytes)
         .map_err(|e| format!("htod pos_buf: {e:?}"))?;
 
     let q  = state.q.as_ref().unwrap();
@@ -2994,7 +2994,7 @@ fn attention_block_batched_swa_only(
     let n_valid_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
     };
-    gpu.hip.memcpy_htod(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+    gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
         .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
 
     // 4. v4f_attn_swa_batched. o_groups passed through for ABI parity
@@ -3459,7 +3459,7 @@ fn attention_block_batched_mixed(
             let np_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(n_per_batch_host.as_ptr() as *const u8, batch_size * 4)
             };
-            gpu.hip.memcpy_htod(&pbs.n_active_topk_arr.buf, np_bytes)
+            gpu.memcpy_htod_auto(&pbs.n_active_topk_arr.buf, np_bytes)
                 .map_err(|e| format!("htod n_per_batch: {e:?}"))?;
 
             // wq_b_idx GEMV batched: q_lat_rot_batch → q_idx_batch.
@@ -3554,12 +3554,12 @@ fn attention_block_batched_mixed(
     let n_valid_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
     };
-    gpu.hip.memcpy_htod(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+    gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
         .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
     let n_active_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(n_active_host.as_ptr() as *const u8, batch_size * 4)
     };
-    gpu.hip.memcpy_htod(&pbs.n_active_topk_arr.buf, n_active_bytes)
+    gpu.memcpy_htod_auto(&pbs.n_active_topk_arr.buf, n_active_bytes)
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
@@ -3838,10 +3838,10 @@ fn ffn_batched(
             topk_w_host.extend(wts.iter().map(|&w| w * route_scale));
         }
         let idx_bytes: Vec<u8> = topk_idx_host.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&pbs.moe_topk_indices_batch.buf, &idx_bytes)
+        gpu.memcpy_htod_auto(&pbs.moe_topk_indices_batch.buf, &idx_bytes)
             .map_err(|e| format!("htod hash topk_idx l{layer_idx}: {e:?}"))?;
         let w_bytes: Vec<u8> = topk_w_host.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&pbs.moe_topk_weights_batch.buf, &w_bytes)
+        gpu.memcpy_htod_auto(&pbs.moe_topk_weights_batch.buf, &w_bytes)
             .map_err(|e| format!("htod hash topk_w l{layer_idx}: {e:?}"))?;
     } else {
         let gate_bias = layer.gate_bias.as_ref()
@@ -4355,19 +4355,32 @@ pub fn forward_prefill_batch_chunk(
         ));
     }
 
+    // Phase C: ensure we have an active stream so all the small h2d
+    // uploads in this chunk forward go async-on-stream via
+    // `memcpy_htod_auto`. Subsequent kernels submitted to the same
+    // stream order naturally — no host blocking on each tiny upload.
+    // Opt out via HIPFIRE_V4F_ASYNC_HTOD=0.
+    let async_htod = std::env::var("HIPFIRE_V4F_ASYNC_HTOD")
+        .map(|s| s != "0").unwrap_or(true);
+    if async_htod && gpu.active_stream.is_none() {
+        let new_stream = gpu.hip.stream_create()
+            .map_err(|e| format!("stream_create for async htod: {e:?}"))?;
+        gpu.active_stream = Some(new_stream);
+    }
+
     // 1. Upload token ids and absolute positions for this chunk.
     let token_ids_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let token_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(token_ids_host.as_ptr() as *const u8, n * 4)
     };
-    gpu.hip.memcpy_htod(&pbs.tokens.buf, token_bytes)
+    gpu.memcpy_htod_auto(&pbs.tokens.buf, token_bytes)
         .map_err(|e| format!("htod tokens: {e:?}"))?;
 
     let positions_host: Vec<i32> = (0..n).map(|i| (start_pos as i32) + i as i32).collect();
     let positions_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
     };
-    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)
+    gpu.memcpy_htod_auto(&pbs.positions.buf, positions_bytes)
         .map_err(|e| format!("htod positions: {e:?}"))?;
 
     // 2. Batched embedding lookup → pbs.embed_batch [n, hidden].
