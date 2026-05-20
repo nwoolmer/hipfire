@@ -193,6 +193,34 @@ pub fn speculative_decode_step(
         accepted_tokens.push(main_top1[n_accept]);
     }
 
+    // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
+    // The MTP loop above left mtp_last_hidden polluted with hidden_{N+K-1}
+    // from MTP's K-step internal chain. For the NEXT call to either
+    // speculative_decode_step or mtp_forward, we want the *main model's*
+    // post-layer-block hidden at the LAST EMITTED position — which the
+    // verify pass already computed and stashed in pbs.streams_batch.
+    //
+    // The position to read: accepted_tokens.len() - 1 (the verify-batch
+    // index of the last token whose KV is now "committed"). Both
+    // accept-all (no divergence) and partial-accept (with divergence) end
+    // at the same index by accepted_tokens.len() - 1, because the
+    // divergence pick adds one to the count and shifts to the next index.
+    {
+        let last_idx = accepted_tokens.len() - 1;
+        let stream_stride = cfg.hc_mult * cfg.hidden_size;
+        let off = last_idx * stream_stride;
+        let last_stream0 = pbs.streams_batch.sub_offset(off, cfg.hidden_size);
+        if state.mtp_last_hidden.is_none() {
+            state.mtp_last_hidden = Some(
+                gpu.alloc_tensor(&[cfg.hidden_size], rdna_compute::DType::F32)
+                    .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?
+            );
+        }
+        let dst = state.mtp_last_hidden.as_ref().unwrap();
+        gpu.memcpy_dtod_auto(&dst.buf, &last_stream0.buf, cfg.hidden_size * 4)
+            .map_err(|e| format!("capture verify-pass mtp_last_hidden: {e:?}"))?;
+    }
+
     // ── 7. Restore state.n_tokens to the post-accept position ─────────
     // Caller's next forward expects `state.n_tokens` == (next position
     // to be processed). We emitted `accepted_tokens.len()` tokens

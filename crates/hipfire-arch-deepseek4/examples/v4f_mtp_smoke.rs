@@ -181,31 +181,11 @@ fn main() -> Result<(), String> {
 
         // Advance the cursor: spec_decode_step emitted accepted_tokens
         // covering positions [last_position+1 .. last_position+accepted_len].
-        let new_last_position = last_position + res.accepted_tokens.len() as u32;
-        let new_last_token = *res.accepted_tokens.last().unwrap();
-
-        // Refresh mtp_last_hidden for the next window. We need h_{new_last_position-1}
-        // = the hidden at the position from which new_last_token was predicted.
-        // Re-run main forward at that position on the second-to-last accepted
-        // token (or last_token, if only 1 was emitted). state.n_tokens is set
-        // to the post-acceptance cursor by spec_decode; we momentarily roll it
-        // back so decode_step's SWA slot calc lines up with the position we
-        // pass in.
-        let refresh_token = if res.accepted_tokens.len() >= 2 {
-            res.accepted_tokens[res.accepted_tokens.len() - 2]
-        } else {
-            last_token
-        };
-        let refresh_pos = new_last_position - 1;
-        let saved_n_tokens = state.n_tokens;
-        state.n_tokens = refresh_pos as u64;
-        let _ = decode_step(&cfg, &weights, &mut state, &mut gpu,
-                            refresh_token, refresh_pos)?;
-        // decode_step did state.n_tokens += 1; restore to the post-acceptance cursor.
-        state.n_tokens = saved_n_tokens;
-
-        last_token = new_last_token;
-        last_position = new_last_position;
+        // mtp_last_hidden was already refreshed inside spec_decode_step from
+        // the verify pass's last-emitted position, so we don't need an extra
+        // decode_step call here.
+        last_position = last_position + res.accepted_tokens.len() as u32;
+        last_token = *res.accepted_tokens.last().unwrap();
     }
     let total_elapsed = total_start.elapsed().as_secs_f64();
 
