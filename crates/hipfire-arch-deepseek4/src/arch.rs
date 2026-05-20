@@ -150,6 +150,104 @@ impl DeepseekV4 {
         Ok(t)
     }
 
+    /// Upload routed-expert blobs for one "layer-shaped" block (a normal
+    /// transformer layer or the MTP layer). Mirrors the original
+    /// inline logic but is parameterized on `prefix` so the same code
+    /// runs for `layers.{L}` and `mtp.0`. Writes `expert_w2_blob/_ptrs/
+    /// _stride` and `expert_gate_up_blob/_ptrs/_stride` on the layer.
+    fn upload_layer_routed_experts(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<(), String> {
+        // w2 (down): pread each expert into a layer-local host Vec, then
+        // one upload.
+        {
+            let name0 = format!("{prefix}.ffn.experts.0.w2.weight");
+            let (info0, _b0) = hfq.tensor_data_pread(&name0)
+                .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
+            let stride = info0.data_size;
+            let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
+            drop(_b0);
+
+            let mut blob = Vec::with_capacity(stride * n_exp);
+            for e in 0..n_exp {
+                let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
+                let (info, bytes) = hfq.tensor_data_pread(&name)
+                    .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+                if info.data_size != stride {
+                    return Err(format!(
+                        "deepseek4: {name} size {} != stride {}", info.data_size, stride));
+                }
+                blob.extend_from_slice(&bytes);
+            }
+            let mut blob_shape = vec![n_exp];
+            blob_shape.extend_from_slice(&shape0);
+            let blob_tensor = gpu.upload_raw(&blob, &blob_shape)
+                .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
+            drop(blob);
+            let base_ptr = blob_tensor.buf.as_ptr() as u64;
+            let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
+            let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
+            gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
+            layer.expert_w2_blob = Some(blob_tensor);
+            layer.expert_w2_ptrs = Some(ptr_tensor);
+            layer.expert_w2_stride = stride;
+        }
+        // gate_up (combined w1 ‖ w3): per-expert pread, build one
+        // layer-local host Vec, single upload.
+        {
+            let w1_0 = format!("{prefix}.ffn.experts.0.w1.weight");
+            let w3_0 = format!("{prefix}.ffn.experts.0.w3.weight");
+            let (w1_info0, _b1) = hfq.tensor_data_pread(&w1_0)
+                .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
+            let stride_w1 = w1_info0.data_size;
+            drop(_b1);
+            let (w3_info0, _b3) = hfq.tensor_data_pread(&w3_0)
+                .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
+            let stride_w3 = w3_info0.data_size;
+            drop(_b3);
+            if stride_w1 != stride_w3 {
+                return Err(format!(
+                    "deepseek4: {prefix} w1/w3 stride mismatch: w1={} w3={}",
+                    stride_w1, stride_w3));
+            }
+            let combined_stride = stride_w1 + stride_w3;
+            let mut combined = Vec::with_capacity(combined_stride * n_exp);
+            for e in 0..n_exp {
+                let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
+                let (_, w1_bytes) = hfq.tensor_data_pread(&w1_name)
+                    .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                combined.extend_from_slice(&w1_bytes);
+                drop(w1_bytes);
+                let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
+                let (_, w3_bytes) = hfq.tensor_data_pread(&w3_name)
+                    .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                combined.extend_from_slice(&w3_bytes);
+            }
+            let combined_tensor = gpu.upload_raw(
+                &combined, &[n_exp, combined_stride])
+                .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
+            drop(combined);
+            let base_ptr = combined_tensor.buf.as_ptr() as u64;
+            let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * combined_stride) as u64).collect();
+            let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
+            gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
+                .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
+            layer.expert_gate_up_blob = Some(combined_tensor);
+            layer.expert_gate_up_ptrs = Some(ptr_tensor);
+            layer.expert_gate_up_stride = combined_stride;
+        }
+        Ok(())
+    }
+
     /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
     /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
     /// quantizer stored F16 bytes. The conversion cost is one host-side
@@ -543,6 +641,77 @@ impl Architecture for DeepseekV4 {
 
         }
 
+        // ── MTP layer (Multi-Token Prediction head, DeepSeek V3 style) ─
+        // The MTP layer mirrors a main layer's attention + FFN structure
+        // PLUS two input projections (e_proj, h_proj) and three extra
+        // norms (enorm, hnorm, final norm). It has no compressor and no
+        // indexer — its attention is SWA-only like a hash layer.
+        //
+        // Gated on the HFQ actually containing `mtp.0.norm.weight`;
+        // existing models (v4f.mq2lloyd-f16compress.hfq, antirezQ8.hfq)
+        // were quantized without MTP and will leave `mtp_layer = None`.
+        let mtp_present = hfq.find_tensor_info("mtp.0.norm.weight").is_some();
+        if mtp_present {
+            let load_mtp = std::env::var("HIPFIRE_V4F_LOAD_MTP")
+                .map(|s| s != "0").unwrap_or(true);
+            if !load_mtp {
+                eprintln!("deepseek4: HFQ contains MTP layer but \
+                    HIPFIRE_V4F_LOAD_MTP=0 — skipping MTP upload");
+            } else {
+                eprintln!("deepseek4: MTP layer present — uploading.");
+                let mut mtp = DeepseekV4LayerWeights::new_empty(0);
+                // ── Standard layer fields under the `mtp.0.` prefix ──
+                mtp.attn_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                    "mtp.0.attn_norm.weight")?);
+                mtp.ffn_norm  = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                    "mtp.0.ffn_norm.weight")?);
+                mtp.q_norm    = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                    "mtp.0.attn.q_norm.weight")?);
+                mtp.kv_norm   = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                    "mtp.0.attn.kv_norm.weight")?);
+                mtp.attn_sink = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                    "mtp.0.attn.attn_sink")?);
+
+                mtp.wq_a = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wq_a.weight")?);
+                mtp.wq_b = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wq_b.weight")?);
+                mtp.wkv  = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wkv.weight")?);
+                mtp.wo_a = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wo_a.weight")?);
+                mtp.wo_b = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wo_b.weight")?);
+
+                // HC blocks (same shape as main layer).
+                mtp.hc_attn_base  = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_base")?);
+                mtp.hc_attn_fn    = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_fn")?);
+                mtp.hc_attn_scale = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_scale")?);
+                mtp.hc_ffn_base   = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_base")?);
+                mtp.hc_ffn_fn     = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_fn")?);
+                mtp.hc_ffn_scale  = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_scale")?);
+
+                // FFN router (score-routed; MTP doesn't have hash routing).
+                mtp.gate_weight = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.ffn.gate.weight")?);
+                let bias_gpu = Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.ffn.gate.bias")?;
+                mtp.gate_bias_host = gpu.download_f32(&bias_gpu)
+                    .map_err(|e| format!("d2h mtp gate_bias: {e:?}"))?;
+                mtp.gate_bias = Some(bias_gpu);
+
+                // Shared expert.
+                mtp.shared_w1 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                    "mtp.0.ffn.shared_experts.w1.weight")?);
+                mtp.shared_w2 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                    "mtp.0.ffn.shared_experts.w2.weight")?);
+                mtp.shared_w3 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                    "mtp.0.ffn.shared_experts.w3.weight")?);
+
+                // ── MTP-specific fields ──
+                mtp.mtp_enorm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.enorm.weight")?);
+                mtp.mtp_hnorm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.hnorm.weight")?);
+                mtp.mtp_e_proj = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.e_proj.weight")?);
+                mtp.mtp_h_proj = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.h_proj.weight")?);
+                mtp.mtp_final_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.norm.weight")?);
+
+                weights.mtp_layer = Some(mtp);
+            }
+        }
+
         // Phase B (2026-05-18): drop the HFQ mmap BEFORE the routed-expert
         // upload pass. The dense + shared-expert pass above accumulates
         // ~5 GB of mmap-backed page cache that competes with the upcoming
@@ -576,90 +745,20 @@ impl Architecture for DeepseekV4 {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
+                Self::upload_layer_routed_experts(
+                    hfq, gpu, &format!("layers.{l}"), n_exp, layer,
+                )?;
+            }
+        }
 
-                {
-                    // w2 (down): pread each expert into a layer-local
-                    // host Vec, then one upload.
-                    let name0 = format!("layers.{l}.ffn.experts.0.w2.weight");
-                    let (info0, _b0) = hfq.tensor_data_pread(&name0)
-                        .ok_or_else(|| format!("deepseek4: missing {name0}"))?;
-                    let stride = info0.data_size;
-                    let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
-                    drop(_b0);
-
-                    let mut blob = Vec::with_capacity(stride * n_exp);
-                    for e in 0..n_exp {
-                        let name = format!("layers.{l}.ffn.experts.{e}.w2.weight");
-                        let (info, bytes) = hfq.tensor_data_pread(&name)
-                            .ok_or_else(|| format!("deepseek4: missing {name}"))?;
-                        if info.data_size != stride {
-                            return Err(format!(
-                                "deepseek4: {name} size {} != stride {}", info.data_size, stride));
-                        }
-                        blob.extend_from_slice(&bytes);
-                    }
-                    let mut blob_shape = vec![n_exp];
-                    blob_shape.extend_from_slice(&shape0);
-                    let blob_tensor = gpu.upload_raw(&blob, &blob_shape)
-                        .map_err(|e| format!("deepseek4: upload blob l{l}.w2: {e:?}"))?;
-                    drop(blob);
-                    let base_ptr = blob_tensor.buf.as_ptr() as u64;
-                    let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
-                    let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-                    let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
-                        .map_err(|e| format!("deepseek4: alloc ptr table l{l}.w2: {e:?}"))?;
-                    gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
-                        .map_err(|e| format!("deepseek4: copy ptr table l{l}.w2: {e:?}"))?;
-                    layer.expert_w2_blob = Some(blob_tensor);
-                    layer.expert_w2_ptrs = Some(ptr_tensor);
-                    layer.expert_w2_stride = stride;
-                }
-                {
-                    // gate_up (combined w1 ‖ w3): per-expert pread, build
-                    // one layer-local host Vec, single upload.
-                    let w1_0 = format!("layers.{l}.ffn.experts.0.w1.weight");
-                    let w3_0 = format!("layers.{l}.ffn.experts.0.w3.weight");
-                    let (w1_info0, _b1) = hfq.tensor_data_pread(&w1_0)
-                        .ok_or_else(|| format!("deepseek4: missing {w1_0}"))?;
-                    let stride_w1 = w1_info0.data_size;
-                    drop(_b1);
-                    let (w3_info0, _b3) = hfq.tensor_data_pread(&w3_0)
-                        .ok_or_else(|| format!("deepseek4: missing {w3_0}"))?;
-                    let stride_w3 = w3_info0.data_size;
-                    drop(_b3);
-                    if stride_w1 != stride_w3 {
-                        return Err(format!(
-                            "deepseek4: l{l} w1/w3 stride mismatch: w1={} w3={}",
-                            stride_w1, stride_w3));
-                    }
-                    let combined_stride = stride_w1 + stride_w3;
-                    let mut combined = Vec::with_capacity(combined_stride * n_exp);
-                    for e in 0..n_exp {
-                        let w1_name = format!("layers.{l}.ffn.experts.{e}.w1.weight");
-                        let (_, w1_bytes) = hfq.tensor_data_pread(&w1_name)
-                            .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                        combined.extend_from_slice(&w1_bytes);
-                        drop(w1_bytes);
-                        let w3_name = format!("layers.{l}.ffn.experts.{e}.w3.weight");
-                        let (_, w3_bytes) = hfq.tensor_data_pread(&w3_name)
-                            .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                        combined.extend_from_slice(&w3_bytes);
-                    }
-                    let combined_tensor = gpu.upload_raw(
-                        &combined, &[n_exp, combined_stride])
-                        .map_err(|e| format!("deepseek4: upload gate_up l{l}: {e:?}"))?;
-                    drop(combined);
-                    let base_ptr = combined_tensor.buf.as_ptr() as u64;
-                    let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * combined_stride) as u64).collect();
-                    let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-                    let ptr_tensor = gpu.alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
-                        .map_err(|e| format!("deepseek4: alloc gate_up ptr table l{l}: {e:?}"))?;
-                    gpu.hip.memcpy_htod(&ptr_tensor.buf, &ptr_bytes)
-                        .map_err(|e| format!("deepseek4: copy gate_up ptr table l{l}: {e:?}"))?;
-                    layer.expert_gate_up_blob = Some(combined_tensor);
-                    layer.expert_gate_up_ptrs = Some(ptr_tensor);
-                    layer.expert_gate_up_stride = combined_stride;
-                }
+        // Routed experts for the MTP layer (same upload logic, gated on
+        // both `upload_experts` and the MTP layer existing).
+        if upload_experts {
+            if let Some(mtp) = weights.mtp_layer.as_mut() {
+                eprintln!("deepseek4: uploading MTP routed experts.");
+                Self::upload_layer_routed_experts(
+                    hfq, gpu, "mtp.0", cfg.n_routed_experts, mtp,
+                )?;
             }
         }
 

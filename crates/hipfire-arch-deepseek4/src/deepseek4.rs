@@ -257,6 +257,23 @@ pub struct DeepseekV4LayerWeights {
     pub indexer_compressor_norm: Option<rdna_compute::GpuTensor>, // [idx_head_dim]
     pub indexer_compressor_ape: Option<rdna_compute::GpuTensor>,  // [ratio, coff*idx_head_dim]
 
+    // MTP-specific fields (only populated for the MTP "layer" in
+    // `DeepseekV4Weights.mtp_layer`; always None for the normal
+    // `layers[0..n_hidden]` bundles). These implement the
+    // DeepSeek V3-style next-token-prediction head:
+    //   x_in   = e_proj(enorm(embed_{n+1})) + h_proj(hnorm(h_n))
+    //   x_attn = attention(attn_norm(x_in))   + x_in
+    //   x_ffn  = ffn(ffn_norm(x_attn))        + x_attn
+    //   h_n+1  = mtp_final_norm(x_ffn)        → shared head → logits_{n+2}
+    // `e_proj`/`h_proj` are FP8-source → Q8F16 on device (under the
+    // v4f-source-precision quant). `enorm`/`hnorm`/`mtp_final_norm`
+    // are BF16-source → F16.
+    pub mtp_enorm:          Option<rdna_compute::GpuTensor>,  // [hidden]
+    pub mtp_hnorm:          Option<rdna_compute::GpuTensor>,  // [hidden]
+    pub mtp_e_proj:         Option<rdna_compute::GpuTensor>,  // [hidden, hidden]
+    pub mtp_h_proj:         Option<rdna_compute::GpuTensor>,  // [hidden, hidden]
+    pub mtp_final_norm:     Option<rdna_compute::GpuTensor>,  // [hidden]
+
     // Hyper-Connections (F16 small matrices).
     pub hc_attn_base:  Option<rdna_compute::GpuTensor>,
     pub hc_attn_fn:    Option<rdna_compute::GpuTensor>,
@@ -331,6 +348,8 @@ impl DeepseekV4LayerWeights {
             indexer_compressor_wkv: None, indexer_compressor_wgate: None,
             indexer_compressor_wkv_f16: None, indexer_compressor_wgate_f16: None,
             indexer_compressor_norm: None, indexer_compressor_ape: None,
+            mtp_enorm: None, mtp_hnorm: None, mtp_e_proj: None, mtp_h_proj: None,
+            mtp_final_norm: None,
             hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
             gate_weight: None, gate_bias: None,
