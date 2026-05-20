@@ -1769,6 +1769,18 @@ pub const GEMM_HFQ4G256_WMMA_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256_wmma.hip");
 
+/// V4F compressor batched ALIGNED compress events. Replaces the
+/// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)
+/// with a single launch over N_events. Handles both overlap=true
+/// (ratio=4) and overlap=false (ratio=128) cases.
+pub const COMPRESSOR_COMPRESS_ALIGNED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_compress_aligned_batched.hip");
+
+/// V4F compressor batched ring-buffer write. Replaces B per-position
+/// memcpy_dtod calls with a single scatter kernel.
+pub const COMPRESSOR_RING_WRITE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_ring_write_batched.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for

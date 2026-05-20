@@ -559,6 +559,279 @@ fn compressor_forward_impl(
     Ok(())
 }
 
+/// Batched compressor commit + compress for a whole chunk of B
+/// positions in a single layer (Phase A, 2026-05-20).
+///
+/// Replaces the per-batch-position loop of `compressor_forward_prebatched`
+/// when `start_pos % R == 0` (aligned chunks). For ratio=4 layers
+/// at B=64, this collapses ~256 launches/layer (64 × 2 ring writes
+/// + 16 × 6 compress-event kernels) into ~6 batched launches:
+///   - 1× compressor_compress_aligned_batched_f32
+///   - 1× rmsnorm_batched (on N_events × head_dim)
+///   - 1× rope_tail_(yarn_)interleaved_batched
+///   - 1× memcpy_dtod to update ring state for next chunk
+///
+/// For the no-event case (B < R, e.g. ratio=128 layers at B=64):
+///   - 1× compressor_ring_write_batched_f32
+///
+/// Bisect at B=1 must remain byte-eq vs the per-position path.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn compressor_forward_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    start_pos: u32,
+    batch_size: usize,
+    is_indexer: bool,
+) -> Result<(), String> {
+    let layer = &weights.layers[layer_idx];
+    let ratio = layer.compress_ratio as usize;
+    if ratio == 0 { return Ok(()); }
+    if is_indexer && ratio != 4 { return Ok(()); }
+
+    let overlap = ratio == 4;
+    let coff: usize = if overlap { 2 } else { 1 };
+    let head_dim = if is_indexer { cfg.index_head_dim } else { cfg.head_dim };
+    let proj_dim = coff * head_dim;
+    let state_rows = coff * ratio;
+
+    let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+
+    // Lazy-alloc state buffers (mirror compressor_forward_impl exactly).
+    {
+        let l_state = &mut state._indexer[layer_idx];
+        if is_indexer {
+            if l_state.indexer_kv_state.is_none() {
+                l_state.indexer_kv_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx kv_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.indexer_score_state.is_none() {
+                l_state.indexer_score_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.indexer_kv_cache.is_none() {
+                l_state.indexer_kv_cache = Some(gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?);
+            }
+        } else {
+            if l_state.main_kv_state.is_none() {
+                l_state.main_kv_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc main kv_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.main_score_state.is_none() {
+                l_state.main_score_state = Some(gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?);
+            }
+            if l_state.main_kv_cache.is_none() {
+                l_state.main_kv_cache = Some(gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?);
+            }
+        }
+    }
+
+    // Select the right wkv/wgate-output buffer + ring state + cache.
+    let (kv_batch_full, score_batch_full) = if is_indexer {
+        (&pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch)
+    } else {
+        (&pbs.comp_main_kv_batch, &pbs.comp_main_score_batch)
+    };
+    let norm = if is_indexer {
+        layer.indexer_compressor_norm.as_ref()
+            .ok_or_else(|| format!("idx_comp_norm l{layer_idx}"))?
+    } else {
+        layer.compressor_norm.as_ref()
+            .ok_or_else(|| format!("comp_norm l{layer_idx}"))?
+    };
+
+    let slot_base = (start_pos as usize) % ratio;
+    // first chunk position whose absolute (p+1) % R == 0:
+    // first_event_chunk_pos = R - 1 - slot_base.
+    let first_event_chunk_pos = if slot_base == 0 {
+        ratio - 1
+    } else {
+        ratio - slot_base - 1
+    };
+    let n_events = if first_event_chunk_pos < batch_size {
+        (batch_size - first_event_chunk_pos + ratio - 1) / ratio
+    } else {
+        0
+    };
+
+    let aligned = slot_base == 0;
+    let compressed_slot_base = (start_pos as usize) / ratio;
+
+    // Check kv_cache capacity for this chunk's events.
+    let n_events_capped = if compressed_slot_base + n_events > max_compressed {
+        max_compressed.saturating_sub(compressed_slot_base)
+    } else {
+        n_events
+    };
+
+    // ALIGNED PATH: B*R-aligned chunk start, do batched compress.
+    if aligned && n_events_capped > 0 {
+        let kv_state = if is_indexer {
+            state._indexer[layer_idx].indexer_kv_state.as_ref().unwrap().clone()
+        } else {
+            state._indexer[layer_idx].main_kv_state.as_ref().unwrap().clone()
+        };
+        let score_state = if is_indexer {
+            state._indexer[layer_idx].indexer_score_state.as_ref().unwrap().clone()
+        } else {
+            state._indexer[layer_idx].main_score_state.as_ref().unwrap().clone()
+        };
+        let kv_cache = if is_indexer {
+            state._indexer[layer_idx].indexer_kv_cache.as_ref().unwrap().clone()
+        } else {
+            state._indexer[layer_idx].main_kv_cache.as_ref().unwrap().clone()
+        };
+
+        // `prev_kv` / `prev_score` for event 0 = first R rows of ring state.
+        // For overlap=1: ring rows 0..R hold the prior chunk's last NEW window
+        //   (FIRST half is the OLD-contribution; SECOND half unused).
+        // For chunk 0 (start_pos=0): ring state is zeros — correct: OLD == 0.
+        let prev_kv = kv_state.sub_offset(0, ratio * proj_dim);
+        let prev_score = score_state.sub_offset(0, ratio * proj_dim);
+
+        let kv_cache_out =
+            kv_cache.sub_offset(compressed_slot_base * head_dim,
+                                n_events_capped * head_dim);
+
+        gpu.compressor_compress_aligned_batched_f32(
+            &prev_kv, &prev_score,
+            kv_batch_full, score_batch_full,
+            &kv_cache_out,
+            ratio as i32, head_dim as i32,
+            n_events_capped as i32,
+            if overlap { 1 } else { 0 },
+            batch_size as i32,
+        ).map_err(|e| format!("compressor_compress_aligned_batched l{layer_idx}: {e:?}"))?;
+
+        // RMSNorm batched over n_events × head_dim.
+        gpu.rmsnorm_batched(
+            &kv_cache_out, norm, &kv_cache_out,
+            n_events_capped, head_dim, cfg.rms_norm_eps,
+        ).map_err(|e| format!("comp rmsnorm batched l{layer_idx}: {e:?}"))?;
+
+        // Tail RoPE batched. Per event we want a per-event position.
+        // Build the position array on host and upload once.
+        let rope_pos_mode = std::env::var("HIPFIRE_V4F_COMP_ROPE_POS")
+            .ok().unwrap_or_else(|| "mid".to_string());
+        let positions_host: Vec<i32> = (0..n_events_capped).map(|k| {
+            let absolute_event_pos = first_event_chunk_pos + k * ratio + (start_pos as usize);
+            if is_indexer {
+                // Indexer always uses start-of-window.
+                (absolute_event_pos / ratio * ratio) as i32
+            } else {
+                match rope_pos_mode.as_str() {
+                    "end"   => absolute_event_pos as i32,
+                    "start" => (absolute_event_pos / ratio * ratio) as i32,
+                    _       => ((absolute_event_pos / ratio * ratio) + ratio / 2) as i32,
+                }
+            }
+        }).collect();
+        // Use the existing pbs.positions field as scratch (it's [max_batch] F32).
+        // We need at least n_events_capped slots. n_events_capped <= max_batch
+        // because each event consumes R positions of input. Safe.
+        let pos_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8,
+                                       n_events_capped * 4)
+        };
+        gpu.hip.memcpy_htod(&pbs.comp_positions.buf, pos_bytes)
+            .map_err(|e| format!("htod comp positions l{layer_idx}: {e:?}"))?;
+
+        let no_main_rope = std::env::var("HIPFIRE_V4F_NO_MAIN_ROPE")
+            .ok().as_deref() == Some("1");
+        if is_indexer {
+            gpu.rope_tail_interleaved_batched(
+                &kv_cache_out, &kv_cache_out, &pbs.comp_positions,
+                1, 0, head_dim as i32, cfg.qk_rope_head_dim as i32,
+                cfg.compress_rope_theta, n_events_capped as i32,
+            ).map_err(|e| format!("comp idx rope batched l{layer_idx}: {e:?}"))?;
+        } else if !no_main_rope {
+            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                layer_rope_params(cfg, layer.compress_ratio);
+            gpu.rope_tail_yarn_interleaved_batched(
+                &kv_cache_out, &kv_cache_out, &pbs.comp_positions,
+                1, 0, head_dim as i32, cfg.qk_rope_head_dim as i32,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                corr_low, corr_high, /*inverse=*/0,
+                n_events_capped as i32,
+            ).map_err(|e| format!("comp main rope batched l{layer_idx}: {e:?}"))?;
+        }
+
+        // Update ring state for next chunk: kv_state[0..R] ← last NEW window's
+        // positions from kv_batch_full. For overlap=1 the last NEW window is
+        // chunk positions [(n_events - 1) * R + first_event_chunk_pos - R + 1
+        // .. n_events * R + first_event_chunk_pos]. With aligned (slot_base=0,
+        // first_event_chunk_pos = R-1), that simplifies to
+        // chunk positions [(n_events - 1) * R .. n_events * R - 1].
+        //
+        // For overlap=0 (ratio=128), no shift-state needed for the next chunk:
+        // the ring still holds in-progress NEW positions (which the no-event
+        // path will scatter). But here n_events > 0 only happens for
+        // overlap=1 at our typical B=64 ratio=4 case.
+        if overlap {
+            let last_new_start_b = (n_events_capped - 1) * ratio;
+            // Source slice: kv_batch_full[last_new_start_b..last_new_start_b + R]
+            let src_kv = kv_batch_full
+                .sub_offset(last_new_start_b * proj_dim, ratio * proj_dim);
+            let src_score = score_batch_full
+                .sub_offset(last_new_start_b * proj_dim, ratio * proj_dim);
+            let dst_kv = kv_state.sub_offset(0, ratio * proj_dim);
+            let dst_score = score_state.sub_offset(0, ratio * proj_dim);
+            let bytes = ratio * proj_dim * 4;
+            gpu.memcpy_dtod_auto(&dst_kv.buf, &src_kv.buf, bytes)
+                .map_err(|e| format!("comp state update kv l{layer_idx}: {e:?}"))?;
+            gpu.memcpy_dtod_auto(&dst_score.buf, &src_score.buf, bytes)
+                .map_err(|e| format!("comp state update score l{layer_idx}: {e:?}"))?;
+        }
+
+        return Ok(());
+    }
+
+    // NO-EVENT PATH (n_events == 0): just scatter all B positions into the
+    // ring state for the next chunk to pick up.
+    // Also covers the non-aligned case as a safe fallback for now.
+    if !aligned || n_events_capped == 0 {
+        let kv_state = if is_indexer {
+            state._indexer[layer_idx].indexer_kv_state.as_ref().unwrap()
+        } else {
+            state._indexer[layer_idx].main_kv_state.as_ref().unwrap()
+        };
+        let score_state = if is_indexer {
+            state._indexer[layer_idx].indexer_score_state.as_ref().unwrap()
+        } else {
+            state._indexer[layer_idx].main_score_state.as_ref().unwrap()
+        };
+
+        gpu.compressor_ring_write_batched_f32(
+            kv_batch_full, score_batch_full,
+            kv_state, score_state,
+            batch_size as i32, proj_dim as i32, ratio as i32,
+            slot_base as i32, if overlap { 1 } else { 0 },
+        ).map_err(|e| format!("comp ring write batched l{layer_idx}: {e:?}"))?;
+
+        // If aligned but n_events==0 (impossible by construction), or
+        // non-aligned (we should add per-position compress-event handling
+        // for any events that DO fire in this chunk). For our V4F bench
+        // start_pos is always a multiple of B which is a multiple of 4,
+        // so this path is hit only for ratio=128 layers at B<128. No
+        // compress events to handle.
+        if !aligned && n_events_capped > 0 {
+            return Err(format!(
+                "compressor_forward_batched: non-aligned chunks with compress events \
+                 not yet supported (l{layer_idx}, start_pos={start_pos}, B={batch_size}, ratio={ratio})"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// V4F indexer scoring + top-K selection (phase 4b).
 ///
 /// Run after `compressor_forward(is_indexer=true)` for layers with
@@ -2433,6 +2706,13 @@ pub struct PrefillBatchScratch {
     /// largest K dim across all V4F batched GEMM call sites — wo_b's
     /// K = groups × o_lora_rank for V4F (= 8 × 1024 = 8192).
     pub wmma_x_scratch_f16: GpuTensor,
+    /// Per-compress-event RoPE positions buffer for the Phase A
+    /// batched compressor pipeline. Sized [max_batch] F32 (i32-in-F32)
+    /// since at B=64 ratio=4 we have at most 16 events per layer and
+    /// ratio=128 has at most 1; total fits well under max_batch slots.
+    /// Separate from `pbs.positions` (which holds the chunk's
+    /// [batch_size] absolute positions and is read by the indexer).
+    pub comp_positions: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2571,6 +2851,7 @@ impl PrefillBatchScratch {
                 t.shape = vec![max_batch, hidden];
                 t
             },
+            comp_positions: alloc(gpu, &[max_batch], "comp_positions", r, log_vram)?,
             wmma_x_scratch_f16: {
                 // Cover the largest x-tensor size across all batched
                 // WMMA call sites. wo_a's input is [B, G, per_group_in]
@@ -3064,54 +3345,81 @@ fn attention_block_batched_mixed(
     // the alloc but means the per-position offset uses the real proj_dim.
     let main_view_proj = if ratio == 4 { main_proj_dim } else { head_dim };
 
-    for b in 0..batch_size {
-        let pos = start_pos + b as u32;
-        state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
-        state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
-        state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
-        state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
+    // PHASE A: batched commit/compress for the whole chunk in one call
+    // per (main, indexer) per layer. Replaces the per-batch loop when
+    // start_pos % ratio == 0 (aligned chunk). Opt out via
+    // HIPFIRE_V4F_COMP_FULLY_BATCHED=0.
+    let comp_fully_batched = comp_batched
+        && (start_pos as usize) % ratio == 0
+        && std::env::var("HIPFIRE_V4F_COMP_FULLY_BATCHED")
+            .map(|s| s != "0").unwrap_or(true);
 
-        let cf_res = if comp_batched {
-            // The pre-batched [B, main_view_proj] buffer is laid out
-            // contiguous-per-row with stride main_view_proj at the
-            // wkv/wgate gemv_auto_batched call.
-            let _ = main_proj_dim; // silence warning when ratio=128
-            compressor_forward_prebatched(
-                cfg, weights, state, gpu, layer_idx, pos,
-                /*is_indexer=*/false,
-                &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
-            )
-        } else {
-            let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-            compressor_forward(
-                cfg, weights, state, gpu, layer_idx,
-                &tmp_view, pos, /*is_indexer=*/false,
-            )
-        };
-        if let Err(e) = cf_res {
-            loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
-            break;
+    if comp_fully_batched {
+        if let Err(e) = compressor_forward_batched(
+            cfg, weights, state, pbs, gpu, layer_idx, start_pos,
+            batch_size, /*is_indexer=*/false,
+        ) {
+            loop_err = Some(format!("compressor_forward_batched(main) l{layer_idx}: {e}"));
         }
-        if ratio == 4 {
-            let cf_res2 = if comp_batched {
+        if loop_err.is_none() && ratio == 4 {
+            if let Err(e) = compressor_forward_batched(
+                cfg, weights, state, pbs, gpu, layer_idx, start_pos,
+                batch_size, /*is_indexer=*/true,
+            ) {
+                loop_err = Some(format!("compressor_forward_batched(idx) l{layer_idx}: {e}"));
+            }
+        }
+    } else {
+        for b in 0..batch_size {
+            let pos = start_pos + b as u32;
+            state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
+            state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
+            state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
+            state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
+
+            let cf_res = if comp_batched {
+                // The pre-batched [B, main_view_proj] buffer is laid out
+                // contiguous-per-row with stride main_view_proj at the
+                // wkv/wgate gemv_auto_batched call.
+                let _ = main_proj_dim; // silence warning when ratio=128
                 compressor_forward_prebatched(
                     cfg, weights, state, gpu, layer_idx, pos,
-                    /*is_indexer=*/true,
-                    &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                    /*is_indexer=*/false,
+                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
                 )
             } else {
-                let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+                let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
                 compressor_forward(
                     cfg, weights, state, gpu, layer_idx,
-                    &tmp_view2, pos, /*is_indexer=*/true,
+                    &tmp_view, pos, /*is_indexer=*/false,
                 )
             };
-            if let Err(e) = cf_res2 {
-                loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
+            if let Err(e) = cf_res {
+                loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
                 break;
+            }
+            if ratio == 4 {
+                let cf_res2 = if comp_batched {
+                    compressor_forward_prebatched(
+                        cfg, weights, state, gpu, layer_idx, pos,
+                        /*is_indexer=*/true,
+                        &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                    )
+                } else {
+                    let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+                    compressor_forward(
+                        cfg, weights, state, gpu, layer_idx,
+                        &tmp_view2, pos, /*is_indexer=*/true,
+                    )
+                };
+                if let Err(e) = cf_res2 {
+                    loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
+                    break;
+                }
             }
         }
     }
+    let _ = main_view_proj;
 
     // Restore per-token state fields before any potential early-return.
     state.tmp = orig_tmp;

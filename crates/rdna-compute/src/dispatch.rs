@@ -20828,6 +20828,103 @@ impl Gpu {
         }
     }
 
+    /// V4F compressor batched aligned compress events. Per-event
+    /// inputs come from `(prev_kv, prev_score)` for event 0 and from
+    /// `(kv_batch, score_batch)` for events 1..N-1.
+    /// Writes N_events × head_dim floats into `kv_cache_out` (caller
+    /// supplies the slot-offset pointer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_compress_aligned_batched_f32(
+        &mut self,
+        prev_kv: &GpuTensor, prev_score: &GpuTensor,
+        kv_batch: &GpuTensor, score_batch: &GpuTensor,
+        kv_cache_out: &GpuTensor,
+        r: i32, head_dim: i32, n_events: i32, overlap: i32, batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_compress_aligned_batched_f32",
+            kernels::COMPRESSOR_COMPRESS_ALIGNED_BATCHED_SRC,
+            "compressor_compress_aligned_batched_f32",
+        )?;
+        let func = &self.functions["compressor_compress_aligned_batched_f32"];
+        let pk = prev_kv.buf.as_ptr();
+        let ps = prev_score.buf.as_ptr();
+        let kb = kv_batch.buf.as_ptr();
+        let sb = score_batch.buf.as_ptr();
+        let yo = kv_cache_out.buf.as_ptr();
+        let mut rr = r;
+        let mut hd = head_dim;
+        let mut ne = n_events;
+        let mut ov = overlap;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &pk as *const _ as *mut c_void,
+            &ps as *const _ as *mut c_void,
+            &kb as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &yo as *const _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut ov as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((head_dim + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, n_events as u32, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F compressor batched ring-buffer write. Single launch scatters
+    /// B positions into `kv_state[slot]` / `score_state[slot]` where
+    /// `slot = (slot_base + b) % R + (overlap ? R : 0)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_ring_write_batched_f32(
+        &mut self,
+        kv_batch: &GpuTensor, score_batch: &GpuTensor,
+        kv_state: &GpuTensor, score_state: &GpuTensor,
+        batch_size: i32, proj_dim: i32, r: i32, slot_base: i32, overlap: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_ring_write_batched_f32",
+            kernels::COMPRESSOR_RING_WRITE_BATCHED_SRC,
+            "compressor_ring_write_batched_f32",
+        )?;
+        let func = &self.functions["compressor_ring_write_batched_f32"];
+        let kb = kv_batch.buf.as_ptr();
+        let sb = score_batch.buf.as_ptr();
+        let ks = kv_state.buf.as_ptr();
+        let ss = score_state.buf.as_ptr();
+        let mut bsv = batch_size;
+        let mut pd = proj_dim;
+        let mut rr = r;
+        let mut sbase = slot_base;
+        let mut ov = overlap;
+        let mut params: Vec<*mut c_void> = vec![
+            &kb as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &ks as *const _ as *mut c_void,
+            &ss as *const _ as *mut c_void,
+            &mut bsv as *mut _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+            &mut sbase as *mut _ as *mut c_void,
+            &mut ov as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((proj_dim + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, batch_size as u32, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// WMMA per-group HFQ4G256 batched GEMV for V4F wo_a. F16 input,
     /// F32 output. Caller must stage `x_in` to F16 (use
     /// `convert_f32_to_f16` on the FWHT-rotated input).
