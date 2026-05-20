@@ -793,6 +793,23 @@ impl Architecture for DeepseekV4 {
                 mtp.mtp_h_proj = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.h_proj.weight")?);
                 mtp.mtp_final_norm = Some(Self::upload_global_f16_as_f32(mtp_source, gpu, "mtp.0.norm.weight")?);
 
+                // MTP-specific head-HC matrices (mirrors the main-model globals
+                // hc_head_fn / hc_head_base / hc_head_scale). Their presence
+                // proves MTP was trained WITH head-HC mix on its lm_head path —
+                // the v3 paper's "logits = OutHead @ norm(h_i^k)" should be
+                // read with norm(h_i^k) = norm(head_hc_mix(streams)) on V4F.
+                mtp.mtp_hc_head_fn   = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_head_fn")?);
+                mtp.mtp_hc_head_base = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_head_base")?);
+                {
+                    let (info, bytes) = mtp_source.tensor_data_pread("mtp.0.hc_head_scale")
+                        .ok_or_else(|| "mtp.0.hc_head_scale missing".to_string())?;
+                    if info.shape != vec![1] {
+                        return Err(format!("mtp.0.hc_head_scale unexpected shape {:?}", info.shape));
+                    }
+                    mtp.mtp_hc_head_scale = hipfire_runtime::llama::f16_to_f32(
+                        u16::from_le_bytes([bytes[0], bytes[1]]));
+                }
+
                 weights.mtp_layer = Some(mtp);
             }
         }

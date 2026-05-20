@@ -3938,7 +3938,17 @@ fn main() {
     let use_v4f_source_precision = format == "v4f-q8-mtp"
         || format == "v4f-q8"
         || format == "v4f-source-precision"
-        || format == "v4f-source";
+        || format == "v4f-source"
+        || format == "v4f-mtp-precise";
+    // v4f-mtp-precise: addon-only build (use with --include-prefix mtp.) that
+    // keeps every mtp.0.* DENSE weight at F16 instead of Q8F16. Doubles the
+    // addon size (~2 GB → ~3 GB) but eliminates Q8 quant noise on the MTP
+    // attn projections, e_proj, h_proj, and shared experts. MTP is small
+    // enough that the precision matters disproportionately — V3 paper's
+    // 60-80% acceptance benchmark assumes weights at training precision,
+    // not 8-bit. Routed experts stay MQ2-Lloyd (no precision-upgrade option
+    // available without a new MoE GEMV kernel).
+    let use_mtp_precise = format == "v4f-mtp-precise";
     let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -4987,7 +4997,18 @@ fn main() {
         //   - All other weights: uniform Q8F16.
         //   - Norms / biases / HC matrices: should_quantize() returns
         //     false → fall through to F16 fallback at the bottom.
-        if use_v4f_source_precision && is_v4f_keep_f16(name) && n_elements >= 32 {
+        // v4f-mtp-precise: all mtp.0.* dense weights (anything that goes
+        // through gemv_auto in mtp_forward — wq_a/b, wkv, wo_a/b, e_proj,
+        // h_proj, shared experts, gate.weight) stay F16 to eliminate Q8
+        // quant noise on the MTP block. Routed experts (".ffn.experts.")
+        // are excluded — they MUST stay MQ2-Lloyd because the MoE GEMV
+        // kernel (`v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed`) only
+        // handles that format.
+        let keep_f16_mtp = use_mtp_precise
+            && name.starts_with("mtp.")
+            && !name.contains(".ffn.experts.")
+            && should_quantize(name);
+        if (use_v4f_source_precision && is_v4f_keep_f16(name) || keep_f16_mtp) && n_elements >= 32 {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let src_dtype = meta.dtype.as_str();
             let f32_data = tensor_to_f32_with_optional_fp8_scale(

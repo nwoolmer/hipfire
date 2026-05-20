@@ -123,10 +123,16 @@ pub fn speculative_decode_step(
         } else {
             draft_tokens[step - 1]
         };
-        let position = last_position + 1 + step as u32;
-        // Make state.n_tokens match `position` so attn_stub writes to
-        // SWA slot (position % win). Step 0 should already match (caller
-        // has state.n_tokens == last_position + 1 == position).
+        // V3 paper §4: h_i^k = M_k @ Concat(norm(h_i^{k-1}), norm(e_{i+k})).
+        // The MTP transformer block operates at position i (not i+1).
+        // For step k=0 predicting T_{N+1}: i = N-1 = last_position.
+        // For step k=s predicting T_{N+1+s}: i = N-1+s = last_position+s.
+        // So position passed to mtp_forward (which sets RoPE phase + SWA
+        // slot) is `last_position + step`, NOT `last_position + 1 + step`.
+        // The off-by-one earlier was causing MTP attn_stub to write the
+        // wrong SWA slot and RoPE to encode the wrong phase — accepted
+        // rate measured at ~50% K=2 with the bug; fix is being tested.
+        let position = last_position + step as u32;
         state.n_tokens = position as u64;
 
         // For step 0 we use h_n_ptr; for step k>0 we point at the
@@ -194,21 +200,15 @@ pub fn speculative_decode_step(
     }
 
     // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
-    // The MTP loop above left mtp_last_hidden polluted with hidden_{N+K-1}
-    // from MTP's K-step internal chain. For the NEXT call to either
-    // speculative_decode_step or mtp_forward, we want the *main model's*
-    // post-layer-block hidden at the LAST EMITTED position — which the
-    // verify pass already computed and stashed in pbs.streams_batch.
-    //
-    // The position to read: accepted_tokens.len() - 1 (the verify-batch
-    // index of the last token whose KV is now "committed"). Both
-    // accept-all (no divergence) and partial-accept (with divergence) end
-    // at the same index by accepted_tokens.len() - 1, because the
-    // divergence pick adds one to the count and shifts to the next index.
+    // Capture stream 0 of pbs.streams_batch[accepted_tokens.len() - 1, :, :].
+    // Matches main forward's capture convention (stream 0, pre-head-HC).
+    // The verify pass's internal final_norm_and_head_all_batched wrote
+    // the LAST batch position's stream 0 to mtp_last_hidden, but we want
+    // the (accepted_tokens.len()-1)-th position — overwrite from pbs.
     {
         let last_idx = accepted_tokens.len() - 1;
-        let stream_stride = cfg.hc_mult * cfg.hidden_size;
-        let off = last_idx * stream_stride;
+        let stream_len = cfg.hc_mult * cfg.hidden_size;
+        let off = last_idx * stream_len;
         let last_stream0 = pbs.streams_batch.sub_offset(off, cfg.hidden_size);
         if state.mtp_last_hidden.is_none() {
             state.mtp_last_hidden = Some(
@@ -218,7 +218,7 @@ pub fn speculative_decode_step(
         }
         let dst = state.mtp_last_hidden.as_ref().unwrap();
         gpu.memcpy_dtod_auto(&dst.buf, &last_stream0.buf, cfg.hidden_size * 4)
-            .map_err(|e| format!("capture verify-pass mtp_last_hidden: {e:?}"))?;
+            .map_err(|e| format!("capture verify-pass stream0: {e:?}"))?;
     }
 
     // ── 7. Restore state.n_tokens to the post-accept position ─────────

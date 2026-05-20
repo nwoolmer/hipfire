@@ -1184,13 +1184,12 @@ pub fn decode_step(
         }
     }
 
-    // 3. Capture post-layer-block hidden for downstream MTP / spec-decode
-    //    (V3 paper §4 `h_n`). MUST run before `final_norm_and_head` since
-    //    that applies the final RMSNorm + head HC mix and we want the
-    //    raw stream-0 hidden, not the normed/mixed one.
-    capture_mtp_hidden(cfg, state, gpu)?;
-
-    // 4. Final norm + LM head.
+    // 3. Final norm + LM head. The head-HC mix INSIDE final_norm_and_head
+    //    now ALSO captures head_hc_out into state.mtp_last_hidden — that's
+    //    the value V4F MTP expects as h_n (post-head-HC-mix, pre-output-norm).
+    //    The previous "capture stream 0 before final_norm_and_head" pattern
+    //    was wrong on HC models — MTP saw 1 of 4 streams instead of the
+    //    actual hidden the main model uses for its own prediction.
     //    Note: V4F has head-level HC (hc_head_base/fn/scale).
     //    For minimal forward: skip the head-HC mix (TODO: head HC
     //    likely projects 4 streams → 1 then applies head_weight)
@@ -1417,35 +1416,42 @@ pub fn mtp_forward(
     ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
 
-    // ── 7. Capture post-layer-block hidden h_{n+1} for chaining ────────
-    // Save stream 0 to `state.mtp_last_hidden` so that the next call to
-    // either `mtp_forward` (in a K-iter spec-decode loop) or a follow-up
-    // tool can pick up the propagated hidden without recomputing.
-    capture_mtp_hidden(cfg, state, gpu)?;
+    // ── 7. Capture stream 0 → mtp_last_hidden for chaining ────────────
+    {
+        if state.mtp_last_hidden.is_none() {
+            state.mtp_last_hidden = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+                .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?);
+        }
+        let streams = state.residual_streams.as_ref().unwrap();
+        let stream0 = streams.sub_offset(0, hidden);
+        let dst = state.mtp_last_hidden.as_ref().unwrap();
+        gpu.memcpy_dtod_auto(&dst.buf, &stream0.buf, hidden * 4)
+            .map_err(|e| format!("capture stream0 → mtp_last_hidden: {e:?}"))?;
+    }
 
-    // ── 8. mtp_final_norm + shared lm_head → logits ────────────────────
-    // V3 paper §4: MTP outputs `h_{n+1}` as a single hidden vector
-    // (not a 4-stream HC reduction) through the *shared* lm_head. We
-    // take stream 0 as the canonical post-mHC hidden and apply
-    // `mtp_final_norm` directly (no head-HC mix on the MTP path).
-    //
-    // OPEN: confirm against antirez ds4 once the model runs — if antirez
-    // applies head-HC to MTP, switch to `final_norm_and_head` with a
-    // norm-weight parameter override.
+    // ── 8. mtp_final_norm + shared lm_head → logits ───────────────────
+    // Stream 0 → mtp_final_norm → lm_head. The MTP head-HC tensors
+    // (mtp.0.hc_head_*) are intentionally unused here — see memory
+    // entry; using them measured WORSE acceptance than skipping.
+    if state.final_norm.is_none() {
+        state.final_norm = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc final_norm: {e:?}"))?);
+    }
+    if state.final_norm_rot.is_none() {
+        state.final_norm_rot = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc final_norm_rot: {e:?}"))?);
+    }
+    let final_norm = state.final_norm.as_ref().unwrap();
+    let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
     {
         let streams = state.residual_streams.as_ref().unwrap();
         let stream0 = streams.sub_offset(0, hidden);
-        let normed = state.mtp_e_norm_scratch.as_ref().unwrap();  // reuse
-        gpu.rmsnorm_f32(&stream0, mtp_final, normed, cfg.rms_norm_eps)
+        gpu.rmsnorm_f32(&stream0, mtp_final, final_norm, cfg.rms_norm_eps)
             .map_err(|e| format!("mtp final rmsnorm: {e:?}"))?;
-
-        // lm_head GEMV. For MQ4-head builds we'd need rotated input; for
-        // v4f-q8-mtp the head is Q8F16 so the rotated alias is unused.
-        let rotated_alias = state.mtp_h_norm_scratch.as_ref().unwrap();
-        gpu.rotate_x_mq(normed, rotated_alias, hidden)
+        gpu.rotate_x_mq(final_norm, final_norm_rot, hidden)
             .map_err(|e| format!("mtp rotate final: {e:?}"))?;
         let logits = state.logits.as_ref().unwrap();
-        gemv_auto(gpu, head, rotated_alias, normed, logits,
+        gemv_auto(gpu, head, final_norm_rot, final_norm, logits,
             cfg.vocab_size, hidden)?;
     }
 
@@ -1991,6 +1997,34 @@ fn final_norm_and_head(
     // 2. Head HC combine: head_hc_out[d] = sum_h pre[h] * streams[h, d]
     gpu.hc_input_map_4stream(head_hc_pre, streams, head_hc_out, cfg.hidden_size as i32)
         .map_err(|e| format!("hc_input_map (head): {e:?}"))?;
+
+    // 2.5. Capture h_n for downstream MTP / spec-decode.
+    //
+    // OPEN QUESTION (empirical): which value does V4F's MTP head_proj
+    // expect as its h-input?
+    //   (A) main's stream 0 (residual_streams[0, :])
+    //   (B) main's post-head-HC-mixed (head_hc_out)
+    //   (C) main's post-output-norm (final_norm)
+    //
+    // Measured K=2 short-prompt acceptance:
+    //   (A): ~50%  ← used to be our convention
+    //   (B): ~25%  ← worse, surprised since MTP ships hc_head_* tensors
+    // (C) untested.
+    //
+    // Sticking with (A) until a definitive signal (e.g. byte-equal
+    // against an antirez ds4 reference) says otherwise. MTP's own
+    // hc_head_* matrices are still used in mtp_forward step 7 for its
+    // OUTPUT pipeline (lm_head input), not for processing main's input.
+    if state.mtp_last_hidden.is_none() {
+        state.mtp_last_hidden = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
+            .map_err(|e| format!("alloc mtp_last_hidden in final_norm_and_head: {e:?}"))?);
+    }
+    {
+        let stream0 = streams.sub_offset(0, cfg.hidden_size);
+        let dst = state.mtp_last_hidden.as_ref().unwrap();
+        gpu.memcpy_dtod_auto(&dst.buf, &stream0.buf, cfg.hidden_size * 4)
+            .map_err(|e| format!("capture stream0 → mtp_last_hidden: {e:?}"))?;
+    }
 
     // 3. RMSNorm of the combined stream output.
     gpu.rmsnorm_f32(head_hc_out, output_norm, final_norm, cfg.rms_norm_eps)

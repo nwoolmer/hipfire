@@ -273,6 +273,17 @@ pub struct DeepseekV4LayerWeights {
     pub mtp_e_proj:         Option<rdna_compute::GpuTensor>,  // [hidden, hidden]
     pub mtp_h_proj:         Option<rdna_compute::GpuTensor>,  // [hidden, hidden]
     pub mtp_final_norm:     Option<rdna_compute::GpuTensor>,  // [hidden]
+    /// MTP-specific head-HC matrices. V4F ships these alongside the per-MTP
+    /// HC matrices (hc_attn_*, hc_ffn_*). Their presence in the safetensors
+    /// means the MTP layer was trained WITH head-HC mixing on its lm_head
+    /// path — taking stream 0 alone (as a naive port of V3's transformer
+    /// formulation does) drops the cross-stream mixing that MTP expects
+    /// for its prediction, measured as ~50% lower acceptance vs head-HC
+    /// mixed. Shapes match main globals: hc_head_fn [hc_mult, hc_mult*hidden],
+    /// hc_head_base [hc_mult], hc_head_scale [1] (scalar host-side after load).
+    pub mtp_hc_head_fn:      Option<rdna_compute::GpuTensor>,  // [hc_mult, hc_mult*hidden]
+    pub mtp_hc_head_base:    Option<rdna_compute::GpuTensor>,  // [hc_mult]
+    pub mtp_hc_head_scale:   f32,                              // scalar (loaded from [1] F16)
 
     // Hyper-Connections (F16 small matrices).
     pub hc_attn_base:  Option<rdna_compute::GpuTensor>,
@@ -350,6 +361,7 @@ impl DeepseekV4LayerWeights {
             indexer_compressor_norm: None, indexer_compressor_ape: None,
             mtp_enorm: None, mtp_hnorm: None, mtp_e_proj: None, mtp_h_proj: None,
             mtp_final_norm: None,
+            mtp_hc_head_fn: None, mtp_hc_head_base: None, mtp_hc_head_scale: 0.0,
             hc_attn_base: None, hc_attn_fn: None, hc_attn_scale: None,
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
             gate_weight: None, gate_bias: None,
