@@ -52,6 +52,14 @@ fn gemv_auto(
         DType::F32 => gpu.gemv_f32(weight, x_plain, y)
             .map_err(|e| format!("gemv_f32: {e:?}")),
         DType::F16 => gemv_f16_x_decode(gpu, weight, x_plain, y, m, k),
+        // Q8 decode (B=1) stays on the scalar `gemv_q8_0` kernel. Empirically
+        // measured: the WMMA path at B=1 wastes 15/16 of the 16×16 output
+        // tile on unused N-axis columns, while scalar gemv_q8_0 produces
+        // exactly 1 output per thread with no wasted work. Result: WMMA at
+        // B=1 is 30% SLOWER than scalar for Q8 on gfx1151 (measured
+        // 2026-05-20). The WMMA path stays opt-in via the decode helper
+        // below for future regression checks; the batched path
+        // (gemv_auto_batched_wmma) does benefit and IS WMMA by default.
         DType::Q8_0 => gpu.gemv_q8_0(weight, x_plain, y, m, k)
             .map_err(|e| format!("gemv_q8_0: {e:?}")),
         _ => gpu.gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
@@ -81,6 +89,36 @@ fn gemv_f16_x_decode(
         .map_err(|e| format!("gemv_f16 convert: {e:?}"))?;
     gpu.gemm_f16_x_f16_wmma(weight, &scratch, y, m, k, 1)
         .map_err(|e| format!("gemv_f16 wmma: {e:?}"))
+}
+
+/// Q8_0-weight single-token decode via WMMA-Q8: F32 input → F16
+/// (small scratch), then `gemm_q8_0_wmma` at B=1. Symmetric with
+/// `gemv_f16_x_decode` — the WMMA tile is 16×16 so at B=1 the
+/// N-dimension is underutilised, but the M-dimension is fully
+/// covered and the matrix-multiply hardware still beats the scalar
+/// `gemv_q8_0` per-FMA throughput.
+///
+/// Opt out with `HIPFIRE_V4F_Q8_WMMA=0` (same env knob as the
+/// batched path) — falls back to the scalar kernel.
+fn gemv_q8_0_via_wmma_decode(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_plain: &GpuTensor,
+    y: &GpuTensor,
+    m: usize, k: usize,
+) -> Result<(), String> {
+    let wmma_on = std::env::var("HIPFIRE_V4F_Q8_WMMA")
+        .map(|s| s != "0").unwrap_or(true);
+    if !wmma_on {
+        return gpu.gemv_q8_0(weight, x_plain, y, m, k)
+            .map_err(|e| format!("gemv_q8_0: {e:?}"));
+    }
+    let scratch = gpu.alloc_tensor(&[k], DType::F16)
+        .map_err(|e| format!("gemv_q8 wmma scratch alloc: {e:?}"))?;
+    gpu.convert_f32_to_f16(x_plain, &scratch, k as i64)
+        .map_err(|e| format!("gemv_q8 wmma convert: {e:?}"))?;
+    gpu.gemm_q8_0_wmma(weight, &scratch, y, m, k, 1)
+        .map_err(|e| format!("gemm_q8_0_wmma decode: {e:?}"))
 }
 
 /// Batched twin of `gemv_auto` for Phase B2 chunk forward.
@@ -150,9 +188,27 @@ fn gemv_auto_batched_wmma(
                 weight, x_plain_batch, y, m, k, batch_size,
             ).map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
         },
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            weight, x_plain_batch, y, m, k, batch_size,
-        ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}")),
+        DType::Q8_0 => {
+            // WMMA-Q8 route mirrors the HFQ4 WMMA path: stage F32 input
+            // → F16 once and dispatch `gemm_q8_0_wmma`. 11–30× microbench
+            // speedup over the scalar `gemm_q8_0_batched_chunked` per
+            // bench_q8_wmma_variants. Opt-out via HIPFIRE_V4F_Q8_WMMA=0
+            // for diagnosis or if a future kernel regression surfaces.
+            let wmma_on = std::env::var("HIPFIRE_V4F_Q8_WMMA")
+                .map(|s| s != "0").unwrap_or(true);
+            if wmma_on {
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.convert_f32_to_f16(x_plain_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
+                    return gpu.gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
+                }
+            }
+            gpu.gemm_q8_0_batched_chunked(
+                weight, x_plain_batch, y, m, k, batch_size,
+            ).map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
+        },
         DType::F16 => {
             // F16 weight: need to stage F32 input to F16 too, then WMMA.
             if let Some(scratch) = x_f16_scratch {

@@ -1764,6 +1764,13 @@ pub const CONVERT_F32_TO_F16_SRC: &str =
 pub const GEMM_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
 
+/// WMMA Q8_0 weight × F16 input → F32 output GEMM with (B, M)
+/// output layout. Drop-in for `gemm_q8_0_batched_chunked` (scalar
+/// FMA path). Per kernel comment: 11–30× microbench speedup at
+/// typical V4F shapes.
+pub const GEMM_Q8_0_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma.hip");
+
 /// WMMA per-group HFQ4G256 batched GEMV for V4F's wo_a block-diagonal
 /// projection. F16 input. Drop-in for `wo_per_group_batched_hfq4g256`.
 pub const WO_PER_GROUP_BATCHED_HFQ4G256_WMMA_SRC: &str =

@@ -22526,6 +22526,48 @@ impl Gpu {
         }
     }
 
+    /// WMMA Q8_0 weight × F16 input → F32 output GEMM with (B, M)
+    /// output layout. Drop-in for `gemm_q8_0_batched_chunked` once
+    /// activations have been staged through `convert_f32_to_f16`.
+    /// Microbench speedup vs the scalar path: 11–30× at typical V4F
+    /// shapes (same substrate ratio as gemm_hfq4g256_wmma vs scalar
+    /// HFQ4).
+    pub fn gemm_q8_0_wmma(
+        &mut self,
+        a_raw: &GpuTensor, x_f16: &GpuTensor, y_f32: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_q8_0_wmma",
+            kernels::GEMM_Q8_0_WMMA_SRC,
+            "gemm_q8_0_wmma",
+        )?;
+        let func = &self.functions["gemm_q8_0_wmma"];
+        let ap = a_raw.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, grid_b, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// WMMA F16 weight × F16 input → F32 output GEMM with (B, M)
     /// output layout. Drop-in for `gemm_f32_register_tiled` once the
     /// weight has been kept on device as F16 and the input has been
