@@ -3883,6 +3883,16 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
+    // V4F source-precision recipe (2026-05-20): routed experts → MQ2-Lloyd,
+    // every other tensor stored at the closest dtype that matches its
+    // safetensors source — F8_E4M3 → Q8F16, BF16 → F16, F32 stays F32.
+    // No K-map, no imatrix promotions, no kmap fallthroughs. Designed to
+    // re-quant DeepSeek-V4-Flash including the MTP head with maximum
+    // fidelity to source precision for everything except the (already
+    // FP4-packed) routed experts.
+    let use_v4f_source_precision = format == "v4f-source-precision"
+        || format == "v4f-source"
+        || format == "v4f-q8";
     let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -4251,7 +4261,7 @@ fn main() {
     }
     let allow_mq2_lloyd = args.iter().any(|a| a == "--allow-mq2-lloyd")
         || std::env::var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
-    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all) && !allow_mq2_lloyd {
+    if (use_mq2g256_lloyd || use_mq4_mq2lloydexp || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap || use_mq4_mq2lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all || use_v4f_source_precision) && !allow_mq2_lloyd {
         eprintln!(
             "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
              uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
@@ -4612,7 +4622,8 @@ fn main() {
             if k % 256 == 0
                 && (use_mq4_mq2lloyd_gptq_all || use_mq4_mqlloyd_antirez_gptq
                     || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_imatrix
-                    || use_mq4_mqlloyd_antirez)
+                    || use_mq4_mqlloyd_antirez
+                    || use_v4f_source_precision)
             {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
@@ -4854,6 +4865,57 @@ fn main() {
                 maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
             }
             continue;
+        }
+
+        // ── v4f-source-precision short-circuit ──────────────────────────────
+        // Strict source-matched dtype for everything that survived the V4F
+        // routed-expert MQ2-Lloyd branch above. Skips kmap/imatrix/etc.
+        if use_v4f_source_precision && should_quantize(name) && n_elements >= 32 {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            // Source maps:
+            //   F8_E4M3 (+ F8_E8M0 scale sibling) → Q8F16
+            //   BF16 / F16 → F16 (BF16 is in BF16 range, F16 conversion is lossless within F16 range)
+            //   F32 → F16 (matches the existing v4f.* quant output for this class — attn_sink ends up F16)
+            //   I8 (+ FP8 scale): only the routed-expert tensors reach this match arm; main path
+            //                     above already caught them via the V4F routed-expert branch.
+            //                     If we land here for an I8 tensor it's an oversight — fall through.
+            let want_q8 = src_dtype == "F8_E4M3";
+            let want_f16 = src_dtype == "BF16" || src_dtype == "F16" || src_dtype == "F32";
+            if want_q8 || want_f16 {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files,
+                );
+                quantized_params += n_elements as u64;
+                if want_q8 {
+                    let q = quantize_q8f16(&f32_data);
+                    eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
+                        "Q8_F16", name, meta.shape, n_elements,
+                        raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                    hfq_tensors.push(HfqTensor {
+                        name: name.to_string(),
+                        quant_type: QuantType::Q8F16,
+                        shape, group_size: 32, data: q, spilled_len: 0,
+                    });
+                } else {
+                    let f16_bytes: Vec<u8> = f32_data
+                        .iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect();
+                    eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
+                        "F16", name, meta.shape, n_elements,
+                        raw_data.len() as f64 / 1024.0, f16_bytes.len() as f64 / 1024.0);
+                    hfq_tensors.push(HfqTensor {
+                        name: name.to_string(),
+                        quant_type: QuantType::F16,
+                        shape, group_size: 0, data: f16_bytes, spilled_len: 0,
+                    });
+                }
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            // Unhandled source dtype — fall through to standard pipeline.
         }
 
         if should_quantize(name) && n_elements >= 32 {
