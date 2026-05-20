@@ -631,6 +631,16 @@ pub struct DeepseekV4State {
     /// and find the values we wrote for the current position.
     pub pos_array_host: Option<Box<[i32]>>,
 
+    /// First-call gate for the HIP graph capture path. The first
+    /// `decode_step_with_graph` call after `HIPFIRE_V4F_GRAPH=1` runs
+    /// direct so kernel JIT and lazy scratch allocations (rope buffers,
+    /// indexer scratch, FFN scratch, MoE expert pointers, etc.) all
+    /// happen OUTSIDE any captured region. The second call captures the
+    /// fully warm forward; the third and later calls replay it. Without
+    /// this flag, the first capture would hit
+    /// `hipMalloc not permitted under stream capture` and fail.
+    pub ar_forward_warmed_up: bool,
+
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
     /// view of `q` until real attention + O-LoRA lands.
@@ -768,6 +778,7 @@ impl DeepseekV4State {
             comp_pos_buf: None,
             pos_array_device: None,
             pos_array_host: None,
+            ar_forward_warmed_up: false,
             attn_out: None,
             ffn_out: None,
             ffn_x_rot: None,

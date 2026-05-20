@@ -1031,6 +1031,160 @@ pub fn decode_step(
     //    reference code before optimising).
     init_residual_streams(cfg, weights, state, gpu, token_id)?;
 
+    let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
+    let logits = state.logits.as_ref().unwrap();
+    gpu.download_f32(logits)
+        .map_err(|e| format!("download logits: {e:?}"))
+}
+
+/// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_V4F_GRAPH=1`.
+///
+/// Three-state machine driven by `state.ar_forward_warmed_up` and
+/// `gpu.graph_exec`:
+///   1. !warmed_up                   → direct dispatch (warmup so JIT
+///                                       and lazy alloc happen out of
+///                                       the captured region), set flag
+///   2. warmed_up && no graph        → wrap layer loop + head in
+///                                       `begin_graph_capture`/`end_graph_capture`,
+///                                       instantiate, run it once
+///   3. graph already instantiated   → update `pos_array_host[]` on
+///                                       the host (stable Box source),
+///                                       `graph_launch()` re-runs the
+///                                       captured ops which re-read
+///                                       pos_array_host; download logits
+///
+/// Returns logits same as `decode_step`. Falls back to plain
+/// `decode_step` when `HIPFIRE_V4F_GRAPH` is unset / "0".
+pub fn decode_step_with_graph(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    use std::sync::OnceLock;
+    static GRAPH_OPT_ENV: OnceLock<bool> = OnceLock::new();
+    let graph_on = *GRAPH_OPT_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_V4F_GRAPH").ok().as_deref() == Some("1")
+    });
+    if !graph_on {
+        return decode_step(cfg, weights, state, gpu, token_id, position);
+    }
+
+    // ── Warmup phase: direct dispatch, no capture ──────────────────
+    if !state.ar_forward_warmed_up {
+        state.ar_forward_warmed_up = true;
+        return decode_step(cfg, weights, state, gpu, token_id, position);
+    }
+
+    // From here on we need an explicit stream for capture/replay.
+    if gpu.active_stream.is_none() {
+        let s = gpu.hip.stream_create()
+            .map_err(|e| format!("decode_step_with_graph: stream_create: {e:?}"))?;
+        gpu.active_stream = Some(s);
+    }
+
+    // Embedding lookup and pos-array host write run OUTSIDE the captured
+    // region. token_id is baked into the embedding kernel arg, so capture
+    // would lock the graph to a single token. Pos-array host source must
+    // be a stable `Box<[i32]>` — the captured memcpy re-reads it on each
+    // replay. We update those host bytes BEFORE launching the graph.
+    init_residual_streams(cfg, weights, state, gpu, token_id)?;
+
+    if gpu.graph_exec.is_none() {
+        // ── Capture phase ──────────────────────────────────────────
+        // precompute_positions is called INSIDE the capture so the
+        // captured memcpy node re-reads pos_array_host on each replay.
+        gpu.begin_graph_capture()
+            .map_err(|e| format!("begin_graph_capture: {e:?}"))?;
+        precompute_positions(cfg, state, gpu, position)?;
+        let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
+        gpu.end_graph_capture()
+            .map_err(|e| format!("end_graph_capture: {e:?}"))?;
+        // Captured kernels were RECORDED, not executed. Launch the
+        // freshly-instantiated graph once so this position's forward
+        // actually runs and `state.logits` gets fresh values.
+        gpu.graph_launch()
+            .map_err(|e| format!("graph_launch (capture-end): {e:?}"))?;
+        eprintln!("[V4F hipGraph] captured forward — {} kernarg blobs retained",
+            gpu.capture_blobs.len());
+    } else {
+        // ── Replay phase ───────────────────────────────────────────
+        // Host-only update of the stable pos_array_host[]. The captured
+        // memcpy node will re-read these bytes on graph_launch and
+        // propagate them to pos_array_device, which all per-layer
+        // kernels read via sub_offset slices.
+        update_pos_array_host(cfg, state, position);
+        gpu.graph_launch()
+            .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
+        state.n_tokens += 1;
+    }
+
+    // Logits download is outside the captured region (sync memcpy_dtoh
+    // on the null stream — completes after the captured kernels finish
+    // because the captured stream is observed by the device).
+    let logits = state.logits.as_ref().unwrap();
+    gpu.download_f32(logits)
+        .map_err(|e| format!("download logits (graph path): {e:?}"))
+}
+
+/// Host-only update of `state.pos_array_host[]` for the given position.
+/// Used by the HIP-graphs replay path; the captured memcpy node will
+/// re-read these bytes when `graph_launch` runs.
+pub(crate) fn update_pos_array_host(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    position: u32,
+) {
+    let comp_rope_mode = std::env::var("HIPFIRE_V4F_COMP_ROPE_POS").ok();
+    let comp_rope_mode = comp_rope_mode.as_deref();
+    let pos_array_host = state.pos_array_host.as_mut()
+        .expect("update_pos_array_host: pos_array_host not initialised (call precompute_positions first)");
+    for layer_idx in 0..=cfg.num_hidden_layers {
+        let ratio = if layer_idx < cfg.num_hidden_layers {
+            cfg.compress_ratios[layer_idx] as usize
+        } else {
+            0
+        };
+        let base = layer_idx * POS_SLOTS_PER_LAYER;
+        pos_array_host[base + 0] = position as i32;
+        if ratio > 0 {
+            let main_rope_pos: i32 = match comp_rope_mode {
+                Some("end") => position as i32,
+                Some("start") => ((position as usize) / ratio * ratio) as i32,
+                _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
+            };
+            let indexer_rope_pos = ((position as usize) / ratio * ratio) as i32;
+            pos_array_host[base + 1] = main_rope_pos;
+            pos_array_host[base + 2] = indexer_rope_pos;
+        } else {
+            pos_array_host[base + 1] = 0;
+            pos_array_host[base + 2] = 0;
+        }
+    }
+}
+
+/// Captured-region body of `decode_step`: the per-layer forward loop
+/// + final norm + head. Token-id-dependent embedding lookup and
+/// position-array setup must be done BEFORE calling this — they are
+/// non-graph-safe (token_id is kernarg, position-array htod source must
+/// stay alive across replays).
+///
+/// `position` is still passed through so position-derived sizing logic
+/// (e.g. `n_filled = (pos + 1) / ratio` in `indexer_forward`) gets the
+/// real value — these are HOST computations that select which slots of
+/// the captured kernel to read, not kernarg-side position writes.
+///
+/// Public so the HIP-graphs capture/replay wrapper can call it directly.
+pub fn decode_step_body(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
     // Optional early-stop for bisection: env HIPFIRE_V4F_FORWARD_LAYER_END=N
     // halts after layer N-1 (exclusive bound) — leaves residual_streams in
     // their just-after-layer-(N-1) state for cross-path comparison.
@@ -1200,12 +1354,13 @@ pub fn decode_step(
     //    and just run final norm + standard lm_head.
     final_norm_and_head(cfg, weights, state, gpu)?;
 
-    // Download logits to host and return.
-    let logits = state.logits.as_ref().unwrap();
-    let logits_host = gpu.download_f32(logits)
-        .map_err(|e| format!("download logits: {e:?}"))?;
+    // Leave logits in `state.logits` for the caller to download. The
+    // download is intentionally outside `decode_step_body` so the
+    // captured-graph path can place it AFTER `graph_launch` (capturing
+    // a sync `memcpy_dtoh` into the captured stream causes wave-reads
+    // of stale buffers).
     state.n_tokens += 1;
-    Ok(logits_host)
+    Ok(Vec::new())
 }
 
 fn unimplemented_step(name: &str) -> Result<(), String> {
