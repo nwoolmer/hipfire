@@ -40,11 +40,16 @@ impl DeepseekV4 {
         gpu: &mut Gpu,
         name: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
+        // pread + fadvise(DONTNEED) keeps page-cache footprint bounded
+        // under unified memory (Strix Halo etc.). mmap-based `tensor_data`
+        // would hold the read pages until the kernel reclaims them, which
+        // can't keep up with the ~80 GB of subsequent routed-expert
+        // hipMallocs on the 88 GB v4f-q8-mtp build — OOM at layer 42.
         let (info, bytes) = hfq
-            .tensor_data(name)
+            .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
-        gpu.upload_raw(bytes, &shape)
+        gpu.upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))
     }
 
@@ -67,8 +72,11 @@ impl DeepseekV4 {
         gpu: &mut Gpu,
         name: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
+        // pread-based read (see upload_global_raw note); avoids the
+        // mmap-backed page-cache pressure that OOMs on UMA with the
+        // 88 GB v4f-q8-mtp build.
         let (info, bytes) = hfq
-            .tensor_data(name)
+            .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         if info.quant_type == 1 {
@@ -105,12 +113,12 @@ impl DeepseekV4 {
                     bytes.len()
                 ));
             }
-            let mut t = gpu.upload_raw(bytes, &shape)
+            let mut t = gpu.upload_raw(&bytes, &shape)
                 .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
             t.dtype = rdna_compute::DType::F16;
             return Ok(t);
         }
-        let mut t = gpu.upload_raw(bytes, &shape)
+        let mut t = gpu.upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload '{name}' failed: {e:?}"))?;
         if info.quant_type == 3 {
             t.dtype = rdna_compute::DType::Q8_0;
@@ -128,7 +136,7 @@ impl DeepseekV4 {
         name: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
         let (info, bytes) = hfq
-            .tensor_data(name)
+            .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         if info.quant_type != 1 {
@@ -144,7 +152,7 @@ impl DeepseekV4 {
                 bytes.len()
             ));
         }
-        let mut t = gpu.upload_raw(bytes, &shape)
+        let mut t = gpu.upload_raw(&bytes, &shape)
             .map_err(|e| format!("deepseek4: upload f16-native '{name}' failed: {e:?}"))?;
         t.dtype = rdna_compute::DType::F16;
         Ok(t)
@@ -258,7 +266,7 @@ impl DeepseekV4 {
         name: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
         let (info, bytes) = hfq
-            .tensor_data(name)
+            .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
         let n: usize = shape.iter().product();
@@ -476,19 +484,85 @@ impl Architecture for DeepseekV4 {
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_V4F_EXPERT_LAYER_END")
             .ok().and_then(|s| s.parse().ok());
 
+        // ── MTP addon HFQ discovery ──────────────────────────────────────
+        // Resolves an optional second HFQ holding only `mtp.0.*` tensors so
+        // users can opt into MTP / speculative decoding without re-quantizing
+        // the 86 GB base. Two resolution paths (env var first, then sibling):
+        //
+        //   1. HIPFIRE_V4F_MTP_ADDON=<path>     — explicit override
+        //   2. <base>.mtp-addon.hfq             — sibling auto-discovery
+        //      e.g. base v4f.mq2lloyd-q8.hfq  →  v4f.mq2lloyd-q8.mtp-addon.hfq
+        //
+        // When set, ALL `mtp.0.*` reads in the block below source from the
+        // addon instead of the base. The MTP layer is present iff the addon
+        // (or, for one-shot quants that put MTP in-band, the base) contains
+        // `mtp.0.norm.weight`.
+        let mut mtp_addon: Option<HfqFile> = {
+            let env_path = std::env::var("HIPFIRE_V4F_MTP_ADDON").ok();
+            let resolved: Option<std::path::PathBuf> = if let Some(p) = env_path {
+                Some(std::path::PathBuf::from(p))
+            } else {
+                // Sibling: strip ".hfq", append ".mtp-addon.hfq".
+                let base = hfq.path();
+                let stem = base.to_string_lossy();
+                let candidate = if let Some(s) = stem.strip_suffix(".hfq") {
+                    std::path::PathBuf::from(format!("{s}.mtp-addon.hfq"))
+                } else {
+                    std::path::PathBuf::from(format!("{stem}.mtp-addon.hfq"))
+                };
+                if candidate.exists() { Some(candidate) } else { None }
+            };
+            match resolved {
+                Some(p) => {
+                    eprintln!("deepseek4: opening MTP addon HFQ {p:?}");
+                    match HfqFile::open(&p) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            return Err(format!(
+                                "deepseek4: failed to open MTP addon HFQ {p:?}: {e:?}"
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
+
+        // Drop the mmap BEFORE any tensor uploads. Every upload helper
+        // below now uses `tensor_data_pread` (pread + FADV_DONTNEED)
+        // which doesn't need the mmap alive. On unified-memory APUs
+        // (Strix Halo etc.), holding the mmap during the upload pass
+        // populates page cache that competes 1:1 with the upcoming
+        // hipMalloc allocations — for the 88 GB v4f-q8-mtp build that
+        // OOMs the 125 GB system at layer ~42. The earlier "drop after
+        // dense pass" pattern (Phase B, 2026-05-19) was just one step
+        // along that path; this completes the migration.
+        // Also drop the addon's mmap on the same grounds.
+        hfq.drop_mmap();
+        if let Some(ref mut addon) = mtp_addon { addon.drop_mmap(); }
 
         // Globals. Norms are F16 on disk but the kernels expect F32
         // weight; convert at upload time.
+        //
+        // `head.weight` MUST use `upload_quant_or_f16` so its dtype gets
+        // tagged correctly (F16 / Q8_0 / Raw). With `upload_global_raw`
+        // the dtype is always Raw, which makes `gemv_auto` dispatch to
+        // the MQ4 fallback regardless of actual quant — Q8F16 bytes get
+        // read as MQ4 blocks and produce NaN logits silently. Same
+        // potential trap for `token_embd`, but the embedding_lookup_q8
+        // kernel reads bytes layout-directly and doesn't gate on dtype,
+        // so leaving it as raw upload is currently safe.
         weights.token_embd  = Some(Self::upload_global_raw(hfq, gpu, "embed.weight")?);
         weights.output_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "norm.weight")?);
-        weights.head        = Some(Self::upload_global_raw(hfq, gpu, "head.weight")?);
+        weights.head        = Some(Self::upload_quant_or_f16(hfq, gpu, "head.weight")?);
 
         // Head HC mix tensors — F16 raw on GPU; scale is scalar host-side.
         weights.hc_head_fn   = Some(Self::upload_global_raw(hfq, gpu, "hc_head_fn")?);
         weights.hc_head_base = Some(Self::upload_global_raw(hfq, gpu, "hc_head_base")?);
         {
-            let (info, bytes) = hfq.tensor_data("hc_head_scale")
+            let (info, bytes) = hfq.tensor_data_pread("hc_head_scale")
                 .ok_or_else(|| "deepseek4: hc_head_scale missing".to_string())?;
             if info.shape != vec![1] {
                 return Err(format!("deepseek4: hc_head_scale unexpected shape {:?}", info.shape));
@@ -596,8 +670,14 @@ impl Architecture for DeepseekV4 {
             layer.hc_ffn_scale  = Some(Self::upload_global_raw(hfq, gpu,
                 &format!("layers.{l}.hc_ffn_scale"))?);
 
-            // FFN router.
-            layer.gate_weight = Some(Self::upload_global_raw(hfq, gpu,
+            // FFN router. MUST use upload_quant_or_f16 (not upload_global_raw)
+            // so the dtype tag matches the quant_type — same trap as head.weight.
+            // With upload_global_raw, dtype=Raw always, and gemv_auto (in
+            // moe_route) falls through to gemv_mq4g256_prerotated regardless
+            // of actual quant. For Q8F16 routers (v4f-q8-mtp) that meant
+            // reading Q8 bytes as MQ4 blocks → NaN logits at layer 3+
+            // (the first non-hash layer that runs moe_route).
+            layer.gate_weight = Some(Self::upload_quant_or_f16(hfq, gpu,
                 &format!("layers.{l}.ffn.gate.weight"))?);
             if l >= cfg.num_hash_layers {
                 // Store F32 on GPU (was F16 on disk) so the bias can
@@ -614,7 +694,7 @@ impl Architecture for DeepseekV4 {
                 // at quant time, in which case forward falls back to
                 // shared-only on hash layers (current default behaviour).
                 let tid_name = format!("layers.{l}.ffn.gate.tid2eid");
-                if let Some((info, bytes)) = hfq.tensor_data(&tid_name) {
+                if let Some((info, bytes)) = hfq.tensor_data_pread(&tid_name) {
                     if bytes.len() % 4 == 0 {
                         let vals: Vec<u32> = bytes.chunks_exact(4)
                             .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
@@ -647,10 +727,13 @@ impl Architecture for DeepseekV4 {
         // norms (enorm, hnorm, final norm). It has no compressor and no
         // indexer — its attention is SWA-only like a hash layer.
         //
-        // Gated on the HFQ actually containing `mtp.0.norm.weight`;
-        // existing models (v4f.mq2lloyd-f16compress.hfq, antirezQ8.hfq)
-        // were quantized without MTP and will leave `mtp_layer = None`.
-        let mtp_present = hfq.find_tensor_info("mtp.0.norm.weight").is_some();
+        // Gated on `mtp.0.norm.weight` being present somewhere. The MTP
+        // tensors source from the addon if it was opened above, else from
+        // the base HFQ (in-band MTP, e.g. one-shot v4f-q8-mtp quants).
+        // Existing models without MTP (v4f.mq2lloyd-f16compress.hfq,
+        // antirezQ8.hfq) and no addon will leave `mtp_layer = None`.
+        let mtp_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
+        let mtp_present = mtp_source.find_tensor_info("mtp.0.norm.weight").is_some();
         if mtp_present {
             let load_mtp = std::env::var("HIPFIRE_V4F_LOAD_MTP")
                 .map(|s| s != "0").unwrap_or(true);
@@ -658,71 +741,76 @@ impl Architecture for DeepseekV4 {
                 eprintln!("deepseek4: HFQ contains MTP layer but \
                     HIPFIRE_V4F_LOAD_MTP=0 — skipping MTP upload");
             } else {
-                eprintln!("deepseek4: MTP layer present — uploading.");
+                eprintln!("deepseek4: MTP layer present — uploading from {}.",
+                    if mtp_addon.is_some() { "addon HFQ" } else { "base HFQ" });
                 let mut mtp = DeepseekV4LayerWeights::new_empty(0);
                 // ── Standard layer fields under the `mtp.0.` prefix ──
-                mtp.attn_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                // All MTP reads source from `mtp_source` (addon if present, else base).
+                mtp.attn_norm = Some(Self::upload_global_f16_as_f32(mtp_source, gpu,
                     "mtp.0.attn_norm.weight")?);
-                mtp.ffn_norm  = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                mtp.ffn_norm  = Some(Self::upload_global_f16_as_f32(mtp_source, gpu,
                     "mtp.0.ffn_norm.weight")?);
-                mtp.q_norm    = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                mtp.q_norm    = Some(Self::upload_global_f16_as_f32(mtp_source, gpu,
                     "mtp.0.attn.q_norm.weight")?);
-                mtp.kv_norm   = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                mtp.kv_norm   = Some(Self::upload_global_f16_as_f32(mtp_source, gpu,
                     "mtp.0.attn.kv_norm.weight")?);
-                mtp.attn_sink = Some(Self::upload_global_f16_as_f32(hfq, gpu,
+                mtp.attn_sink = Some(Self::upload_global_f16_as_f32(mtp_source, gpu,
                     "mtp.0.attn.attn_sink")?);
 
-                mtp.wq_a = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wq_a.weight")?);
-                mtp.wq_b = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wq_b.weight")?);
-                mtp.wkv  = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wkv.weight")?);
-                mtp.wo_a = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wo_a.weight")?);
-                mtp.wo_b = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.attn.wo_b.weight")?);
+                mtp.wq_a = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.attn.wq_a.weight")?);
+                mtp.wq_b = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.attn.wq_b.weight")?);
+                mtp.wkv  = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.attn.wkv.weight")?);
+                mtp.wo_a = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.attn.wo_a.weight")?);
+                mtp.wo_b = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.attn.wo_b.weight")?);
 
                 // HC blocks (same shape as main layer).
-                mtp.hc_attn_base  = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_base")?);
-                mtp.hc_attn_fn    = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_fn")?);
-                mtp.hc_attn_scale = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_attn_scale")?);
-                mtp.hc_ffn_base   = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_base")?);
-                mtp.hc_ffn_fn     = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_fn")?);
-                mtp.hc_ffn_scale  = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.hc_ffn_scale")?);
+                mtp.hc_attn_base  = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_attn_base")?);
+                mtp.hc_attn_fn    = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_attn_fn")?);
+                mtp.hc_attn_scale = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_attn_scale")?);
+                mtp.hc_ffn_base   = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_ffn_base")?);
+                mtp.hc_ffn_fn     = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_ffn_fn")?);
+                mtp.hc_ffn_scale  = Some(Self::upload_global_raw(mtp_source, gpu, "mtp.0.hc_ffn_scale")?);
 
                 // FFN router (score-routed; MTP doesn't have hash routing).
-                mtp.gate_weight = Some(Self::upload_global_raw(hfq, gpu, "mtp.0.ffn.gate.weight")?);
-                let bias_gpu = Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.ffn.gate.bias")?;
+                mtp.gate_weight = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.ffn.gate.weight")?);
+                let bias_gpu = Self::upload_global_f16_as_f32(mtp_source, gpu, "mtp.0.ffn.gate.bias")?;
                 mtp.gate_bias_host = gpu.download_f32(&bias_gpu)
                     .map_err(|e| format!("d2h mtp gate_bias: {e:?}"))?;
                 mtp.gate_bias = Some(bias_gpu);
 
                 // Shared expert.
-                mtp.shared_w1 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                mtp.shared_w1 = Some(Self::upload_quant_or_f16(mtp_source, gpu,
                     "mtp.0.ffn.shared_experts.w1.weight")?);
-                mtp.shared_w2 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                mtp.shared_w2 = Some(Self::upload_quant_or_f16(mtp_source, gpu,
                     "mtp.0.ffn.shared_experts.w2.weight")?);
-                mtp.shared_w3 = Some(Self::upload_quant_or_f16(hfq, gpu,
+                mtp.shared_w3 = Some(Self::upload_quant_or_f16(mtp_source, gpu,
                     "mtp.0.ffn.shared_experts.w3.weight")?);
 
                 // ── MTP-specific fields ──
-                mtp.mtp_enorm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.enorm.weight")?);
-                mtp.mtp_hnorm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.hnorm.weight")?);
-                mtp.mtp_e_proj = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.e_proj.weight")?);
-                mtp.mtp_h_proj = Some(Self::upload_quant_or_f16(hfq, gpu, "mtp.0.h_proj.weight")?);
-                mtp.mtp_final_norm = Some(Self::upload_global_f16_as_f32(hfq, gpu, "mtp.0.norm.weight")?);
+                mtp.mtp_enorm = Some(Self::upload_global_f16_as_f32(mtp_source, gpu, "mtp.0.enorm.weight")?);
+                mtp.mtp_hnorm = Some(Self::upload_global_f16_as_f32(mtp_source, gpu, "mtp.0.hnorm.weight")?);
+                mtp.mtp_e_proj = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.e_proj.weight")?);
+                mtp.mtp_h_proj = Some(Self::upload_quant_or_f16(mtp_source, gpu, "mtp.0.h_proj.weight")?);
+                mtp.mtp_final_norm = Some(Self::upload_global_f16_as_f32(mtp_source, gpu, "mtp.0.norm.weight")?);
 
                 weights.mtp_layer = Some(mtp);
             }
         }
 
-        // Phase B (2026-05-18): drop the HFQ mmap BEFORE the routed-expert
-        // upload pass. The dense + shared-expert pass above accumulates
-        // ~5 GB of mmap-backed page cache that competes with the upcoming
-        // ~80 GB of hipMalloc-backed routed-expert blobs under unified
-        // memory. Dropping the mmap now lets the kernel reclaim those
-        // pages immediately — measured per-layer time stays flat across
-        // the routed pass instead of growing 0.84 s → 2.04 s as before.
+        // (Mmaps were dropped earlier, right after the host walk —
+        // see the comment above `hfq.drop_mmap()` at the top of this
+        // function. The previous "Phase B drop here" call is redundant
+        // now that every upload helper uses tensor_data_pread, but is
+        // left removed to make the lifecycle obvious.)
         //
-        // tensor_data_pread (used by the routed pass) reads via pread() on
-        // self._file directly, so it does not need the mmap alive.
-        hfq.drop_mmap();
+        // Reclaim the pread reuse buffer's peak allocation before the
+        // routed-expert pass. After the dense + MTP pass, pread_buf is
+        // sitting at ~560 MB (size of head.weight at Q8F16) but the
+        // routed-expert pass only ever reads ~9 MB at a time. On UMA
+        // that 560 MB is the difference between fitting and OOM at
+        // layer 42 of the 88 GB v4f-q8-mtp build.
+        hfq.shrink_pread_buf();
+        if let Some(ref addon) = mtp_addon { addon.shrink_pread_buf(); }
 
         // Routed experts: 256 × 3 = 768 tensors per layer ×
         // 43 layers = ~33K total. Per-expert hipMalloc takes ~10ms
@@ -752,12 +840,15 @@ impl Architecture for DeepseekV4 {
         }
 
         // Routed experts for the MTP layer (same upload logic, gated on
-        // both `upload_experts` and the MTP layer existing).
+        // both `upload_experts` and the MTP layer existing). Reads from the
+        // addon HFQ if present, else from the base (in-band MTP).
         if upload_experts {
             if let Some(mtp) = weights.mtp_layer.as_mut() {
-                eprintln!("deepseek4: uploading MTP routed experts.");
+                let mtp_expert_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
+                eprintln!("deepseek4: uploading MTP routed experts from {}.",
+                    if mtp_addon.is_some() { "addon HFQ" } else { "base HFQ" });
                 Self::upload_layer_routed_experts(
-                    hfq, gpu, "mtp.0", cfg.n_routed_experts, mtp,
+                    mtp_expert_source, gpu, "mtp.0", cfg.n_routed_experts, mtp,
                 )?;
             }
         }

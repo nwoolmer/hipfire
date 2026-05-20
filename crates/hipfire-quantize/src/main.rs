@@ -2061,13 +2061,31 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
             if range > 0.0 {
-                // Lloyd's iterations — cap at 16, early-exit on stable assignments.
-                // Synthetic-distribution sweep (see `lloyd_iteration_headroom` test,
-                // 2026-05-19) showed 8-iter cap leaves 0.4-0.9% MSE on the table
-                // for heavy-tailed and sparse-outlier distributions; 16-iter
-                // reaches the MSE plateau (32-iter gives 0% further). Free win on
-                // the next quant rebuild.
-                let max_iter = 16;
+                // Lloyd's iterations — cap at 8 (REVERTED from 16 on 2026-05-20).
+                //
+                // History: f8cd234 (2026-05-19) bumped 8 → 16 based on the
+                // `lloyd_iteration_headroom` synthetic-distribution probe,
+                // which showed +0.4-0.9% MSE improvement on heavy-tailed +
+                // sparse distributions. Free-on-paper, but never gated on a
+                // real-model coherence run.
+                //
+                // 2026-05-20 V4F re-quant under 16-iter measured 60x worse
+                // PPL on wikitext2 (758 vs 12 baseline) vs files built with
+                // 8-iter (v4f.mq2lloyd-f16compress.hfq, v4f.antirezQ8.hfq —
+                // byte-identical routed experts, identical bytes hash =
+                // identical algorithm = "8-iter is the prod-good config").
+                //
+                // Hypothesis: 16-iter pushes centroids into pathological local
+                // minima on FWHT-rotated MoE expert weight distributions. The
+                // synthetic probe's "heavy-tailed + sparse" categories didn't
+                // capture FWHT-rotated MoE statistics. Classic synth-win →
+                // prod-falsify per CLAUDE.md's "Δ ≥ 5% investigation rule".
+                //
+                // Reverting to 8-iter to match the known-good build until
+                // a real-model coherence-gated sweep validates a different
+                // value. Do NOT raise this back to 16 (or higher) without
+                // running wikitext2 PPL on a V4F build first.
+                let max_iter = 8;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut sums = [0.0f64; 4];
@@ -2500,8 +2518,14 @@ enum QuantType {
     // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
     // signals "rotation present, offline FWHT" for future interop/detection.
     MFP4G32 = 24,      // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    /// I64→U32 downcast of V4F hash-routing `tid2eid` lookup tables.
+    /// Shape `[vocab, num_experts_per_tok]`. Stored as raw u32 LE; the
+    /// loader reads `bytes.chunks_exact(4)`. ID 22 was reserved for the
+    /// HFP4G16 NV-aligned ablation (never built) — we re-use the slot
+    /// for tid2eid storage to stay byte-compatible with antirezQ8.hfq.
+    TidI32 = 22,
     // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
-    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
+    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation (re-used by TidI32)
     // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
@@ -2870,6 +2894,27 @@ fn should_quantize(name: &str) -> bool {
     }
     // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
+}
+
+/// antirez ds4 reference keeps three classes at F16 because Q8 measurably
+/// regresses PPL on V4F: (1) attn compressor wkv + wgate, (2) indexer wq_b +
+/// weights_proj, (3) indexer compressor wkv + wgate. All small (≤32 MiB
+/// combined across 43 layers).
+///
+/// Router gate.weight (.ffn.gate.weight) is NOT kept at F16: antirez
+/// actually ships it as MQ4G256, and the working v4f.mq2lloyd-f16compress
+/// quant matches. Falling back to the format's default (Q8F16 in v4f-q8-mtp)
+/// is fine — the router is dispatched via `gemv_auto`.
+///
+/// `attn.indexer.compressor.*` is a substring of `attn.compressor.*` only
+/// in the literal-prefix sense, so order doesn't matter — the substring
+/// `.compressor.wkv.weight` matches both `.attn.compressor.wkv.weight` and
+/// `.attn.indexer.compressor.wkv.weight` deliberately.
+fn is_v4f_keep_f16(name: &str) -> bool {
+    name.ends_with(".compressor.wkv.weight")
+        || name.ends_with(".compressor.wgate.weight")
+        || name.ends_with(".indexer.wq_b.weight")
+        || name.ends_with(".indexer.weights_proj.weight")
 }
 
 /// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
@@ -3883,16 +3928,17 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_mq8g256 = format == "mq8" || format == "mq8g256";
-    // V4F source-precision recipe (2026-05-20): routed experts → MQ2-Lloyd,
-    // every other tensor stored at the closest dtype that matches its
-    // safetensors source — F8_E4M3 → Q8F16, BF16 → F16, F32 stays F32.
-    // No K-map, no imatrix promotions, no kmap fallthroughs. Designed to
-    // re-quant DeepSeek-V4-Flash including the MTP head with maximum
-    // fidelity to source precision for everything except the (already
-    // FP4-packed) routed experts.
-    let use_v4f_source_precision = format == "v4f-source-precision"
-        || format == "v4f-source"
-        || format == "v4f-q8";
+    // V4F recipe (2026-05-20): routed experts → MQ2-Lloyd, every other
+    // 2D weight → Q8F16, with norms/biases/HC matrices falling through
+    // to the F16 fallback path via `should_quantize() == false`.
+    // No K-map, no imatrix promotions, no source-dtype distinctions in
+    // the quant branch — uniform Q8F16 for everything that's a real
+    // matmul weight. Designed to re-quant DeepSeek-V4-Flash including
+    // the MTP head at maximum precision for the dense path.
+    let use_v4f_source_precision = format == "v4f-q8-mtp"
+        || format == "v4f-q8"
+        || format == "v4f-source-precision"
+        || format == "v4f-source";
     let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -4535,8 +4581,28 @@ fn main() {
     let vision_quant = std::env::args().position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
         .unwrap_or_default();
+    // --include-prefix <prefix>: when set, ONLY tensors whose name starts
+    // with this prefix are ingested; everything else is silently skipped.
+    // Used to produce side-car HFQs (e.g. `--include-prefix mtp.` builds an
+    // MTP-only addon that pairs with an existing base HFQ via the loader's
+    // `.mtp-addon.hfq` discovery). When unset (default), all tensors pass
+    // this gate and the usual mtp/vision skip rules below apply.
+    let include_prefix = std::env::args().position(|a| a == "--include-prefix")
+        .and_then(|i| std::env::args().nth(i + 1));
+    if let Some(ref p) = include_prefix {
+        eprintln!("  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested");
+    }
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
+        // --include-prefix filter (highest priority — runs before mtp/vision skips).
+        if let Some(ref p) = include_prefix {
+            if !name.starts_with(p) {
+                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+                let n: usize = meta.shape.iter().product();
+                skipped_params += n as u64;
+                continue;
+            }
+        }
         // Skip MTP head; optionally include vision encoder for VL inference
         let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
         if is_vision && !include_vision {
@@ -4545,7 +4611,11 @@ fn main() {
             skipped_params += n as u64;
             continue;
         }
-        if name.starts_with("mtp.") {
+        // MTP (Multi-Token Prediction) head: pre-Phase-5 quants skipped these
+        // because no forward path consumed them. v4f-q8-mtp is the first format
+        // that ingests the MTP layer; v3 spec-decode requires it. For other
+        // formats we still skip to avoid bloating the HFQ with unused tensors.
+        if name.starts_with("mtp.") && !use_v4f_source_precision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -4556,14 +4626,52 @@ fn main() {
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
 
-        // V4F's `tid2eid` hash-routing tables are I64 integer lookups,
-        // not weights. The forward path (when it lands) needs them, but
-        // Phase 1 ingest skips them: they don't go through quantization
-        // and the existing pass-through plumbing only handles float
-        // dtypes. Re-add as raw bytes in a follow-up when forward
-        // bring-up needs them.
+        // V4F's `tid2eid` hash-routing tables: source I64 in safetensors,
+        // shape [vocab=129280, k=6]. The values are token-id × expert-id
+        // pairs that all fit in i32 (vocab < 2^31, n_experts < 2^31), so
+        // we downcast I64 → U32 (4 bytes/element) before write — antirez
+        // does the same and the V4F loader at arch.rs reads them as U32
+        // (`bytes.chunks_exact(4)`). Without these in the HFQ, the loader
+        // sees an empty `tid2eid_host` and `ffn_hash_routed` falls back
+        // to shared-only on the first `num_hash_layers` (3) layers —
+        // measured 2× wikitext2 PPL regression on v4f-q8-mtp (21.85
+        // vs 11.42 antirez) before this fix landed.
+        //
+        // QuantType=22 is "reserved-but-unused" in our enum (HFP4G16
+        // ablation slot, never built); we use it for tid2eid storage to
+        // stay byte-compatible with antirezQ8.hfq which also writes 22.
+        // The loader is name-gated (looks for "tid2eid" substring), so
+        // qt value doesn't actually steer dispatch — only matters for
+        // cross-tooling identification.
         if meta.dtype == "I64" {
-            eprintln!("  [skip-I64] {} {:?} ({} elements) — hash-routing table, restore in forward bring-up",
+            if name.ends_with("tid2eid") {
+                if n_elements * 8 != raw_data.len() {
+                    panic!("tid2eid '{name}': expected {} bytes (8 × {}), got {}",
+                        n_elements * 8, n_elements, raw_data.len());
+                }
+                let mut u32_bytes: Vec<u8> = Vec::with_capacity(n_elements * 4);
+                for i in 0..n_elements {
+                    let off = i * 8;
+                    let v = i64::from_le_bytes(
+                        raw_data[off..off + 8].try_into().unwrap());
+                    let v_u32 = v as u32;  // downcast — values fit
+                    u32_bytes.extend_from_slice(&v_u32.to_le_bytes());
+                }
+                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+                eprintln!("  {:>8}: {} {:?} (I64 → U32, {} elements, {:.1} KB)",
+                    "TID2EID", name, meta.shape, n_elements,
+                    u32_bytes.len() as f64 / 1024.0);
+                quantized_params += n_elements as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::TidI32,
+                    shape, group_size: 0, data: u32_bytes, spilled_len: 0,
+                });
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // Other I64 (none expected in V4F): skip with explicit warning.
+            eprintln!("  [skip-I64] {} {:?} ({} elements) — unexpected I64 tensor, not ingested",
                 name, meta.shape, n_elements);
             skipped_params += n_elements as u64;
             continue;
@@ -4867,55 +4975,63 @@ fn main() {
             continue;
         }
 
-        // ── v4f-source-precision short-circuit ──────────────────────────────
-        // Strict source-matched dtype for everything that survived the V4F
-        // routed-expert MQ2-Lloyd branch above. Skips kmap/imatrix/etc.
+        // ── v4f-q8-mtp short-circuit ───────────────────────────────────────
+        // Routed experts (.ffn.experts.*) were claimed by the MQ2-Lloyd
+        // branch above. Here we handle everything else:
+        //
+        //   - antirez-precision-sensitive (compressor / indexer /
+        //     router gate.weight): keep as F16 on disk. The compressor
+        //     class alone regresses PPL +40-81% if dropped to MQ4
+        //     (memory: project_v4f_compressor_must_stay_f16); F16 → Q8
+        //     on these classes is a smaller hit but still unnecessary.
+        //   - All other weights: uniform Q8F16.
+        //   - Norms / biases / HC matrices: should_quantize() returns
+        //     false → fall through to F16 fallback at the bottom.
+        if use_v4f_source_precision && is_v4f_keep_f16(name) && n_elements >= 32 {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let f16_bytes: Vec<u8> = f32_data.iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}, keep-F16]",
+                "F16", name, meta.shape, n_elements,
+                raw_data.len() as f64 / 1024.0, f16_bytes.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape, group_size: 0, data: f16_bytes, spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
         if use_v4f_source_precision && should_quantize(name) && n_elements >= 32 {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let src_dtype = meta.dtype.as_str();
-            // Source maps:
-            //   F8_E4M3 (+ F8_E8M0 scale sibling) → Q8F16
-            //   BF16 / F16 → F16 (BF16 is in BF16 range, F16 conversion is lossless within F16 range)
-            //   F32 → F16 (matches the existing v4f.* quant output for this class — attn_sink ends up F16)
-            //   I8 (+ FP8 scale): only the routed-expert tensors reach this match arm; main path
-            //                     above already caught them via the V4F routed-expert branch.
-            //                     If we land here for an I8 tensor it's an oversight — fall through.
-            let want_q8 = src_dtype == "F8_E4M3";
-            let want_f16 = src_dtype == "BF16" || src_dtype == "F16" || src_dtype == "F32";
-            if want_q8 || want_f16 {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name, raw_data, meta, &fp8_scale_for, &st_files,
-                );
-                quantized_params += n_elements as u64;
-                if want_q8 {
-                    let q = quantize_q8f16(&f32_data);
-                    eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
-                        "Q8_F16", name, meta.shape, n_elements,
-                        raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
-                    hfq_tensors.push(HfqTensor {
-                        name: name.to_string(),
-                        quant_type: QuantType::Q8F16,
-                        shape, group_size: 32, data: q, spilled_len: 0,
-                    });
-                } else {
-                    let f16_bytes: Vec<u8> = f32_data
-                        .iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect();
-                    eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
-                        "F16", name, meta.shape, n_elements,
-                        raw_data.len() as f64 / 1024.0, f16_bytes.len() as f64 / 1024.0);
-                    hfq_tensors.push(HfqTensor {
-                        name: name.to_string(),
-                        quant_type: QuantType::F16,
-                        shape, group_size: 0, data: f16_bytes, spilled_len: 0,
-                    });
-                }
-                st_files[*file_idx].drop_tensor_pages(name);
-                if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-                }
-                continue;
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
+                "Q8_F16", name, meta.shape, n_elements,
+                raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape, group_size: 32, data: q, spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
-            // Unhandled source dtype — fall through to standard pipeline.
+            continue;
         }
 
         if should_quantize(name) && n_elements >= 32 {

@@ -270,7 +270,7 @@ fn compressor_forward_impl(
     is_indexer: bool,
     pre_batched: Option<(&GpuTensor, &GpuTensor, usize)>,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let ratio = layer.compress_ratio as usize;
     if ratio == 0 { return Ok(()); }
     if is_indexer && ratio != 4 { return Ok(()); }
@@ -587,7 +587,7 @@ fn compressor_forward_batched(
     batch_size: usize,
     is_indexer: bool,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let ratio = layer.compress_ratio as usize;
     if ratio == 0 { return Ok(()); }
     if is_indexer && ratio != 4 { return Ok(()); }
@@ -857,7 +857,7 @@ fn indexer_forward(
     layer_idx: usize,
     position: u32,
 ) -> Result<usize, String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     if layer.compress_ratio != 4 { return Ok(0); }
 
     let h = cfg.index_n_heads;
@@ -979,7 +979,7 @@ pub fn decode_step(
 
     // 2. Per-layer forward.
     for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
-        let layer = &weights.layers[layer_idx];
+        let layer = weights.resolve_layer(layer_idx);
         let l_state = &mut state._indexer[layer_idx];
         let l_attn  = &mut state._attention[layer_idx];
 
@@ -1128,7 +1128,13 @@ pub fn decode_step(
         }
     }
 
-    // 3. Final norm + LM head.
+    // 3. Capture post-layer-block hidden for downstream MTP / spec-decode
+    //    (V3 paper §4 `h_n`). MUST run before `final_norm_and_head` since
+    //    that applies the final RMSNorm + head HC mix and we want the
+    //    raw stream-0 hidden, not the normed/mixed one.
+    capture_mtp_hidden(cfg, state, gpu)?;
+
+    // 4. Final norm + LM head.
     //    Note: V4F has head-level HC (hc_head_base/fn/scale).
     //    For minimal forward: skip the head-HC mix (TODO: head HC
     //    likely projects 4 streams → 1 then applies head_weight)
@@ -1146,6 +1152,252 @@ pub fn decode_step(
 fn unimplemented_step(name: &str) -> Result<(), String> {
     let _ = name;  // silence unused; kept for stack-trace clarity later.
     Ok(())
+}
+
+/// V4F Multi-Token Prediction (MTP) forward step — DeepSeek V3 §4.
+///
+/// Predicts the **next-next** token given:
+///   - `h_n`         : hidden state at absolute position N (the output of
+///                     the main forward at that position, before the head)
+///   - `next_token`  : the token that was emitted at position N+1
+///   - `position`    : absolute position N+1 (used by tail-RoPE)
+///
+/// Output: logits over the vocab for position N+2.
+///
+/// Architecture (from `mtp.0.*` weights in V4F-MTP HFQ files):
+/// ```text
+/// e_norm     = enorm(embed_lookup(next_token))
+/// h_norm     = hnorm(h_n)
+/// x_in       = e_proj @ e_norm + h_proj @ h_norm         (Q8F16 GEMVs)
+/// x_attn     = attention(attn_norm(x_in))   + x_in        (SWA-only — no compressor)
+/// x_ffn      = ffn(ffn_norm(x_attn))        + x_attn      (shared + routed MoE)
+/// h_n_plus_1 = mtp_final_norm(x_ffn)
+/// logits     = shared_head @ h_n_plus_1                   (reuses main lm_head)
+/// ```
+///
+/// The MTP layer has NO compressor and NO indexer (verified against the
+/// safetensors tensor table: only standard attn + FFN weights). Its
+/// attention block is the SWA-only path (same as a hash-routed main
+/// layer's attention).
+///
+/// **Status**: M1+M2 (weights ingest) are landed; the standard layer
+/// block (attn + FFN with MTP weights) is still pending — the existing
+/// per-layer helpers (`q_lora`, `kv_joint`, `attn_stub`, ...) all read
+/// `weights.layers[layer_idx]` and need refactoring to accept a
+/// `&DeepseekV4LayerWeights` parameter so they can run against
+/// `weights.mtp_layer`. Filling in that refactor is M3-complete; it
+/// will land alongside validation against the new HFQ that contains
+/// the MTP layer.
+///
+/// Until then this function returns a clear error so callers can stub
+/// out the spec-decode path without false-positive bring-up.
+pub fn mtp_forward(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    h_n: &GpuTensor,
+    next_token: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    // ── 0. Validate MTP weights are present ────────────────────────────
+    let mtp = weights.mtp_layer.as_ref()
+        .ok_or_else(|| "mtp_forward: weights.mtp_layer is None — \
+            re-quantize V4F with --format v4f-q8-mtp to include the \
+            mtp.0.* tensors, then HIPFIRE_V4F_LOAD_MTP=1 at load time. \
+            Existing v4f.mq2lloyd-f16compress.hfq and antirezQ8.hfq were \
+            quantized without MTP and cannot run spec-decode.".to_string())?;
+    let mtp_enorm  = mtp.mtp_enorm.as_ref().ok_or("mtp_forward: mtp_enorm missing")?;
+    let mtp_hnorm  = mtp.mtp_hnorm.as_ref().ok_or("mtp_forward: mtp_hnorm missing")?;
+    let mtp_e_proj = mtp.mtp_e_proj.as_ref().ok_or("mtp_forward: mtp_e_proj missing")?;
+    let mtp_h_proj = mtp.mtp_h_proj.as_ref().ok_or("mtp_forward: mtp_h_proj missing")?;
+    let mtp_final  = mtp.mtp_final_norm.as_ref().ok_or("mtp_forward: mtp_final_norm missing")?;
+
+    // Defensive: step 4 below passes `dummy_rotated` aliasing the OTHER
+    // norm scratch (not a real FWHT rotation). That's safe for Q8_0 /
+    // F16 / F32 dtypes since gemv_auto reads only x_plain on those
+    // paths. For MQ4 (Raw dtype) gemv_auto reads x_rotated → we'd feed
+    // garbage and produce silent NaN cascades. Reject upfront with a
+    // clear message; if someone wants MQ4 MTP they need to plumb proper
+    // rotated buffers through step 4.
+    for (name, t) in [("mtp_e_proj", mtp_e_proj), ("mtp_h_proj", mtp_h_proj)] {
+        match t.dtype {
+            DType::F32 | DType::F16 | DType::Q8_0 => {}
+            other => return Err(format!(
+                "mtp_forward: {name} dtype {other:?} unsupported — step 4 \
+                 only plumbs plain input (no FWHT rotation). Add rotated \
+                 buffers or re-quant MTP at Q8F16 / F16.")),
+        }
+    }
+
+    if h_n.shape != [cfg.hidden_size] && h_n.shape != [1, cfg.hidden_size] {
+        return Err(format!(
+            "mtp_forward: h_n shape {:?} != [hidden_size={}]",
+            h_n.shape, cfg.hidden_size,
+        ));
+    }
+    if cfg.num_nextn_predict_layers == 0 {
+        return Err("mtp_forward: cfg.num_nextn_predict_layers == 0; MTP not enabled".to_string());
+    }
+
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    // MTP layer occupies the slot just past the main layers; resolve_layer
+    // routes the per-layer helpers below to `weights.mtp_layer`.
+    let mtp_layer_idx = cfg.num_hidden_layers;
+
+    // ── 1. Lazy state allocation ───────────────────────────────────────
+    if state.embed_scratch.is_none() {
+        state.embed_scratch = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc embed_scratch: {e:?}"))?);
+    }
+    if state.residual_streams.is_none() {
+        let t = gpu.zeros(&[hc_mult, hidden], DType::F32)
+            .map_err(|e| format!("alloc residual_streams: {e:?}"))?;
+        state.residual_streams = Some(t);
+    }
+    if state.tmp.is_none() {
+        state.tmp = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc tmp: {e:?}"))?);
+    }
+    if state.mtp_e_norm_scratch.is_none() {
+        state.mtp_e_norm_scratch = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc mtp_e_norm_scratch: {e:?}"))?);
+    }
+    if state.mtp_h_norm_scratch.is_none() {
+        state.mtp_h_norm_scratch = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc mtp_h_norm_scratch: {e:?}"))?);
+    }
+    if state.logits.is_none() {
+        state.logits = Some(gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
+            .map_err(|e| format!("alloc logits: {e:?}"))?);
+    }
+
+    let token_embd = weights.token_embd.as_ref()
+        .ok_or("mtp_forward: token_embd not uploaded")?;
+    let head = weights.head.as_ref()
+        .ok_or("mtp_forward: head not uploaded")?;
+
+    // ── 2. Embed next_token → embed_scratch [hidden] ───────────────────
+    {
+        let embed_scratch = state.embed_scratch.as_ref().unwrap();
+        gpu.embedding_lookup_q8(token_embd, embed_scratch, next_token, hidden)
+            .map_err(|e| format!("mtp embedding_lookup_q8: {e:?}"))?;
+    }
+
+    // ── 3. RMSNorm both inputs ─────────────────────────────────────────
+    // e_norm = mtp_enorm(embed)  → mtp_e_norm_scratch
+    // h_norm = mtp_hnorm(h_n)    → mtp_h_norm_scratch
+    {
+        let embed_scratch = state.embed_scratch.as_ref().unwrap();
+        let e_out = state.mtp_e_norm_scratch.as_ref().unwrap();
+        gpu.rmsnorm_f32(embed_scratch, mtp_enorm, e_out, cfg.rms_norm_eps)
+            .map_err(|e| format!("mtp rmsnorm_e: {e:?}"))?;
+    }
+    {
+        let h_out = state.mtp_h_norm_scratch.as_ref().unwrap();
+        gpu.rmsnorm_f32(h_n, mtp_hnorm, h_out, cfg.rms_norm_eps)
+            .map_err(|e| format!("mtp rmsnorm_h: {e:?}"))?;
+    }
+
+    // ── 4. x_in = mtp_e_proj @ e_norm + mtp_h_proj @ h_norm ────────────
+    // gemv_auto dispatches on the weight's GpuTensor.dtype:
+    //   - Q8F16 → gemv_q8_0   (plain input)         ← v4f-q8-mtp uses this
+    //   - F16   → gemm_f16_x_f16_wmma at B=1        (plain input)
+    //   - MQ4   → gemv_mq4g256_prerotated           (rotated input)
+    //
+    // For the MQ4 fallback path we'd need a FWHT-rotated copy of the norm
+    // outputs; in v4f-q8-mtp these matrices are Q8F16 so the `x_rotated`
+    // argument is unused. We pass `mtp_h_norm_scratch` itself as the dummy
+    // rotated alias — it's the right size and content doesn't matter for
+    // Q8/F16 paths.
+    {
+        let e_norm = state.mtp_e_norm_scratch.as_ref().unwrap();
+        let dummy_rotated = state.mtp_h_norm_scratch.as_ref().unwrap();
+        let tmp = state.tmp.as_ref().unwrap();
+        gemv_auto(gpu, mtp_e_proj, dummy_rotated, e_norm, tmp, hidden, hidden)?;
+    }
+    {
+        let h_norm = state.mtp_h_norm_scratch.as_ref().unwrap();
+        let dummy_rotated = state.mtp_e_norm_scratch.as_ref().unwrap();
+        let embed_scratch = state.embed_scratch.as_ref().unwrap();
+        // Reuse embed_scratch as the h_proj output buffer — its previous
+        // content (raw embed of next_token) is no longer needed.
+        gemv_auto(gpu, mtp_h_proj, dummy_rotated, h_norm, embed_scratch, hidden, hidden)?;
+        let tmp = state.tmp.as_ref().unwrap();
+        gpu.add_inplace_f32(tmp, embed_scratch)
+            .map_err(|e| format!("mtp x_in add: {e:?}"))?;
+    }
+
+    // ── 5. Broadcast x_in (now in state.tmp) to all hc_mult streams ────
+    // Matches `init_residual_streams`' HC init (per antirez ds4
+    // `hc_from_plain_embedding`): all streams start equal, not [x, 0,0,0].
+    {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let src = state.tmp.as_ref().unwrap();
+        let bytes = hidden * 4;
+        for h in 0..hc_mult {
+            let dst = streams.sub_offset(h * hidden, hidden);
+            gpu.memcpy_dtod_auto(&dst.buf, &src.buf, bytes)
+                .map_err(|e| format!("mtp d2d copy stream {h}: {e:?}"))?;
+        }
+    }
+
+    // ── 6. Standard layer block at layer_idx = num_hidden_layers ───────
+    // All per-layer helpers below call `weights.resolve_layer(layer_idx)`
+    // internally, which routes to `weights.mtp_layer`. The MTP layer has
+    // NO compressor/indexer (compress_ratio = 0 by construction), and is
+    // NOT a hash layer (mtp_layer_idx >= num_hash_layers), so we use the
+    // standard MoE router (`ffn_routed`) rather than `ffn_hash_routed`.
+    mhc_pre(cfg, weights, state, gpu, mtp_layer_idx, /*is_attn=*/true)?;
+    q_lora(cfg, weights, state, gpu, mtp_layer_idx)?;
+    kv_joint(cfg, weights, state, gpu, mtp_layer_idx)?;
+    apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
+    // (No compressor / indexer for MTP — compress_ratio == 0.)
+    attn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
+    mhc_pre(cfg, weights, state, gpu, mtp_layer_idx, /*is_attn=*/false)?;
+    ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
+    hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
+
+    // ── 7. Capture post-layer-block hidden h_{n+1} for chaining ────────
+    // Save stream 0 to `state.mtp_last_hidden` so that the next call to
+    // either `mtp_forward` (in a K-iter spec-decode loop) or a follow-up
+    // tool can pick up the propagated hidden without recomputing.
+    capture_mtp_hidden(cfg, state, gpu)?;
+
+    // ── 8. mtp_final_norm + shared lm_head → logits ────────────────────
+    // V3 paper §4: MTP outputs `h_{n+1}` as a single hidden vector
+    // (not a 4-stream HC reduction) through the *shared* lm_head. We
+    // take stream 0 as the canonical post-mHC hidden and apply
+    // `mtp_final_norm` directly (no head-HC mix on the MTP path).
+    //
+    // OPEN: confirm against antirez ds4 once the model runs — if antirez
+    // applies head-HC to MTP, switch to `final_norm_and_head` with a
+    // norm-weight parameter override.
+    {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let stream0 = streams.sub_offset(0, hidden);
+        let normed = state.mtp_e_norm_scratch.as_ref().unwrap();  // reuse
+        gpu.rmsnorm_f32(&stream0, mtp_final, normed, cfg.rms_norm_eps)
+            .map_err(|e| format!("mtp final rmsnorm: {e:?}"))?;
+
+        // lm_head GEMV. For MQ4-head builds we'd need rotated input; for
+        // v4f-q8-mtp the head is Q8F16 so the rotated alias is unused.
+        let rotated_alias = state.mtp_h_norm_scratch.as_ref().unwrap();
+        gpu.rotate_x_mq(normed, rotated_alias, hidden)
+            .map_err(|e| format!("mtp rotate final: {e:?}"))?;
+        let logits = state.logits.as_ref().unwrap();
+        gemv_auto(gpu, head, rotated_alias, normed, logits,
+            cfg.vocab_size, hidden)?;
+    }
+
+    // ── 9. Download logits ─────────────────────────────────────────────
+    let logits = state.logits.as_ref().unwrap();
+    let logits_host = gpu.download_f32(logits)
+        .map_err(|e| format!("mtp download logits: {e:?}"))?;
+    Ok(logits_host)
 }
 
 /// FFN block (partial — shared expert only; routed experts pending).
@@ -1167,7 +1419,7 @@ fn ffn_stub(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let ffn_norm  = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
@@ -1274,7 +1526,7 @@ fn ffn_routed(
         // selection possible. Shared expert alone for these layers.
         return Ok(());
     }
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none()
     {
         return Ok(());  // experts not uploaded; nothing to dispatch
@@ -1452,7 +1704,7 @@ fn ffn_hash_routed(
     if std::env::var("HIPFIRE_V4F_NO_HASH").ok().as_deref() == Some("1") {
         return Ok(());
     }
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none()
     {
         return Ok(());
@@ -1599,6 +1851,35 @@ fn hc_ffn_mix(
 ///   final = rmsnorm(y, output_norm)              # [hidden]
 ///   logits = head @ final                        # [vocab_size]
 ///
+/// Save stream 0 of `state.residual_streams` to `state.mtp_last_hidden`.
+///
+/// Captures the post-layer-block hidden state for downstream MTP
+/// speculative decoding (V3 paper §4 `h_n`). Both `decode_step` and
+/// `mtp_forward` call this just before applying their respective final
+/// RMSNorm + lm_head, so the caller of `speculative_decode_step` can
+/// always read `state.mtp_last_hidden` regardless of which function
+/// produced it.
+///
+/// Allocates the destination on first call. d2d copy of `hidden` F32
+/// floats — negligible cost relative to a layer block.
+fn capture_mtp_hidden(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+    if state.mtp_last_hidden.is_none() {
+        state.mtp_last_hidden = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+            .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?);
+    }
+    let streams = state.residual_streams.as_ref()
+        .ok_or_else(|| "capture_mtp_hidden: residual_streams missing".to_string())?;
+    let stream0 = streams.sub_offset(0, hidden);
+    let dst = state.mtp_last_hidden.as_ref().unwrap();
+    gpu.memcpy_dtod_auto(&dst.buf, &stream0.buf, hidden * 4)
+        .map_err(|e| format!("capture_mtp_hidden d2d: {e:?}"))
+}
+
 /// We were previously taking ONLY stream 0 for the head — discarding 75%
 /// of the model's output state. This wires the full HC mix.
 fn final_norm_and_head(
@@ -1730,7 +2011,7 @@ fn attn_stub(
     let q = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
     let attn_out_raw = state.attn_out_raw.as_ref().unwrap();
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let attn_sink = layer.attn_sink.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_sink not uploaded"))?;
 
@@ -1874,7 +2155,7 @@ fn attn_stub(
                 cfg.qk_rope_head_dim as i32, cfg.rope_theta,
             ).map_err(|e| format!("rope_tail_inverse (no-yarn) l{layer_idx}: {e:?}"))?;
         } else {
-            let layer = &weights.layers[layer_idx];
+            let layer = weights.resolve_layer(layer_idx);
             let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
                 layer_rope_params(cfg, layer.compress_ratio);
             gpu.rope_tail_yarn_interleaved(
@@ -2036,7 +2317,7 @@ fn moe_route(
     // tid2eid indices for hash layers, top-K for score layers). The split
     // was: score layers ALSO use gate.bias for bias-aware selection. So
     // gate.weight + sqrt_softplus is shared; gate.bias is optional.
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let gate_w = layer.gate_weight.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} gate.weight missing"))?;
     let _gate_b = layer.gate_bias.as_ref();  // None for hash layers; unused here
@@ -2055,16 +2336,23 @@ fn moe_route(
     let topk = state.topk_indices.as_ref().unwrap();
 
     // Upstream V4F gates on the POST-ffn_norm input (same x that
-    // shared/routed experts see). ffn_x_rot is already FWHT(ffn_norm
-    // (hc_x_in)) — the right tensor to feed the gate's MQ4 GEMV.
-    // Using raw hc_x_in (as we did before) caused scores to scale with
-    // stream magnitude, biasing expert selection.
+    // shared/routed experts see). ffn_x_rot is FWHT(ffn_norm(hc_x_in));
+    // ffn_x_plain is the un-rotated version. Both are populated in
+    // ffn_stub which runs before us.
+    //
+    // gemv_auto dispatches on the gate weight's dtype: MQ4 path consumes
+    // ffn_x_rot, Q8_0 / F16 paths consume ffn_x_plain. Switching from the
+    // hardcoded gemv_mq4g256_prerotated call lets the router work with
+    // any quant of `gate.weight` — needed by v4f-q8-mtp (Q8F16) and
+    // future formats. Using raw hc_x_in (as before ffn_stub landed)
+    // caused scores to scale with stream magnitude, biasing selection.
     let ffn_x_rot = state.ffn_x_rot.as_ref()
         .ok_or_else(|| "ffn_x_rot not allocated — moe_route must run after ffn_stub".to_string())?;
+    let ffn_x_plain = state.ffn_x_plain.as_ref()
+        .ok_or_else(|| "ffn_x_plain not allocated — moe_route must run after ffn_stub".to_string())?;
 
-    // logits = gate.weight @ ffn_x_rot
-    gpu.gemv_mq4g256_prerotated(gate_w, ffn_x_rot, scores, n_exp, cfg.hidden_size)
-        .map_err(|e| format!("gemv gate layer {layer_idx}: {e:?}"))?;
+    // logits = gate.weight @ x  (dispatch on gate.weight dtype)
+    gemv_auto(gpu, gate_w, ffn_x_rot, ffn_x_plain, scores, n_exp, cfg.hidden_size)?;
 
     // logits += gate.bias (bias is F16, scores is F32 — need a kernel
     // for f16-bias-add. Skip for now; bias is small magnitude).
@@ -2095,7 +2383,7 @@ fn mhc_pre(
     layer_idx: usize,
     is_attn: bool,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let (hc_fn, hc_base) = if is_attn {
         (layer.hc_attn_fn.as_ref().unwrap(),
          layer.hc_attn_base.as_ref().unwrap())
@@ -2322,7 +2610,7 @@ fn apply_tail_rope(
         return Ok(());
     }
 
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
 
@@ -2358,7 +2646,7 @@ fn kv_joint(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let wkv = layer.wkv.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
     let kv_norm = layer.kv_norm.as_ref()
@@ -2414,7 +2702,7 @@ fn q_lora(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let attn_norm = layer.attn_norm.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_norm missing"))?;
     let q_norm = layer.q_norm.as_ref()
@@ -2942,7 +3230,7 @@ fn attention_block_batched_swa_only(
     start_pos: u32,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let attn_sink = layer.attn_sink.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_sink missing"))?;
     let wo_a = layer.wo_a.as_ref()
@@ -3192,7 +3480,7 @@ fn attention_block_batched_mixed(
     start_pos: u32,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let ratio = layer.compress_ratio as usize;
     assert!(ratio > 0, "attention_block_batched_mixed called on dense layer");
 
@@ -3720,7 +4008,7 @@ fn ffn_batched(
     batch_size: usize,
     tokens: &[u32],
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let ffn_norm  = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
@@ -3987,6 +4275,55 @@ fn final_norm_and_head_last_batched(
         .map_err(|e| format!("download logits: {e:?}"))
 }
 
+/// Run final_norm + head on EVERY position of the batched chunk.
+///
+/// `final_norm_and_head_last_batched` only produces logits for the last
+/// position (the only position whose token is sampled in normal prefill).
+/// Speculative-decode verification needs per-position logits so each
+/// draft can be compared against the verifier's preferred token —
+/// that's what this helper provides.
+///
+/// Cost: K invocations of the per-position final_norm_and_head pipeline
+/// (head HC + RMSNorm + rotate + lm_head GEMV + d2h). The lm_head is
+/// [vocab=129280, hidden=4096]; per-position it's well under 5 ms on
+/// gfx1151, so K=8 takes <40 ms. Acceptable for spec-decode windows.
+///
+/// Returns Vec<Vec<f32>> of length `batch_size`, each inner Vec sized
+/// `vocab_size`.
+pub fn final_norm_and_head_all_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    if batch_size == 0 {
+        return Err("final_norm_and_head_all_batched: empty batch".to_string());
+    }
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+    let orig = state.residual_streams.take();
+    let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+    let result: Result<(), String> = (|| {
+        for i in 0..batch_size {
+            let off = i * stream_len;
+            let streams_i = pbs.streams_batch.sub_offset(off, stream_len);
+            state.residual_streams = Some(streams_i);
+            final_norm_and_head(cfg, weights, state, gpu)?;
+            let logits_tensor = state.logits.as_ref()
+                .ok_or_else(|| "logits not allocated".to_string())?;
+            let logits_host = gpu.download_f32(logits_tensor)
+                .map_err(|e| format!("download logits @pos {i}: {e:?}"))?;
+            all_logits.push(logits_host);
+        }
+        Ok(())
+    })();
+    // Restore original residual_streams regardless of success / failure.
+    state.residual_streams = orig;
+    result?;
+    Ok(all_logits)
+}
+
 /// Batched twin of `hc_ffn_mix`. Same shape as `hc_attn_mix_batched`
 /// but mixes the FFN-side post/comb (produced by the second
 /// mhc_pre_batched call with is_attn=false) and the FFN's transform
@@ -4034,7 +4371,7 @@ fn mhc_pre_batched(
     is_attn: bool,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let (hc_fn, hc_base, hc_scale) = if is_attn {
         (
             layer.hc_attn_fn.as_ref().unwrap(),
@@ -4119,7 +4456,7 @@ fn apply_tail_rope_batched(
         return Ok(());
     }
 
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
 
@@ -4154,7 +4491,7 @@ fn kv_joint_batched(
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let wkv = layer.wkv.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
     let kv_norm = layer.kv_norm.as_ref()
@@ -4203,7 +4540,7 @@ fn q_lora_batched(
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    let layer = &weights.layers[layer_idx];
+    let layer = weights.resolve_layer(layer_idx);
     let attn_norm = layer.attn_norm.as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_norm missing"))?;
     let q_norm = layer.q_norm.as_ref()
@@ -4422,7 +4759,7 @@ pub fn forward_prefill_batch_chunk(
 
         // ── Attention block: pure-SWA for compress_ratio==0, mixed
         //    (SWA + indexer/identity topk) for compress_ratio>0.
-        let layer = &weights.layers[layer_idx];
+        let layer = weights.resolve_layer(layer_idx);
         if layer.compress_ratio == 0 {
             attention_block_batched_swa_only(
                 cfg, weights, state, pbs, gpu, layer_idx, start_pos, n,

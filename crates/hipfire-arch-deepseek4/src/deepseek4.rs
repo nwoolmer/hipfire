@@ -396,6 +396,38 @@ pub struct DeepseekV4Weights {
     pub _scaffold: (),
 }
 
+impl DeepseekV4Weights {
+    /// Look up the layer-shaped weight bundle by index. Resolves to
+    /// `layers[idx]` for the main `0..num_hidden_layers` range and to
+    /// `mtp_layer` for `idx == layers.len()`. Used by the per-layer
+    /// helpers so they can run against either a normal layer or the
+    /// MTP head with no signature change.
+    ///
+    /// Panics if `idx == layers.len()` but `mtp_layer.is_none()`, or
+    /// if `idx > layers.len()`.
+    pub fn resolve_layer(&self, idx: usize) -> &DeepseekV4LayerWeights {
+        if idx < self.layers.len() {
+            &self.layers[idx]
+        } else if idx == self.layers.len() {
+            self.mtp_layer.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "DeepseekV4Weights::resolve_layer({idx}) — \
+                     idx points at the MTP slot but mtp_layer is None. \
+                     Either set HIPFIRE_V4F_LOAD_MTP=1 and use a model \
+                     quantized with MTP, or stop calling mtp_forward."
+                )
+            })
+        } else {
+            panic!(
+                "DeepseekV4Weights::resolve_layer({idx}) out of range \
+                 (have {} main layers + {} MTP)",
+                self.layers.len(),
+                self.mtp_layer.is_some() as usize,
+            );
+        }
+    }
+}
+
 /// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).
 ///
 /// Active only on layers with `compress_ratios[l] > 0`. Each layer
@@ -511,6 +543,28 @@ pub struct DeepseekV4State {
     /// `gemv_f32` expects un-rotated input. Computed once per layer in
     /// `q_lora` alongside `tmp`.
     pub tmp_plain: Option<rdna_compute::GpuTensor>,
+
+    /// MTP pre-block scratch — RMSNorm output of the embed input
+    /// `[hidden]` F32. Holds `mtp_enorm(embed_lookup(next_token))`
+    /// across the two-GEMV `mtp_e_proj @ ... + mtp_h_proj @ ...` fusion.
+    /// Only allocated when `mtp_forward` is called.
+    pub mtp_e_norm_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// MTP pre-block scratch — RMSNorm output of the hidden input
+    /// `[hidden]` F32. Holds `mtp_hnorm(h_n)`. Same lazy-allocation
+    /// pattern as `mtp_e_norm_scratch`.
+    pub mtp_h_norm_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// Post-layer-block hidden state `[hidden]` F32 from the most-recent
+    /// `decode_step` or `mtp_forward` call. This is stream 0 of the
+    /// residual streams AFTER the standard layer block (and HC mixes)
+    /// but BEFORE the final RMSNorm + lm_head. V3 paper §4 calls this
+    /// `h_n` (post-decode-step) / `h_{n+k}` (post-mtp-forward step k);
+    /// it's the input the MTP block's `h_proj` reads from. Populated by
+    /// both code paths so `speculative_decode_step` can chain K
+    /// iterations without the caller having to track which function
+    /// produced the hidden.
+    pub mtp_last_hidden: Option<rdna_compute::GpuTensor>,
 
     /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
     /// `wq_a @ x`, input to `wq_b`. Reused across layers.
@@ -670,6 +724,9 @@ impl DeepseekV4State {
             embed_scratch: None,
             tmp: None,
             tmp_plain: None,
+            mtp_e_norm_scratch: None,
+            mtp_h_norm_scratch: None,
+            mtp_last_hidden: None,
             q_lat: None,
             q_lat_rot: None,
             q: None,
