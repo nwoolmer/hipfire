@@ -641,23 +641,32 @@ pub struct DeepseekV4State {
     /// `hipMalloc not permitted under stream capture` and fail.
     pub ar_forward_warmed_up: bool,
 
-    /// Six-slot device buffer for SWA attention runtime state:
-    ///   [0] slot              = state.n_tokens % sliding_window
-    ///   [1] n_valid_swa       = min(state.n_tokens + 1, sliding_window)
-    ///   [2] n_compressed_4    = (state.n_tokens + 1) / 4      (ratio=4 layers)
-    ///   [3] n_compressed_128  = (state.n_tokens + 1) / 128    (ratio=128 layers)
+    /// Ten-slot device buffer for SWA + compressor runtime state.
+    /// Layout (all i32 stored as F32 bits):
+    ///   [0] swa_slot          = pos % sliding_window
+    ///   [1] n_valid_swa       = min(pos + 1, sliding_window)
+    ///   [2] n_compressed_4    = (pos + 1) / 4    (ratio=4 layers)
+    ///   [3] n_compressed_128  = (pos + 1) / 128  (ratio=128 layers)
     ///   [4] k_active_4        = min(index_topk, n_compressed_4)
     ///   [5] k_active_128      = min(topk_window, n_compressed_128)
-    /// All values derived from `state.n_tokens` at decode_step entry; the
-    /// `_buf` variants of SWA / topk-gather / topk-attention kernels read
-    /// the relevant slots so captured HIP graphs pick up new positions on
-    /// each replay without re-capture.
+    ///   [6] ring_slot_4       = ring write slot for ratio=4 state
+    ///                            buffer (overlap path: 4 + pos%4)
+    ///   [7] commit_slot_4     = pos/4 if (pos+1)%4 == 0 else -1
+    ///   [8] ring_slot_128     = pos % 128 (ratio=128 state ring slot)
+    ///   [9] commit_slot_128   = pos/128 if (pos+1)%128 == 0 else -1
+    ///
+    /// All values derived from `state.n_tokens` at decode_step entry.
+    /// The `_buf` variants of SWA / topk-gather / topk-attention /
+    /// compressor kernels read the relevant slots so captured HIP graphs
+    /// pick up new positions on each replay without re-capture. Slots
+    /// 7 and 9 store -1 (sentinel) on non-commit positions so the
+    /// commit kernels can early-return without writing.
     pub attn_state_buf: Option<rdna_compute::GpuTensor>,
     /// Stable-pointer host source for `attn_state_buf`. Same rationale
     /// as `pos_array_host`: captured memcpy nodes re-read this pointer
     /// on each graph replay and find the values written for the current
     /// position.
-    pub attn_state_host: Option<Box<[i32; 6]>>,
+    pub attn_state_host: Option<Box<[i32; 10]>>,
 
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced

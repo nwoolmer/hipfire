@@ -20191,6 +20191,53 @@ impl Gpu {
     /// V4F Compressor softmax-weighted pool. Compresses `T` window
     /// positions of (kv_state, score_state) into one `head_dim` output:
     ///   output[d] = sum_t softmax_t(score_state[:, d])[t] * kv_state[t, d]
+    /// HIP-graphs-safe twin of `compressor_softmax_pool_f32`: reads the
+    /// destination slot index from `slot_buf` (sentinel: -1 → no-op).
+    /// Writes to `kv_cache + slot * head_dim`. Captured graphs include
+    /// the commit kernel at every replay; the host sets slot to -1 on
+    /// non-commit positions so the kernel is a no-op there.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn compressor_softmax_pool_f32_buf(
+        &mut self,
+        kv_state: &GpuTensor,
+        score_state: &GpuTensor,
+        kv_cache: &GpuTensor,   // base ptr [max_slots, head_dim]
+        slot_buf: &GpuTensor,
+        t: i32,
+        head_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("compressor_softmax_pool_f32_buf",
+            kernels::COMPRESSOR_SOFTMAX_POOL_BUF_SRC,
+            "compressor_softmax_pool_f32_buf")?;
+        let kp = kv_state.buf.as_ptr();
+        let sp = score_state.buf.as_ptr();
+        let cp = kv_cache.buf.as_ptr();
+        let sb = slot_buf.buf.as_ptr();
+        let mut tv = t;
+        let mut hd = head_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &mut tv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((head_dim as u32) + block - 1) / block;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(kp); b.push_ptr(sp); b.push_ptr(cp); b.push_ptr(sb);
+            b.push_i32(tv); b.push_i32(hd);
+            b
+        };
+        self.launch_maybe_blob(
+            "compressor_softmax_pool_f32_buf",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
     pub fn compressor_softmax_pool_f32(
         &mut self,
         kv_state: &GpuTensor,     // [T, head_dim] F32

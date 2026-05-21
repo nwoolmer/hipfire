@@ -1283,24 +1283,24 @@ pub(crate) fn precompute_attn_state(
 ) -> Result<(), String> {
     if state.attn_state_buf.is_none() {
         state.attn_state_buf = Some(
-            gpu.alloc_tensor(&[6], DType::F32)
+            gpu.alloc_tensor(&[10], DType::F32)
                 .map_err(|e| format!("alloc attn_state_buf: {e:?}"))?,
         );
     }
     if state.attn_state_host.is_none() {
-        state.attn_state_host = Some(Box::new([0i32; 6]));
+        state.attn_state_host = Some(Box::new([0i32; 10]));
     }
     fill_attn_state_host(cfg, state, state.n_tokens as u32);
     let host = state.attn_state_host.as_ref().unwrap();
     let dev = state.attn_state_buf.as_ref().unwrap();
     let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, 6 * 4)
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, 10 * 4)
     };
     gpu.memcpy_htod_auto(&dev.buf, bytes)
         .map_err(|e| format!("htod attn_state: {e:?}"))
 }
 
-/// Internal helper: fill `state.attn_state_host[0..6]` from `position`
+/// Internal helper: fill `state.attn_state_host[0..10]` from `position`
 /// using V4F's compress-ratio + index_topk constants. Used by both
 /// `precompute_attn_state` (decode entry) and `update_attn_state_host`
 /// (graph replay path).
@@ -1308,20 +1308,33 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     let win = cfg.sliding_window as i32;
     let topk = cfg.index_topk as i32;       // V4F: 512
     let pos = position as i32;
-    let slot = pos % win;
+    let swa_slot = pos % win;
     let n_valid_swa = (pos + 1).min(win);
     let n_compressed_4 = (pos + 1) / 4;
     let n_compressed_128 = (pos + 1) / 128;
     let k_active_4 = topk.min(n_compressed_4);
     let k_active_128 = topk.min(n_compressed_128);
+    // Compressor ring/commit slots. For overlap=true (ratio=4 in V4F),
+    // the state ring is sized [2*ratio, proj_dim] and writes go to the
+    // second half: `ring + ratio + (pos % ratio)`. Commit slot is
+    // pos/ratio at commit positions, -1 otherwise (commit kernels
+    // early-return on -1).
+    let ring_slot_4 = 4 + (pos % 4);
+    let commit_slot_4 = if (pos + 1) % 4 == 0 { pos / 4 } else { -1 };
+    let ring_slot_128 = pos % 128;       // overlap=false (ratio=128)
+    let commit_slot_128 = if (pos + 1) % 128 == 0 { pos / 128 } else { -1 };
     let host = state.attn_state_host.as_mut()
         .expect("fill_attn_state_host: attn_state_host not initialised");
-    host[0] = slot;
+    host[0] = swa_slot;
     host[1] = n_valid_swa;
     host[2] = n_compressed_4;
     host[3] = n_compressed_128;
     host[4] = k_active_4;
     host[5] = k_active_128;
+    host[6] = ring_slot_4;
+    host[7] = commit_slot_4;
+    host[8] = ring_slot_128;
+    host[9] = commit_slot_128;
 }
 
 /// Update host-only `attn_state_host[]` (no device copy). Used by the

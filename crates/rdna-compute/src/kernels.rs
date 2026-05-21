@@ -1620,6 +1620,13 @@ pub const V4F_ATTN_SWA_BUF_SRC: &str =
 pub const HC_PRE_POST_SIGMOID_SCALE_SRC: &str =
     include_str!("../../../kernels/src/hc_pre_post_sigmoid_scale.hip");
 
+/// HIP-graphs-safe twin of compressor_softmax_pool_f32: reads
+/// destination slot from a device buffer; early-returns on slot < 0
+/// (so captured graph can include the commit kernels at every replay
+/// while host gates on `commit_slot >= 0` only at actual commit positions).
+pub const COMPRESSOR_SOFTMAX_POOL_BUF_SRC: &str =
+    include_str!("../../../kernels/src/compressor_softmax_pool_buf.hip");
+
 /// HIP-graphs-safe twin of `v4f_attn_swa_topk_f32`: reads `n_valid_swa`
 /// + `n_active_topk` from device buffers.
 pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
