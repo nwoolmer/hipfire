@@ -1,8 +1,23 @@
 // HIP-graphs-safe twin of indexer_top_k.
 // Reads `n_compressed` (= N) and `k` from device buffers instead of
-// i32 kernargs. Body math byte-identical to indexer_top_k for the
-// in-range portion; out-of-range top_indices entries are set to -1
-// sentinel so downstream gather kernels skip them.
+// i32 kernargs.
+//
+// Fast path: when n_compressed <= max_k (the common case until the
+// cache fills at ratio=4 layers, i.e. for positions <= 8K) the
+// selection is "use all of them" — every compressed slot lands in the
+// top-K. The downstream gather + softmax-attention are order-
+// invariant w.r.t. the topk_idx ordering, so we can write the slots
+// in IDENTITY order (0, 1, …, n_compressed-1, sentinel-padded) and
+// skip the O(N^2) selection sort entirely. Parallelised across the
+// whole block.
+//
+// Slow path: when n_compressed > max_k (positions > 8K with V4F
+// defaults), single-thread selection sort still runs. Worth porting
+// to a parallel top-K when long-context perf matters.
+//
+// Body math is byte-equivalent to indexer_top_k on the fast path
+// (same SET of selected indices, just different ORDER — downstream
+// kernels treat the K-axis as a bag).
 
 #include <hip/hip_runtime.h>
 #include <limits.h>
@@ -18,10 +33,23 @@ extern "C" __global__ void indexer_top_k_buf(
 ) {
     const int head = blockIdx.x;
     if (head >= n_idx_heads) return;
-    if (threadIdx.x != 0) return;
 
     const int n_compressed = n_compressed_buf[0];
     const int k = k_buf[0];
+
+    // Fast path: n_compressed <= max_k → top-K is the full set. Each
+    // thread writes its own slot of the output (identity for the first
+    // n_compressed entries, -1 sentinel for the rest up to max_k).
+    if (n_compressed <= max_k) {
+        for (int i = threadIdx.x; i < max_k; i += blockDim.x) {
+            top_indices[head * max_k + i] = (i < n_compressed) ? i : -1;
+        }
+        return;
+    }
+
+    // Slow path: actual selection. Single-thread per block, O(N*K)
+    // selection sort with a "taken" bitmap in shared memory.
+    if (threadIdx.x != 0) return;
 
     extern __shared__ unsigned char taken_smem[];
     char* taken = (char*)taken_smem;
@@ -29,7 +57,6 @@ extern "C" __global__ void indexer_top_k_buf(
 
     for (int rank = 0; rank < max_k; ++rank) {
         if (rank >= k) {
-            // Beyond the active K → sentinel.
             top_indices[head * max_k + rank] = -1;
             continue;
         }

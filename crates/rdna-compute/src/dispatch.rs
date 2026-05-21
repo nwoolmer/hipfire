@@ -22957,9 +22957,14 @@ impl Gpu {
             b.push_i32(h); b.push_i32(mk);
             b
         };
+        // Block sized to parallelise the fast-path identity write of
+        // up to max_k indices across threads (each thread writes
+        // multiple slots via stride). The slow-path selection-sort
+        // still serialises on thread 0 only — the extra threads
+        // early-return in that branch.
         self.launch_maybe_blob(
             "indexer_top_k_buf",
-            [n_idx_heads as u32, 1, 1], [1, 1, 1], smem,
+            [n_idx_heads as u32, 1, 1], [128, 1, 1], smem,
             &mut params, blob_builder,
         )
     }
