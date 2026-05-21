@@ -22,6 +22,86 @@
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// OnceLock-cached env-var lookups for the V4F decode hot path. Each
+/// `std::env::var` is a syscall (~1μs) — at 43 layers × ~5 lookups per
+/// layer in the un-cached code that was ~200μs/token of pure syscall
+/// overhead. Each helper reads the env once and atomic-loads thereafter.
+mod env_cache {
+    use std::sync::OnceLock;
+
+    fn flag_one(name: &'static str) -> bool {
+        std::env::var(name).ok().as_deref() == Some("1")
+    }
+    fn flag_not_one(name: &'static str) -> bool {
+        std::env::var(name).ok().as_deref() != Some("1")
+    }
+
+    /// `HIPFIRE_V4F_MOE` — must be "1" for ffn_routed to actually dispatch.
+    pub(super) fn moe_on() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_MOE"))
+    }
+    /// `HIPFIRE_V4F_NO_MAIN_ROPE` — when set, skips the main-compressor YaRN RoPE.
+    pub(super) fn no_main_rope() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_MAIN_ROPE"))
+    }
+    /// `HIPFIRE_V4F_NO_YARN` — when set, reverts to single-theta RoPE.
+    pub(super) fn no_yarn() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_YARN"))
+    }
+    /// `HIPFIRE_V4F_NO_COMPRESSOR` — diagnostic: skip compressor + indexer.
+    pub(super) fn no_compressor() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_COMPRESSOR"))
+    }
+    /// True unless `HIPFIRE_V4F_NO_FUSED_MOE=1`. Default-on use of the
+    /// fused MoE down+residual indexed kernel (vs the legacy per-expert
+    /// k=0..6 × 3 GEMV loop).
+    pub(super) fn fused_moe_on() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_not_one("HIPFIRE_V4F_NO_FUSED_MOE"))
+    }
+    /// `HIPFIRE_V4F_SKIP_FFN` — diagnostic: zero ffn_out to isolate attn growth.
+    pub(super) fn skip_ffn() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_SKIP_FFN"))
+    }
+    /// `HIPFIRE_V4F_CPU_TOPK` — fallback CPU top-k for MoE routing.
+    pub(super) fn cpu_topk() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_CPU_TOPK"))
+    }
+    /// `HIPFIRE_V4F_MAX_COMPRESS_POS` — cap on the compressed-KV scan length.
+    pub(super) fn max_compress_pos() -> usize {
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(2048)
+        })
+    }
+    /// `HIPFIRE_V4F_FORWARD_LAYER_END` — early-stop the decode layer loop.
+    pub(super) fn forward_layer_end() -> Option<usize> {
+        static V: OnceLock<Option<usize>> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
+                .ok().and_then(|s| s.parse().ok())
+        })
+    }
+    /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
+    pub(super) fn bisect_break() -> Option<&'static str> {
+        static V: OnceLock<Option<String>> = OnceLock::new();
+        let opt = V.get_or_init(|| std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok());
+        // SAFETY: the String inside the OnceLock outlives the process.
+        // We return its &str view as 'static for ergonomic comparison.
+        opt.as_deref().map(|s| {
+            let leaked: &'static str = unsafe { std::mem::transmute(s) };
+            leaked
+        })
+    }
+}
+
 /// V4F GEMV dispatch: switch kernel based on weight dtype.
 ///
 /// - `DType::MQ4G256` (default V4F non-expert quant): consume FWHT-rotated
@@ -581,7 +661,7 @@ fn compressor_forward_impl(
             cfg.qk_rope_head_dim as i32,
             cfg.compress_rope_theta,
         ).map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
-    } else if std::env::var("HIPFIRE_V4F_NO_MAIN_ROPE").ok().as_deref() != Some("1") {
+    } else if !env_cache::no_main_rope() {
         // YaRN-aware tail RoPE on main compressor (single-tensor via
         // n_heads_q=1, n_heads_k=0) — matches Q's apply_tail_rope.
         let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
@@ -1188,8 +1268,11 @@ pub fn decode_step_body(
     // Optional early-stop for bisection: env HIPFIRE_V4F_FORWARD_LAYER_END=N
     // halts after layer N-1 (exclusive bound) — leaves residual_streams in
     // their just-after-layer-(N-1) state for cross-path comparison.
-    let layer_end: usize = std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(cfg.num_hidden_layers);
+    let layer_end: usize = env_cache::forward_layer_end()
+        .unwrap_or(cfg.num_hidden_layers);
+    let bisect_break = env_cache::bisect_break();
+    let no_compressor = env_cache::no_compressor();
+    let skip_ffn = env_cache::skip_ffn();
 
     // 2. Per-layer forward.
     for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
@@ -1246,9 +1329,7 @@ pub fn decode_step_body(
         // compressor unconditionally for compressed layers and the
         // indexer for ratio==4 layers (ds4.c:7505-7555).
         // Env opt-out: HIPFIRE_V4F_NO_COMPRESSOR=1 for diagnosis.
-        if layer.compress_ratio > 0
-            && std::env::var("HIPFIRE_V4F_NO_COMPRESSOR").ok().as_deref() != Some("1")
-        {
+        if layer.compress_ratio > 0 && !no_compressor {
             let tmp_view = {
                 let t = state.tmp.as_ref().unwrap();
                 t.sub_offset(0, t.numel())
@@ -1271,8 +1352,7 @@ pub fn decode_step_body(
         // applied, FFN side not yet). Useful for isolating divergence in the
         // FFN-side stages from divergence in the attention-side stages.
         if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
-                == Some("after_attn_mix")
+            && bisect_break == Some("after_attn_mix")
         {
             return Ok(Vec::new());
         }
@@ -1280,12 +1360,11 @@ pub fn decode_step_body(
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
         if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
-                == Some("after_mhc_pre_ffn")
+            && bisect_break == Some("after_mhc_pre_ffn")
         {
             return Ok(Vec::new());
         }
-        if std::env::var("HIPFIRE_V4F_SKIP_FFN").ok().as_deref() != Some("1") {
+        if !skip_ffn {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
             if layer_idx < cfg.num_hash_layers {
                 ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id)?;
@@ -1739,7 +1818,7 @@ fn ffn_routed(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    if std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() != Some("1") {
+    if !env_cache::moe_on() {
         return Ok(());
     }
     if layer_idx < cfg.num_hash_layers {
@@ -1766,10 +1845,14 @@ fn ffn_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
-    let cpu_topk = std::env::var("HIPFIRE_V4F_CPU_TOPK")
-        .ok().as_deref() == Some("1");
+    // Route-scale: rarely-overridden; one-shot env read at first call.
+    use std::sync::OnceLock;
+    static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
+    let route_scale_override: f32 = *ROUTE_SCALE.get_or_init(|| {
+        std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2)
+    });
+    let cpu_topk = env_cache::cpu_topk();
 
     // Legacy CPU top-K (kept for parity testing under HIPFIRE_V4F_CPU_TOPK=1).
     let (topk_ids, wts): (Vec<u32>, Vec<f32>) = if cpu_topk {
@@ -1785,7 +1868,7 @@ fn ffn_routed(
         (Vec::new(), Vec::new())
     };
 
-    if std::env::var("HIPFIRE_V4F_NO_FUSED_MOE").ok().as_deref() != Some("1")
+    if env_cache::fused_moe_on()
         && layer.expert_gate_up_blob.is_some()
     {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
@@ -1911,7 +1994,7 @@ fn ffn_hash_routed(
     layer_idx: usize,
     token_id: u32,
 ) -> Result<(), String> {
-    if std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() != Some("1") {
+    if !env_cache::moe_on() {
         return Ok(());
     }
     // Bisection knob: disable hash routing on layers 0..num_hash_layers.
@@ -2398,7 +2481,7 @@ fn attn_stub(
     let pos_buf = state.pos_buf.as_ref()
         .ok_or_else(|| "pos_buf not allocated".to_string())?;
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+        if env_cache::no_yarn() {
             gpu.rope_tail_inverse(attn_out_raw, pos_buf,
                 n_heads as i32, head_dim as i32,
                 cfg.qk_rope_head_dim as i32, cfg.rope_theta,
@@ -2847,7 +2930,7 @@ fn apply_tail_rope(
     // Pre-YaRN escape hatch: HIPFIRE_V4F_NO_YARN=1 reverts to the old
     // single-theta path (rope_theta=10000 everywhere) for direct A/B
     // comparison with prior tuning data.
-    if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+    if env_cache::no_yarn() {
         gpu.rope_tail_interleaved(
             q, kv, pos_buf,
             cfg.num_attention_heads as i32,
@@ -3641,7 +3724,7 @@ fn attention_block_batched_swa_only(
 
     // 5. Inverse tail RoPE on attn_out_raw_batch.
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+        if env_cache::no_yarn() {
             gpu.rope_tail_inverse_batched(
                 &pbs.attn_out_raw_batch, &pbs.positions,
                 n_heads as i32, head_dim as i32,
@@ -4210,7 +4293,7 @@ fn attention_block_batched_mixed(
 
     // 5. Inverse RoPE.
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+        if env_cache::no_yarn() {
             gpu.rope_tail_inverse_batched(
                 &pbs.attn_out_raw_batch, &pbs.positions,
                 n_heads as i32, head_dim as i32,
@@ -4788,7 +4871,7 @@ fn apply_tail_rope_batched(
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    if std::env::var("HIPFIRE_V4F_NO_YARN").ok().as_deref() == Some("1") {
+    if env_cache::no_yarn() {
         gpu.rope_tail_interleaved_batched(
             &pbs.q_batch, &pbs.kv_batch, &pbs.positions,
             cfg.num_attention_heads as i32,
