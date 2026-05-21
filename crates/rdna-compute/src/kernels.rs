@@ -1873,6 +1873,14 @@ pub const GEMM_F16_X_F16_WMMA_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_ZA4_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_za4.hip");
 
+/// WMMA MQ2-Lloyd-G256 weight × F16 input → F32 output GEMM with (B, M)
+/// output layout. Smoke / proof-of-concept for the MQ2 WMMA path —
+/// MoE-routed MQ2-Lloyd is the dominant V4F prefill kernel (54.1% of GPU
+/// time post-Option-B) and currently has no WMMA variant. Targets
+/// gfx1100+ wave32 WMMA.
+pub const GEMM_MQ2G256_LLOYD_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_wmma.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations.
 pub const CONVERT_F32_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/convert_f32_to_f16.hip");
