@@ -18,7 +18,7 @@
 //!   HIPFIRE_V4F_SEED=N         PRNG seed (default: time-based)
 
 use hipfire_arch_deepseek4::{
-    forward::{decode_step_with_graph, forward_prefill_batch_chunked, PrefillBatchScratch},
+    forward::{decode_step, forward_prefill_batch_chunked, PrefillBatchScratch},
     DeepseekV4, DeepseekV4State,
 };
 use hipfire_runtime::arch::Architecture;
@@ -196,7 +196,7 @@ fn main() -> Result<(), String> {
         for _ in 0..max_gen {
             if !raw_mode && tok == eos_tok { break; }
             generated.push(tok);
-            let logits = decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, tok, pos)?;
+            let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos)?;
             pos += 1;
             tok = sample_token(&logits, temp, top_k, &mut rng);
         }

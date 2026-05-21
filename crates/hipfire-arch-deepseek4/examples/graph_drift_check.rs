@@ -29,9 +29,20 @@ fn run(use_graph: bool, n_steps: usize, model_path: &str) -> Result<Vec<usize>, 
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let mut state = DeepseekV4State::new(&cfg)?;
 
+    // Use a varied prompt sequence so positions feed DIFFERENT tokens
+    // (not a self-loop). Catches graph-capture bugs where state-dependent
+    // kernel args (e.g. SWA slot from state.n_tokens) get baked at
+    // capture time.
+    let prompt: Vec<u32> = (0..32u32).map(|i| (100 + i * 37) % 100_000).collect();
+
     let mut out = Vec::with_capacity(n_steps);
-    let mut tok: u32 = 100;
     for i in 0..n_steps {
+        // Use prompt token at position i if within prompt; else argmax-feedback.
+        let tok = if i < prompt.len() {
+            prompt[i]
+        } else {
+            *out.last().unwrap() as u32
+        };
         let logits = if use_graph {
             decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, tok, i as u32)?
         } else {
@@ -39,7 +50,6 @@ fn run(use_graph: bool, n_steps: usize, model_path: &str) -> Result<Vec<usize>, 
         };
         let am = argmax(&logits);
         out.push(am);
-        tok = am as u32;
     }
     Ok(out)
 }
@@ -51,12 +61,42 @@ fn main() -> Result<(), String> {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
     eprintln!("Comparing direct vs graph over {n} steps on {path}...");
 
-    eprintln!("=== Direct path ===");
-    let direct = run(false, n, &path)?;
+    // The graph path's HIPFIRE_V4F_GRAPH env is OnceLock-cached at first
+    // read. Single-process A/B doesn't work — re-spawn this binary in a
+    // child process for each side, controlling via the env var.
+    if std::env::var("DRIFT_RUN").is_ok() {
+        let force_graph = std::env::var("DRIFT_RUN").ok().as_deref() == Some("graph");
+        std::env::set_var("HIPFIRE_V4F_GRAPH", if force_graph { "1" } else { "0" });
+        let out = run(force_graph, n, &path)?;
+        // Emit as a single line for the parent to parse.
+        println!("DRIFT_OUT:{}", out.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let spawn = |label: &str| -> Result<Vec<usize>, String> {
+        let out = std::process::Command::new(&exe)
+            .env("DRIFT_RUN", label)
+            .env("HIPFIRE_V4F_MODEL", &path)
+            .env("N_STEPS", n.to_string())
+            .output()
+            .map_err(|e| format!("spawn {label}: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("DRIFT_OUT:") {
+                return Ok(rest.split(',').filter_map(|s| s.parse().ok()).collect());
+            }
+        }
+        Err(format!("child {label}: no DRIFT_OUT line"))
+    };
+
+    eprintln!("=== Direct path (subprocess HIPFIRE_V4F_GRAPH=0) ===");
+    let direct = spawn("direct")?;
     eprintln!("Done: {direct:?}");
 
-    eprintln!("\n=== Graph path ===");
-    let graphed = run(true, n, &path)?;
+    eprintln!("\n=== Graph path (subprocess HIPFIRE_V4F_GRAPH=1) ===");
+    let graphed = spawn("graph")?;
     eprintln!("Done: {graphed:?}");
 
     eprintln!("\n=== Comparison ===");
