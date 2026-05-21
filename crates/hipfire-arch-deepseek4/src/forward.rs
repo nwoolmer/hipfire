@@ -3005,17 +3005,18 @@ fn moe_route(
     let _gate_b = layer.gate_bias.as_ref();  // None for hash layers; unused here
 
     let n_exp = cfg.n_routed_experts;
-    let k = cfg.num_experts_per_tok;
     if state.router_scores.is_none() {
         state.router_scores = Some(gpu.alloc_tensor(&[n_exp], DType::F32)
             .map_err(|e| format!("alloc router_scores: {e:?}"))?);
     }
-    if state.topk_indices.is_none() {
-        state.topk_indices = Some(gpu.alloc_tensor(&[k], DType::F32)
-            .map_err(|e| format!("alloc topk_indices: {e:?}"))?);
-    }
     let scores = state.router_scores.as_ref().unwrap();
-    let topk = state.topk_indices.as_ref().unwrap();
+    // Note: this function used to also write `state.topk_indices` via a
+    // single-threaded selection-sort kernel. That output was never read
+    // (the GPU bias-aware top-K in `ffn_routed` overwrites the real
+    // expert indices into `state.moe_topk_indices`), so the call has
+    // been removed — pure wasted work. The `topk_indices` allocation is
+    // kept lazily-None for backward compat with any external readers.
+    let _ = state.topk_indices.as_ref();
 
     // Upstream V4F gates on the POST-ffn_norm input (same x that
     // shared/routed experts see). ffn_x_rot is FWHT(ffn_norm(hc_x_in));
@@ -3043,10 +3044,7 @@ fn moe_route(
     // scores = sqrt(softplus(logits))
     gpu.sqrt_softplus_f32(scores)
         .map_err(|e| format!("sqrt_softplus layer {layer_idx}: {e:?}"))?;
-
-    // top-K via indexer_top_k. H=1, N=n_exp, K=k.
-    gpu.indexer_top_k(scores, topk, 1, n_exp as i32, k as i32)
-        .map_err(|e| format!("indexer_top_k router layer {layer_idx}: {e:?}"))?;
+    let _ = layer_idx;
 
     Ok(())
 }
@@ -3500,7 +3498,7 @@ pub(crate) const POS_SLOTS_PER_LAYER: usize = 3;
 ///
 /// Reads env vars HIPFIRE_V4F_COMP_ROPE_POS once into a cache (TODO:
 /// migrate to OnceLock once we settle on a fixed default).
-pub(crate) fn precompute_positions(
+pub fn precompute_positions(
     cfg: &DeepseekV4Config,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
@@ -5090,7 +5088,7 @@ fn ffn_batched(
 /// Returns the logits at the last position. Caller is responsible for
 /// any sampler integration.
 #[allow(dead_code)]
-fn final_norm_and_head_last_batched(
+pub fn final_norm_and_head_last_batched(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
