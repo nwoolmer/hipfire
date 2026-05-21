@@ -100,6 +100,17 @@ mod env_cache {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_MIXED"))
     }
+    /// `HIPFIRE_V4F_F16XF32_R2=1` — opt-in: route gemv_auto F16-weight
+    /// decode through the multirow R=2 GEMV. Drift-gate byte-eq, but
+    /// the perf delta on V4F-mq2lloyd-q8 decode is +0.7% on gfx1151
+    /// (within noise) because F16-weight GEMVs aren't the bottleneck
+    /// for this build — Q8/MQ4 GEMVs dominate. Kept for future tuning
+    /// (other models, other archs) without becoming an unmonitored
+    /// default.
+    pub(super) fn f16xf32_r2_on() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_F16XF32_R2"))
+    }
     /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
     pub(super) fn bisect_break() -> Option<&'static str> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -164,6 +175,9 @@ fn gemv_auto(
                 .map(|s| s == "1").unwrap_or(false);
             if use_wmma {
                 gemv_f16_x_decode(gpu, weight, x_plain, y, m, k)
+            } else if env_cache::f16xf32_r2_on() {
+                gpu.gemv_f16_xf32_multirow_r2(weight, x_plain, y, m, k)
+                    .map_err(|e| format!("gemv_f16_xf32_multirow_r2: {e:?}"))
             } else {
                 gpu.gemv_f16_xf32(weight, x_plain, y, m, k)
                     .map_err(|e| format!("gemv_f16_xf32: {e:?}"))
