@@ -572,37 +572,23 @@ fn compressor_forward_impl(
     //   gpu.add_f16_to_f32_inplace(score_buf, ape_row_view, proj_dim)
     let _ = ape;
 
-    // 3. Store kv_buf at kv_state[slot, :], score_buf at score_state[slot, :].
-    {
-        let l_state = &state._indexer[layer_idx];
-        let kv_state = if is_indexer {
-            l_state.indexer_kv_state.as_ref().unwrap()
-        } else {
-            l_state.main_kv_state.as_ref().unwrap()
-        };
-        let score_state = if is_indexer {
-            l_state.indexer_score_state.as_ref().unwrap()
-        } else {
-            l_state.main_score_state.as_ref().unwrap()
-        };
-        let kv_dst = kv_state.sub_offset(slot * proj_dim, proj_dim);
-        let score_dst = score_state.sub_offset(slot * proj_dim, proj_dim);
-        gpu.memcpy_dtod_auto(&kv_dst.buf, &kv_buf.buf, proj_dim * 4)
-            .map_err(|e| format!("comp kv-store l{layer_idx}: {e:?}"))?;
-        gpu.memcpy_dtod_auto(&score_dst.buf, &score_buf.buf, proj_dim * 4)
-            .map_err(|e| format!("comp score-store l{layer_idx}: {e:?}"))?;
-    }
-
-    // 4. Compression every `ratio` steps.
-    let should_compress = (pos + 1) % ratio == 0;
-    if !should_compress { return Ok(()); }
-
-    let compressed_slot = pos / ratio;
-    if compressed_slot >= max_compressed {
-        // Cache full; skip — TODO: ring or panic when long context exceeds cap.
-        return Ok(());
-    }
-
+    // Compressor commit + compress pipeline.
+    //
+    // Two paths share the same dataflow but differ in how slot indices
+    // reach the kernels:
+    //
+    // - `pre_batched=Some` (prefill batched per-position fallback):
+    //   slot indices are baked into memcpy_dtod_auto offsets host-side.
+    //   `compressed_slot >= max_compressed` and `(pos+1) % ratio != 0`
+    //   short-circuit via host-side return.
+    //
+    // - `pre_batched=None` (decode, captured under HIP graphs):
+    //   slot indices are read from `state.attn_state_buf`. ring_slot lives
+    //   at offset 6 (ratio=4) or 8 (ratio=128); commit_slot at offset 7
+    //   (ratio=4) or 9 (ratio=128). The buf-variant kernels early-return
+    //   on commit_slot < 0, so the captured graph can include every
+    //   commit kernel at every replay and they no-op on non-commit
+    //   positions.
     let l_state = &state._indexer[layer_idx];
     let kv_state = if is_indexer {
         l_state.indexer_kv_state.as_ref().unwrap()
@@ -620,98 +606,141 @@ fn compressor_forward_impl(
         l_state.main_kv_cache.as_ref().unwrap()
     };
 
-    let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+    // Per-layer compressor rope pos comes from the pre-computed pos_array.
+    // Slot 1 = main_comp_rope_pos, slot 2 = indexer_comp_rope_pos.
+    let rope_pos_slot = if is_indexer { 2 } else { 1 };
+    let pos_buf = pos_slot(state, layer_idx, rope_pos_slot)?;
 
+    let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+        if is_indexer {
+            (cfg.compress_rope_theta, 1.0_f32, 0.0_f32, 1.0_f32, 0.0_f32, 0.0_f32)
+        } else {
+            layer_rope_params(cfg, layer.compress_ratio)
+        };
+    let do_rope = is_indexer || !env_cache::no_main_rope();
+
+    // Capture attn_state_buf slot views BEFORE borrowing l_state — we
+    // need a non-overlapping immutable borrow of state.
+    let attn_buf_view = if pre_batched.is_some() { None } else {
+        let attn_buf = state.attn_state_buf.as_ref()
+            .ok_or_else(|| format!("comp l{layer_idx}: attn_state_buf missing (precompute_attn_state must run first)"))?;
+        let (ring_off, commit_off) = if ratio == 4 { (6usize, 7usize) } else { (8usize, 9usize) };
+        Some((attn_buf.sub_offset(ring_off, 1), attn_buf.sub_offset(commit_off, 1)))
+    };
+
+    if pre_batched.is_some() {
+        // ---- Prebatched prefill path (host-side gating, memcpy ring writes) ----
+        let kv_dst = kv_state.sub_offset(slot * proj_dim, proj_dim);
+        let score_dst = score_state.sub_offset(slot * proj_dim, proj_dim);
+        gpu.memcpy_dtod_auto(&kv_dst.buf, &kv_buf.buf, proj_dim * 4)
+            .map_err(|e| format!("comp kv-store l{layer_idx}: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&score_dst.buf, &score_buf.buf, proj_dim * 4)
+            .map_err(|e| format!("comp score-store l{layer_idx}: {e:?}"))?;
+
+        let should_compress = (pos + 1) % ratio == 0;
+        if !should_compress { return Ok(()); }
+        let compressed_slot = pos / ratio;
+        if compressed_slot >= max_compressed { return Ok(()); }
+        let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+
+        if overlap {
+            let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
+            let concat_score = l_state.comp_concat_score.as_ref().unwrap();
+            gpu.compressor_overlap_concat_f32(kv_state, concat_kv, ratio as i32, head_dim as i32)
+                .map_err(|e| format!("comp concat_kv l{layer_idx}: {e:?}"))?;
+            gpu.compressor_overlap_concat_f32(score_state, concat_score, ratio as i32, head_dim as i32)
+                .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
+            gpu.compressor_softmax_pool_f32(concat_kv, concat_score, &kv_cache_slot,
+                (2 * ratio) as i32, head_dim as i32)
+                .map_err(|e| format!("comp pool l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.compressor_softmax_pool_f32(kv_state, score_state, &kv_cache_slot,
+                ratio as i32, head_dim as i32)
+                .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
+        }
+        gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
+            .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
+        if do_rope {
+            if is_indexer {
+                gpu.rope_tail_interleaved(
+                    &kv_cache_slot, &kv_cache_slot, &pos_buf,
+                    1, 0,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    cfg.compress_rope_theta,
+                ).map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.rope_tail_yarn_interleaved(
+                    &kv_cache_slot, &kv_cache_slot, &pos_buf,
+                    1, 0,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+                    /*inverse=*/0,
+                ).map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
+            }
+        }
+        if overlap {
+            let shift_bytes = ratio * proj_dim * 4;
+            let src_view = kv_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
+            let dst_view = kv_state.sub_offset(0, ratio * proj_dim);
+            gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
+                .map_err(|e| format!("comp kv_state shift l{layer_idx}: {e:?}"))?;
+            let src_view = score_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
+            let dst_view = score_state.sub_offset(0, ratio * proj_dim);
+            gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
+                .map_err(|e| format!("comp score_state shift l{layer_idx}: {e:?}"))?;
+        }
+        return Ok(());
+    }
+
+    // ---- Decode / graph-captured path (state-buffer-driven slots) ----
+    let (ring_slot_buf, commit_slot_buf) = attn_buf_view
+        .expect("attn_buf_view populated when !pre_batched.is_some()");
+
+    // Ring write — unconditional within graph, no-op on -1 sentinel.
+    gpu.state_ring_write_f32_buf(kv_buf, kv_state, &ring_slot_buf, proj_dim as i32)
+        .map_err(|e| format!("comp ring write kv l{layer_idx}: {e:?}"))?;
+    gpu.state_ring_write_f32_buf(score_buf, score_state, &ring_slot_buf, proj_dim as i32)
+        .map_err(|e| format!("comp ring write score l{layer_idx}: {e:?}"))?;
+
+    // Compress event — concat (overlap only) is unconditional within graph;
+    // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
     if overlap {
         let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
         let concat_score = l_state.comp_concat_score.as_ref().unwrap();
-
-        // Build concat views from [2*ratio, 2*head_dim] state → [2*ratio, head_dim].
         gpu.compressor_overlap_concat_f32(kv_state, concat_kv, ratio as i32, head_dim as i32)
             .map_err(|e| format!("comp concat_kv l{layer_idx}: {e:?}"))?;
         gpu.compressor_overlap_concat_f32(score_state, concat_score, ratio as i32, head_dim as i32)
             .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
-
-        // Pool with softmax weights → [head_dim] at kv_cache slot.
-        gpu.compressor_softmax_pool_f32(concat_kv, concat_score, &kv_cache_slot,
+        gpu.compressor_softmax_pool_f32_buf(concat_kv, concat_score, kv_cache, &commit_slot_buf,
             (2 * ratio) as i32, head_dim as i32)
-            .map_err(|e| format!("comp pool l{layer_idx}: {e:?}"))?;
+            .map_err(|e| format!("comp pool buf l{layer_idx}: {e:?}"))?;
     } else {
-        // overlap=false (ratio=128): state IS already [ratio, head_dim] since
-        // coff=1 → proj_dim=head_dim. Pool directly.
-        gpu.compressor_softmax_pool_f32(kv_state, score_state, &kv_cache_slot,
+        gpu.compressor_softmax_pool_f32_buf(kv_state, score_state, kv_cache, &commit_slot_buf,
             ratio as i32, head_dim as i32)
-            .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
+            .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
     }
-
-    // RMSNorm in place on the compressed kv_cache slot.
-    gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
-        .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
-
-    // Tail RoPE on the compressed entry.
-    //
-    // Indexer compressor: plain rope_tail_interleaved with
-    // compress_rope_theta=160000 at start-of-window position. Q used in
-    // indexer scoring also uses plain rope_tail_interleaved with the
-    // same theta, so Q·K is consistent in indexer scoring.
-    //
-    // Main compressor: YaRN-aware tail RoPE so the K-space matches Q
-    // (which has YaRN tail-RoPE applied for compressed layers via
-    // apply_tail_rope). Without this, mixed attention computes Q·K with
-    // Q rotated at absolute pos but K unrotated — breaking the RoPE
-    // relative-position invariant. Long-context wins (ctx=2048: 14.12 →
-    // 8.30 ppl, ctx=1024: 10.38 → 8.76 ppl) outweigh the modest
-    // short-context regression (ctx=128: 14.69 → 16.83 ppl).
-    // Env opt-out: HIPFIRE_V4F_NO_MAIN_ROPE=1.
-    // Per-layer compressor rope pos comes from the pre-computed pos_array.
-    // Slot 1 = main_comp_rope_pos (mid-of-window by default; respects the
-    // HIPFIRE_V4F_COMP_ROPE_POS env var read once in precompute_positions).
-    // Slot 2 = indexer_comp_rope_pos (always start-of-window).
-    let slot = if is_indexer { 2 } else { 1 };
-    let pos_slice = pos_slot(state, layer_idx, slot)?;
-    // Keep state.comp_pos_buf populated for any external reader; the value
-    // here is the same slice we're about to pass into the rope kernels.
-    state.comp_pos_buf = Some(pos_slice);
-    let pos_buf = state.comp_pos_buf.as_ref().unwrap();
-    let _ = (position, ratio); // values now consumed in precompute_positions
-
-    if is_indexer {
-        gpu.rope_tail_interleaved(
-            &kv_cache_slot, &kv_cache_slot, pos_buf,
-            1, 0,
-            head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            cfg.compress_rope_theta,
-        ).map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
-    } else if !env_cache::no_main_rope() {
-        // YaRN-aware tail RoPE on main compressor (single-tensor via
-        // n_heads_q=1, n_heads_k=0) — matches Q's apply_tail_rope.
-        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-            layer_rope_params(cfg, layer.compress_ratio);
-        gpu.rope_tail_yarn_interleaved(
-            &kv_cache_slot, &kv_cache_slot, pos_buf,
-            1, 0,
-            head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
+    gpu.rmsnorm_f32_at_slot_buf(kv_cache, norm, &commit_slot_buf,
+        head_dim as i32, cfg.rms_norm_eps)
+        .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
+    if do_rope {
+        gpu.rope_tail_yarn_interleaved_at_slot_buf(
+            kv_cache, &pos_buf, &commit_slot_buf,
+            head_dim as i32, cfg.qk_rope_head_dim as i32,
             freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
-            /*inverse=*/0,
-        ).map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
+        ).map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
     }
-
-    // State shift for overlap: kv_state[:ratio] = kv_state[ratio:].
     if overlap {
-        let shift_bytes = ratio * proj_dim * 4;
-        let src_view = kv_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
-        let dst_view = kv_state.sub_offset(0, ratio * proj_dim);
-        gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
-            .map_err(|e| format!("comp kv_state shift l{layer_idx}: {e:?}"))?;
-
-        let src_view = score_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
-        let dst_view = score_state.sub_offset(0, ratio * proj_dim);
-        gpu.memcpy_dtod_auto(&dst_view.buf, &src_view.buf, shift_bytes)
-            .map_err(|e| format!("comp score_state shift l{layer_idx}: {e:?}"))?;
+        gpu.state_overlap_shift_f32_buf(kv_state, &commit_slot_buf,
+            ratio as i32, proj_dim as i32)
+            .map_err(|e| format!("comp kv_state shift buf l{layer_idx}: {e:?}"))?;
+        gpu.state_overlap_shift_f32_buf(score_state, &commit_slot_buf,
+            ratio as i32, proj_dim as i32)
+            .map_err(|e| format!("comp score_state shift buf l{layer_idx}: {e:?}"))?;
     }
 
+    let _ = (position, max_compressed); // consumed via attn_state_buf
     Ok(())
 }
 
@@ -1320,9 +1349,16 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     // pos/ratio at commit positions, -1 otherwise (commit kernels
     // early-return on -1).
     let ring_slot_4 = 4 + (pos % 4);
-    let commit_slot_4 = if (pos + 1) % 4 == 0 { pos / 4 } else { -1 };
+    let max_compressed = env_cache::max_compress_pos() as i32;
+    let commit_slot_4 = if (pos + 1) % 4 == 0 {
+        let s = pos / 4;
+        if s < max_compressed { s } else { -1 }
+    } else { -1 };
     let ring_slot_128 = pos % 128;       // overlap=false (ratio=128)
-    let commit_slot_128 = if (pos + 1) % 128 == 0 { pos / 128 } else { -1 };
+    let commit_slot_128 = if (pos + 1) % 128 == 0 {
+        let s = pos / 128;
+        if s < max_compressed { s } else { -1 }
+    } else { -1 };
     let host = state.attn_state_host.as_mut()
         .expect("fill_attn_state_host: attn_state_host not initialised");
     host[0] = swa_slot;

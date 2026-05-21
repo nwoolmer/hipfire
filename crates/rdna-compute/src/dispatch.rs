@@ -20238,6 +20238,197 @@ impl Gpu {
         )
     }
 
+    /// HIP-graphs-safe in-place RMSNorm at `base + slot_buf[0] * n`.
+    /// -1 sentinel → no-op. Single block (head_dim ≤ 512).
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn rmsnorm_f32_at_slot_buf(
+        &mut self,
+        base: &GpuTensor,
+        weight: &GpuTensor,
+        slot_buf: &GpuTensor,
+        n: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_f32_at_slot_buf",
+            kernels::RMSNORM_AT_SLOT_BUF_SRC,
+            "rmsnorm_f32_at_slot_buf",
+        )?;
+        let bp = base.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sb = slot_buf.buf.as_ptr();
+        let mut nv = n;
+        let mut ev = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(n as u32).next_power_of_two().max(32);
+        let shared = block * 4;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(bp); b.push_ptr(wp); b.push_ptr(sb);
+            b.push_i32(nv); b.push_f32(ev);
+            b
+        };
+        self.launch_maybe_blob(
+            "rmsnorm_f32_at_slot_buf",
+            [1, 1, 1], [block, 1, 1], shared, &mut params, blob_builder,
+        )
+    }
+
+    /// HIP-graphs-safe in-place YaRN tail RoPE at `base + slot_buf[0] *
+    /// head_dim`. -1 sentinel → no-op. Single-tensor (n_heads_q=1,
+    /// n_heads_k=0). Set freq_scale=1.0, ext_factor=0.0 to recover
+    /// plain rope_tail_interleaved.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn rope_tail_yarn_interleaved_at_slot_buf(
+        &mut self,
+        base: &GpuTensor,
+        pos_buf: &GpuTensor,
+        slot_buf: &GpuTensor,
+        head_dim: i32,
+        n_rot: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        corr_low: f32,
+        corr_high: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_tail_yarn_interleaved_at_slot_buf",
+            kernels::ROPE_TAIL_YARN_INTERLEAVED_AT_SLOT_BUF_SRC,
+            "rope_tail_yarn_interleaved_at_slot_buf_f32",
+        )?;
+        let bp = base.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let sb = slot_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut nr = n_rot;
+        let mut fb = freq_base;
+        let mut fs = freq_scale;
+        let mut ef = ext_factor;
+        let mut af = attn_factor;
+        let mut cl = corr_low;
+        let mut ch = corr_high;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut fs as *mut _ as *mut c_void,
+            &mut ef as *mut _ as *mut c_void,
+            &mut af as *mut _ as *mut c_void,
+            &mut cl as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        let block = 32u32;
+        let grid = (half + block - 1) / block;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(bp); b.push_ptr(pp); b.push_ptr(sb);
+            b.push_i32(hd); b.push_i32(nr);
+            b.push_f32(fb); b.push_f32(fs); b.push_f32(ef);
+            b.push_f32(af); b.push_f32(cl); b.push_f32(ch);
+            b
+        };
+        self.launch_maybe_blob(
+            "rope_tail_yarn_interleaved_at_slot_buf_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
+    /// HIP-graphs-safe ring write: `state[ring_slot_buf[0]*proj_dim..]
+    /// = src[0..proj_dim]`. -1 sentinel → no-op.
+    #[allow(dead_code)]
+    pub fn state_ring_write_f32_buf(
+        &mut self,
+        src: &GpuTensor,
+        state: &GpuTensor,
+        ring_slot_buf: &GpuTensor,
+        proj_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "state_ring_write_f32_buf",
+            kernels::STATE_RING_WRITE_F32_BUF_SRC,
+            "state_ring_write_f32_buf",
+        )?;
+        let sp = src.buf.as_ptr();
+        let stp = state.buf.as_ptr();
+        let rp = ring_slot_buf.buf.as_ptr();
+        let mut pd = proj_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &stp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((proj_dim as u32) + block - 1) / block;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sp); b.push_ptr(stp); b.push_ptr(rp);
+            b.push_i32(pd);
+            b
+        };
+        self.launch_maybe_blob(
+            "state_ring_write_f32_buf",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
+    /// HIP-graphs-safe overlap-shift gated by commit slot: when
+    /// `commit_slot_buf[0] >= 0`, copies `state[ratio*proj_dim..2*ratio*proj_dim]`
+    /// down to `state[0..ratio*proj_dim]`. Otherwise no-op.
+    #[allow(dead_code)]
+    pub fn state_overlap_shift_f32_buf(
+        &mut self,
+        state: &GpuTensor,
+        commit_slot_buf: &GpuTensor,
+        ratio: i32,
+        proj_dim: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "state_overlap_shift_f32_buf",
+            kernels::STATE_OVERLAP_SHIFT_F32_BUF_SRC,
+            "state_overlap_shift_f32_buf",
+        )?;
+        let stp = state.buf.as_ptr();
+        let cp = commit_slot_buf.buf.as_ptr();
+        let mut rv = ratio;
+        let mut pd = proj_dim;
+        let mut params: Vec<*mut c_void> = vec![
+            &stp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut rv as *mut _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+        ];
+        let total = (ratio * proj_dim) as u32;
+        let block = 256u32;
+        let grid = (total + block - 1) / block;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(stp); b.push_ptr(cp);
+            b.push_i32(rv); b.push_i32(pd);
+            b
+        };
+        self.launch_maybe_blob(
+            "state_overlap_shift_f32_buf",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
     pub fn compressor_softmax_pool_f32(
         &mut self,
         kv_state: &GpuTensor,     // [T, head_dim] F32

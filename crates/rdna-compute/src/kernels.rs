@@ -1627,6 +1627,29 @@ pub const HC_PRE_POST_SIGMOID_SCALE_SRC: &str =
 pub const COMPRESSOR_SOFTMAX_POOL_BUF_SRC: &str =
     include_str!("../../../kernels/src/compressor_softmax_pool_buf.hip");
 
+/// HIP-graphs-safe in-place RMSNorm at slot `slot_buf[0]` of a base
+/// buffer; -1 sentinel → no-op. Twin of `rmsnorm_f32(kv_cache.sub_offset(slot*n, n))`.
+pub const RMSNORM_AT_SLOT_BUF_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_at_slot_buf.hip");
+
+/// HIP-graphs-safe in-place YaRN-aware tail RoPE at slot `slot_buf[0]` of a
+/// base buffer; -1 sentinel → no-op. Single-tensor (n_heads_q=1, n_heads_k=0).
+/// Pass freq_scale=1.0, ext_factor=0.0 to recover plain rope_tail_interleaved.
+pub const ROPE_TAIL_YARN_INTERLEAVED_AT_SLOT_BUF_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved_at_slot_buf.hip");
+
+/// HIP-graphs-safe ring write: src[proj_dim] → state[slot*proj_dim..]
+/// with slot from `ring_slot_buf[0]`. Twin of the per-position
+/// `memcpy_dtod_auto` writes in compressor_forward_impl.
+pub const STATE_RING_WRITE_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_ring_write_f32_buf.hip");
+
+/// HIP-graphs-safe overlap-shift: state[:ratio*proj_dim] = state[ratio*proj_dim:].
+/// Gated by `commit_slot_buf[0] >= 0` so captured graphs only fire it on
+/// commit positions. Twin of the post-commit memcpy_dtod_auto state shift.
+pub const STATE_OVERLAP_SHIFT_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_overlap_shift_f32_buf.hip");
+
 /// HIP-graphs-safe twin of `v4f_attn_swa_topk_f32`: reads `n_valid_swa`
 /// + `n_active_topk` from device buffers.
 pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
