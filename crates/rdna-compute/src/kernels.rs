@@ -343,6 +343,12 @@ pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g2
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+
+/// V4F-asymmetric-clamped variant of `fused_silu_mul_mq_rotate`. Replaces
+/// the V4F decode pair `v4f_silu_mul_clamp_f32` + `rotate_x_mq` with one
+/// launch (saves 1 launch + 8 KB intermediate write/read per layer).
+pub const V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/v4f_fused_silu_mul_clamp_mq_rotate.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:

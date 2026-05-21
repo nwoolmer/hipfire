@@ -1980,17 +1980,17 @@ fn ffn_stub(
     // 3. up = x @ shared_w3
     gemv_auto(gpu, shared_w3, ffn_x_rot, ffn_x_plain, up, im, cfg.hidden_size)?;
 
-    // 4. V4F SwiGLU with swiglu_limit clamp (cfg.swiglu_limit = 10.0
-    //    on V4F). Same Expert class used for shared and routed in
-    //    upstream model.py — both apply this clamp before silu_mul.
-    gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
-        .map_err(|e| format!("v4f_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
-
-    // 5. FWHT-rotate the silu-gated vector for the down GEMV — only if
-    //    down weight (shared_w2) needs FWHT input.
+    // 4-5. V4F SwiGLU with swiglu_limit clamp, optionally fused with
+    //      the FWHT rotation when shared_w2 is MQ4. The fused kernel
+    //      saves one launch + the 8 KB intermediate write/read of
+    //      `gate`. cfg.swiglu_limit = 10.0 on V4F. Same Expert class
+    //      used for shared and routed in upstream model.py.
     if down_needs_fwht {
-        gpu.rotate_x_mq(gate, silu_rot, im)
-            .map_err(|e| format!("rotate_x_mq silu layer {layer_idx}: {e:?}"))?;
+        gpu.v4f_fused_silu_mul_clamp_mq_rotate(gate, up, silu_rot, im, cfg.swiglu_limit)
+            .map_err(|e| format!("v4f_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}"))?;
+    } else {
+        gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
+            .map_err(|e| format!("v4f_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
     }
 
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
