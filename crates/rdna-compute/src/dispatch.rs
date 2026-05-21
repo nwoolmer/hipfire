@@ -3374,6 +3374,139 @@ impl Gpu {
         result
     }
 
+    /// Strict superset of `fused_rmsnorm_rotate_mq`: also writes the plain
+    /// (non-FWHT) RMSNormed output to `x_plain`. Saves the follow-up
+    /// `rmsnorm_f32` launch on V4F decode FFN paths that consume both
+    /// representations (MQ4 GEMV reads x_rot, Q8/F16 GEMV reads x_plain).
+    pub fn fused_rmsnorm_rotate_mq_plain(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_plain",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
+            "fused_rmsnorm_mq_rotate_plain",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let xpp = x_plain.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &xpp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = k * 4 * 4 + 2 * 256 * 4; // +1 K*4 for x_plain write
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_rmsnorm_mq_rotate_plain", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_plain", [1, 1, 1], [block_size, 1, 1],
+            shared_mem, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp); b.push_ptr(xpp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        self.invalidate_x_caches_for(xpp);
+        result
+    }
+
+    /// Batched twin of `fused_rmsnorm_rotate_mq_plain`. Grid.x = batch_size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_rmsnorm_rotate_mq_plain_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_plain",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
+            "fused_rmsnorm_mq_rotate_plain",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut xpp = x_plain.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut xpp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_rmsnorm_mq_rotate_plain_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_plain",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp); b.push_ptr(xpp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        self.invalidate_x_caches_for(xpp);
+        result
+    }
+
     /// Phase A Stage A — AWQ-aware variant of fused_rmsnorm_rotate_mq.
     ///
     /// After computing the RMSNorm output, divides element-wise by

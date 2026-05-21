@@ -2066,16 +2066,20 @@ fn ffn_stub(
         || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
-    // 1. RMSNorm (+ optional FWHT) for the gate/up GEMVs.
+    // 1. RMSNorm (+ optional FWHT). When BOTH rot and plain outputs are
+    //    needed (common case: MoE on OR shared_w1/w3 are MQ4), use the
+    //    fused single-launch variant that writes both. Saves one launch
+    //    + the duplicate sum-of-squares pass.
     if gate_up_need_fwht {
-        gpu.fused_rmsnorm_rotate_mq(hc_x_in, ffn_norm, ffn_x_rot,
-            cfg.hidden_size, cfg.rms_norm_eps)
-            .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
+        gpu.fused_rmsnorm_rotate_mq_plain(hc_x_in, ffn_norm,
+            ffn_x_rot, ffn_x_plain, cfg.hidden_size, cfg.rms_norm_eps)
+            .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain ffn layer {layer_idx}: {e:?}"))?;
+    } else {
+        // Pure plain path (no MoE AND shared_w1/w3 not MQ4): only need
+        // ffn_x_plain.
+        gpu.rmsnorm_f32(hc_x_in, ffn_norm, ffn_x_plain, cfg.rms_norm_eps)
+            .map_err(|e| format!("rmsnorm_f32 ffn-side plain l{layer_idx}: {e:?}"))?;
     }
-    // 1b. Plain RMSNorm — always needed (consumed by Q8/F16 gemv path
-    //     AND by the routed MoE input via ffn_x_rot fallthrough).
-    gpu.rmsnorm_f32(hc_x_in, ffn_norm, ffn_x_plain, cfg.rms_norm_eps)
-        .map_err(|e| format!("rmsnorm_f32 ffn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. gate = x @ shared_w1
     gemv_auto(gpu, shared_w1, ffn_x_rot, ffn_x_plain, gate, im, cfg.hidden_size)?;
@@ -3433,14 +3437,19 @@ fn q_lora(
     let wq_a_needs_fwht = weight_needs_fwht(wq_a);
     let wq_b_needs_fwht = weight_needs_fwht(wq_b);
 
-    // 1. RMSNorm (+ optional FWHT) hc_x_in → tmp / tmp_plain.
+    // 1. RMSNorm (+ optional FWHT) hc_x_in → tmp / tmp_plain. When both
+    //    outputs are needed (the common V4F case), use the fused variant
+    //    that writes both in one launch.
     if wq_a_needs_fwht {
-        gpu.fused_rmsnorm_rotate_mq(hc_x_in, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
-            .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
+        gpu.fused_rmsnorm_rotate_mq_plain(hc_x_in, attn_norm,
+            tmp, tmp_plain, cfg.hidden_size, cfg.rms_norm_eps)
+            .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain layer {layer_idx}: {e:?}"))?;
+    } else {
+        // Plain only: wq_a is Q8/F16/F32 → tmp not consumed downstream,
+        // but compressor + indexer still read tmp_plain so it's required.
+        gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
+            .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
     }
-    // 1b. Plain RMSNorm — always needed (compressor + indexer also read tmp_plain).
-    gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
-        .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
     gemv_auto(gpu, wq_a, tmp, tmp_plain, q_lat, cfg.q_lora_rank, cfg.hidden_size)?;
@@ -4867,19 +4876,21 @@ fn ffn_batched(
         || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
-    // 1. RMSNorm (+ optional FWHT) of hc_x_in_batch → ffn_x_rot_batch.
+    // 1. RMSNorm (+ optional FWHT). Fused variant writes BOTH rot and
+    //    plain outputs when both are needed (saves one launch per layer).
     if gate_up_need_fwht {
-        gpu.fused_rmsnorm_rotate_mq_batched(
-            &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_rot_batch,
+        gpu.fused_rmsnorm_rotate_mq_plain_batched(
+            &pbs.hc_x_in_batch, ffn_norm,
+            &pbs.ffn_x_rot_batch, &pbs.ffn_x_plain_batch,
             hidden, cfg.rms_norm_eps, batch_size,
-        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched ffn l{layer_idx}: {e:?}"))?;
+        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_plain_batched ffn l{layer_idx}: {e:?}"))?;
+    } else {
+        // Pure-plain (no MoE AND no MQ4 shared): only ffn_x_plain needed.
+        gpu.rmsnorm_batched(
+            &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_plain_batch,
+            batch_size, hidden, cfg.rms_norm_eps,
+        ).map_err(|e| format!("rmsnorm_batched ffn-side l{layer_idx}: {e:?}"))?;
     }
-
-    // 1b. Plain RMSNorm → ffn_x_plain_batch.
-    gpu.rmsnorm_batched(
-        &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_plain_batch,
-        batch_size, hidden, cfg.rms_norm_eps,
-    ).map_err(|e| format!("rmsnorm_batched ffn-side l{layer_idx}: {e:?}"))?;
 
     // 2-3. Shared expert gate + up GEMVs.
     gemv_auto_batched_wmma(
@@ -5417,20 +5428,22 @@ fn q_lora_batched(
     let wq_a_needs_fwht = weight_needs_fwht(wq_a);
     let wq_b_needs_fwht = weight_needs_fwht(wq_b);
 
-    // 1. RMSNorm (+ optional FWHT) batched.
+    // 1. RMSNorm (+ optional FWHT) batched. Fused variant writes BOTH
+    //    rot and plain outputs in one launch when both are needed
+    //    (common V4F case — compressor + indexer always read tmp_plain).
     if wq_a_needs_fwht {
-        gpu.fused_rmsnorm_rotate_mq_batched(
-            hc_x_in_batch, attn_norm, &pbs.tmp_batch,
+        gpu.fused_rmsnorm_rotate_mq_plain_batched(
+            hc_x_in_batch, attn_norm,
+            &pbs.tmp_batch, &pbs.tmp_plain_batch,
             hidden, cfg.rms_norm_eps, batch_size,
-        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched l{layer_idx}: {e:?}"))?;
+        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_plain_batched l{layer_idx}: {e:?}"))?;
+    } else {
+        // Plain only (wq_a Q8/F16/F32 doesn't need FWHT).
+        gpu.rmsnorm_batched(
+            hc_x_in_batch, attn_norm, &pbs.tmp_plain_batch,
+            batch_size, hidden, cfg.rms_norm_eps,
+        ).map_err(|e| format!("rmsnorm_batched attn-side plain l{layer_idx}: {e:?}"))?;
     }
-
-    // 1b. Plain RMSNorm batched: hc_x_in_batch → tmp_plain_batch.
-    //     Always needed (compressor + indexer read tmp_plain_batch).
-    gpu.rmsnorm_batched(
-        hc_x_in_batch, attn_norm, &pbs.tmp_plain_batch,
-        batch_size, hidden, cfg.rms_norm_eps,
-    ).map_err(|e| format!("rmsnorm_batched attn-side plain l{layer_idx}: {e:?}"))?;
 
     // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
     gemv_auto_batched_wmma(
