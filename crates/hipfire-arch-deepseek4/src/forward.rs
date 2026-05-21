@@ -2936,26 +2936,25 @@ fn mhc_pre(
     // every stream by zero in the limit so quality is unchanged here,
     // kept aligned for clarity.
     let pre_view = state.hc_c.as_ref().unwrap().sub_offset(0, 4);
-    gpu.sigmoid_f32(&pre_view)
-        .map_err(|e| format!("sigmoid pre layer {layer_idx}: {e:?}"))?;
-
-    // POST (4-dim, 2·sigmoid): per-stream OUTPUT scaling. Antirez ds4
-    // (hc_split_sinkhorn_one, ds4.c:4205-4208): `out[off] = 2.0 / (1.0 +
-    // exp(-z))` where z = mix[off] * scale[1] + base[off]. The factor 2
-    // is hardcoded; the learned per-layer scale[1] was already applied
-    // via hc_apply_alpha above (c[4..8] = α[1]*mix + base[1]). So our
-    // sigmoid(c) * post_scale matches antirez when post_scale=2.0.
-    // Env override kept for diagnostics.
-    let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
-    gpu.sigmoid_f32(&post_view)
-        .map_err(|e| format!("sigmoid post layer {layer_idx}: {e:?}"))?;
-    // Default 1.5: empirical optimum under mixed attention + YaRN. Antirez
-    // hardcodes 2.0; the 0.5 delta is plausibly MQ2-Lloyd vs IQ2_XXS+Q2_K
-    // quantization noise compensation. Env override kept for tuning.
-    let post_scale: f32 = std::env::var("HIPFIRE_V4F_POST_SCALE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.5);
-    gpu.scale_f32(&post_view, post_scale)
-        .map_err(|e| format!("scale post layer {layer_idx}: {e:?}"))?;
+    // FUSED pre + post sigmoid+scale: one kernel launch replaces three
+    // (sigmoid(pre), sigmoid(post), scale(post)). hc_c[0..4] gets
+    // sigmoid + hc_eps; hc_c[4..8] gets post_scale * sigmoid;
+    // hc_c[8..24] left for the sinkhorn pass below.
+    //
+    // Default post_scale = 1.5: empirical optimum under mixed attention
+    // + YaRN. Antirez hardcodes 2.0; the 0.5 delta is plausibly MQ2-
+    // Lloyd vs IQ2_XXS+Q2_K quant noise compensation. Env override:
+    // HIPFIRE_V4F_POST_SCALE.
+    use std::sync::OnceLock;
+    static POST_SCALE: OnceLock<f32> = OnceLock::new();
+    let post_scale = *POST_SCALE.get_or_init(|| {
+        std::env::var("HIPFIRE_V4F_POST_SCALE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.5)
+    });
+    let hc_c_full = state.hc_c.as_ref().unwrap();
+    gpu.hc_pre_post_sigmoid_scale_f32(hc_c_full, cfg.hc_eps, post_scale)
+        .map_err(|e| format!("hc_pre_post_sigmoid_scale layer {layer_idx}: {e:?}"))?;
+    let post_view = hc_c_full.sub_offset(4, 4);
 
     // COMB (16-dim → 4x4): cross-stream combining matrix, Sinkhorn-
     //   normalized to be doubly stochastic.

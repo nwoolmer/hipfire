@@ -17839,6 +17839,40 @@ impl Gpu {
     }
 
     #[cfg(feature = "deltanet")]
+    /// V4F mHC fused: hc_c[0..4] = sigmoid(hc_c[0..4]) + hc_eps;
+    /// hc_c[4..8] = post_scale * sigmoid(hc_c[4..8]); hc_c[8..] unchanged.
+    /// Replaces 3 element-wise launches (sigmoid(pre), sigmoid(post),
+    /// scale(post)) with one 8-thread launch — saves 2 launches per
+    /// mhc_pre call, ~860 μs/decode on 43-layer V4F.
+    #[allow(dead_code)]
+    pub fn hc_pre_post_sigmoid_scale_f32(
+        &mut self,
+        hc_c: &GpuTensor,
+        hc_eps: f32,
+        post_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("hc_pre_post_sigmoid_scale_f32",
+            kernels::HC_PRE_POST_SIGMOID_SCALE_SRC, "hc_pre_post_sigmoid_scale_f32")?;
+        let xp = hc_c.buf.as_ptr();
+        let mut eps = hc_eps;
+        let mut ps = post_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(xp); b.push_f32(eps); b.push_f32(ps);
+            b
+        };
+        self.launch_maybe_blob(
+            "hc_pre_post_sigmoid_scale_f32",
+            [1, 1, 1], [8, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;

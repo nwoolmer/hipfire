@@ -1615,6 +1615,11 @@ pub const V4F_ATTN_SWA_SRC: &str =
 pub const V4F_ATTN_SWA_BUF_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa_buf.hip");
 
+/// V4F mHC pre+post sigmoid/scale fusion — replaces 3 element-wise
+/// launches (sigmoid(pre), sigmoid(post), scale(post)) with 1.
+pub const HC_PRE_POST_SIGMOID_SCALE_SRC: &str =
+    include_str!("../../../kernels/src/hc_pre_post_sigmoid_scale.hip");
+
 /// HIP-graphs-safe twin of `v4f_attn_swa_topk_f32`: reads `n_valid_swa`
 /// + `n_active_topk` from device buffers.
 pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
