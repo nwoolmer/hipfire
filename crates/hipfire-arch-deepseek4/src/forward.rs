@@ -4103,16 +4103,8 @@ fn attention_block_batched_swa_only(
         ).map_err(|e| format!("swa_visibility_stage_batched l{layer_idx}: {e:?}"))?;
     }
 
-    // 3. Compute and upload per-batch n_valid_swa_arr.
-    //    n_valid_swa[b] = min(start_pos + b + 1, swa_window).
-    let n_valid_host: Vec<i32> = (0..batch_size)
-        .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
-        .collect();
-    let n_valid_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
-    };
-    gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
-        .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
+    // 3. n_valid_swa_arr is uploaded once per chunk by
+    //    `forward_prefill_batch_chunk`. Skip the per-layer htod.
 
     // 4. v4f_attn_swa_batched. o_groups passed through for ABI parity
     //    (unused inside the kernel).
@@ -4373,9 +4365,9 @@ fn attention_block_batched_mixed(
     //     and conditional pools to indexer/main_kv_cache). MUST run before
     //     the batched indexer chain so n_filled[b] reflects all relevant
     //     commits. We swap state.* fields to point at per-row sub-views.
-    let n_valid_host: Vec<i32> = (0..batch_size)
-        .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
-        .collect();
+    // n_valid_swa_arr is uploaded once per chunk by
+    // `forward_prefill_batch_chunk` — same value for every layer in the
+    // chunk (depends only on start_pos, batch_size, sliding_window).
 
     // Snapshot the per-token state fields so we can restore after the loop.
     let orig_tmp = state.tmp.take();
@@ -4681,12 +4673,8 @@ fn attention_block_batched_mixed(
         }
     }
 
-    // 3. Upload per-batch valid-counts.
-    let n_valid_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, batch_size * 4)
-    };
-    gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
-        .map_err(|e| format!("htod n_valid_swa_arr: {e:?}"))?;
+    // 3. Upload per-batch n_active_topk_arr only — n_valid_swa_arr is
+    //    populated once per chunk by the caller.
     let n_active_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(n_active_host.as_ptr() as *const u8, batch_size * 4)
     };
@@ -5598,6 +5586,23 @@ pub fn forward_prefill_batch_chunk(
     };
     gpu.memcpy_htod_auto(&pbs.positions.buf, positions_bytes)
         .map_err(|e| format!("htod positions: {e:?}"))?;
+
+    // 1.5. Hoist `n_valid_swa_arr` upload to once-per-chunk. Both
+    // `attention_block_batched_swa_only` and `attention_block_batched_mixed`
+    // used to upload this identical buffer per-layer (43× per chunk on V4F),
+    // each upload synchronising the active stream. The value depends only
+    // on (start_pos, batch_size, sliding_window) — chunk-invariant across
+    // all layers. The per-layer uploads are now skipped (the device buffer
+    // is already populated when `attention_block_*` runs).
+    let win = cfg.sliding_window;
+    let n_valid_host: Vec<i32> = (0..n)
+        .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
+        .collect();
+    let n_valid_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(n_valid_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.memcpy_htod_auto(&pbs.n_valid_swa_arr.buf, n_valid_bytes)
+        .map_err(|e| format!("htod n_valid_swa_arr (chunk-level): {e:?}"))?;
 
     // 2. Batched embedding lookup → pbs.embed_batch [n, hidden].
     let token_embd = weights.token_embd.as_ref()
