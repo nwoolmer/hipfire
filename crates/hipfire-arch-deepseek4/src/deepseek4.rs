@@ -307,6 +307,11 @@ pub struct DeepseekV4LayerWeights {
     /// a static set of K expert IDs. Empty for non-hash-routed layers.
     /// Stored as flat row-major Vec<u32> length = vocab_size * k.
     pub tid2eid_host: Vec<u32>,
+    /// Device-resident twin of `tid2eid_host` for the GPU hash-router
+    /// path (eliminates per-step d2h+h2d of scores/weights). Allocated
+    /// at load time alongside `tid2eid_host`. `None` for non-hash
+    /// layers or when the HFQ shipped without the table.
+    pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
     pub shared_w1: Option<rdna_compute::GpuTensor>,
@@ -366,6 +371,7 @@ impl DeepseekV4LayerWeights {
             hc_ffn_base: None, hc_ffn_fn: None, hc_ffn_scale: None,
             gate_weight: None, gate_bias: None,
             gate_bias_host: Vec::new(), tid2eid_host: Vec::new(),
+            tid2eid_dev: None,
             shared_w1: None, shared_w2: None, shared_w3: None,
             expert_w1_blob: None, expert_w2_blob: None, expert_w3_blob: None,
             expert_w1_ptrs: None, expert_w2_ptrs: None, expert_w3_ptrs: None,

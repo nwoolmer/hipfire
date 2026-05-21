@@ -701,6 +701,18 @@ impl Architecture for DeepseekV4 {
                             .collect();
                         let expected = info.shape.iter().product::<u32>() as usize;
                         if vals.len() == expected {
+                            // Upload to device for the GPU hash-router path.
+                            // Reinterpret u32 bytes as raw bytes — keep dtype
+                            // as F32 (raw) since the kernel reads `unsigned int*`
+                            // and the buffer's bytes are what matters.
+                            let shape: Vec<usize> = info.shape.iter()
+                                .map(|&s| s as usize).collect();
+                            match gpu.upload_raw(&bytes, &shape) {
+                                Ok(t) => layer.tid2eid_dev = Some(t),
+                                Err(e) => eprintln!(
+                                    "deepseek4: tid2eid l{l} upload failed: {e:?}; \
+                                    fall back to host gather"),
+                            }
                             layer.tid2eid_host = vals;
                         } else {
                             eprintln!("deepseek4: tid2eid l{l} size mismatch \

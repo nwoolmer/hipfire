@@ -2334,37 +2334,24 @@ fn ffn_hash_routed(
 
     // Compute scores (unbiased) on-device for the weight values.
     moe_route(cfg, weights, state, gpu, layer_idx)?;
-    let scores = state.router_scores.as_ref().unwrap();
-    let scores_host = gpu.download_f32(scores)
-        .map_err(|e| format!("d2h scores hash l{layer_idx}: {e:?}"))?;
 
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
 
-    // Static expert IDs from tid2eid[token_id, 0..k].
+    // Bounds check on token_id (host-side; tid2eid_dev shape == tid2eid_host).
     let row = (token_id as usize) * k;
     if row + k > layer.tid2eid_host.len() {
         return Err(format!(
             "hash l{layer_idx}: token_id {token_id} out of tid2eid range \
              ({} entries)", layer.tid2eid_host.len()));
     }
-    let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k].iter()
-        .map(|&i| i.min((n_exp - 1) as u32))
-        .collect();
 
-    let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
-        Some(w) => w,
-        None => return Ok(()),
-    };
-
-    // Fused MoE dispatch — same body as ffn_routed but with static
-    // tid2eid-derived top-K indices.
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let route_scale_override: f32 = std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2);
-    let k_top = topk_ids.len();
+    let k_top = k;
 
     // Lazy-alloc moe scratch (shared with ffn_routed via state).
     if state.moe_topk_indices.is_none() {
@@ -2390,14 +2377,37 @@ fn ffn_hash_routed(
 
     let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
     let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
-    let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-    let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-    gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
-        .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
-    let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-    let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-    gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
-        .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
+    let scores = state.router_scores.as_ref().unwrap();
+
+    // GPU-side hash-router lookup + normalize + scale. Replaces the
+    // d2h(scores) + host gather + h2d(topk_idx, topk_w) round-trip.
+    // Host fallback kicks in if tid2eid_dev is missing (older HFQs or
+    // upload failure at load).
+    if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
+        gpu.hash_router_normalize_f32(
+            tid2eid_dev, scores, topk_idx_dev, topk_w_dev,
+            token_id as i32, n_exp as i32, k as i32, route_scale_override,
+        ).map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
+    } else {
+        // Fallback: d2h + host gather + h2d.
+        let scores_host = gpu.download_f32(scores)
+            .map_err(|e| format!("d2h scores hash l{layer_idx}: {e:?}"))?;
+        let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k].iter()
+            .map(|&i| i.min((n_exp - 1) as u32))
+            .collect();
+        let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
+            .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
+        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
+        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
+            .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
+    }
 
     let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
