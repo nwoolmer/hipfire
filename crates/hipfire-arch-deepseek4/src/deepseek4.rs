@@ -641,6 +641,22 @@ pub struct DeepseekV4State {
     /// `hipMalloc not permitted under stream capture` and fail.
     pub ar_forward_warmed_up: bool,
 
+    /// Two-slot device buffer for SWA attention runtime state:
+    ///   [0] = slot      = state.n_tokens % sliding_window
+    ///   [1] = n_valid   = min(state.n_tokens + 1, sliding_window)
+    /// Both are derived from `state.n_tokens` at decode_step entry. Used
+    /// by the `_buf` variants of `swa_ring_write_f32` and the SWA
+    /// attention kernels so those kernels can be HIP-graph-captured
+    /// without baking position-derived integers into the kernarg blob.
+    /// All 43 layers read the SAME slot/n_valid values, so one shared
+    /// buffer is enough.
+    pub attn_state_buf: Option<rdna_compute::GpuTensor>,
+    /// Stable-pointer host source for `attn_state_buf`. Same rationale
+    /// as `pos_array_host`: captured memcpy nodes re-read this pointer
+    /// on each graph replay and find the values written for the current
+    /// position.
+    pub attn_state_host: Option<Box<[i32; 2]>>,
+
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
     /// view of `q` until real attention + O-LoRA lands.
@@ -779,6 +795,8 @@ impl DeepseekV4State {
             pos_array_device: None,
             pos_array_host: None,
             ar_forward_warmed_up: false,
+            attn_state_buf: None,
+            attn_state_host: None,
             attn_out: None,
             ffn_out: None,
             ffn_x_rot: None,

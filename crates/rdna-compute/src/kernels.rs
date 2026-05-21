@@ -1610,6 +1610,12 @@ pub const V4F_ATTN_SWA_SRC: &str =
 pub const SWA_RING_WRITE_SRC: &str =
     include_str!("../../../kernels/src/swa_ring_write.hip");
 
+/// HIP-graphs-safe variant of swa_ring_write_f32: reads `slot` from a
+/// device buffer instead of an i32 kernarg, so the captured kernel
+/// picks up new positions on each replay without re-capture.
+pub const SWA_RING_WRITE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write_buf.hip");
+
 // Phase 4 — Tail-only RoPE:
 pub const ROPE_TAIL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_halfsplit.hip");

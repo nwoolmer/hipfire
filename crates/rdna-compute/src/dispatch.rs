@@ -20609,6 +20609,52 @@ impl Gpu {
         }
     }
 
+    /// HIP-graphs-safe variant of `swa_ring_write_f32`: reads `slot`
+    /// from a device buffer instead of an i32 kernarg. Use this in
+    /// captured-region code paths where the position changes between
+    /// graph replays — the host updates `slot_buf` (stable Box-backed
+    /// memory) before each replay and the captured launch re-reads it.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn swa_ring_write_f32_buf(
+        &mut self,
+        kv: &GpuTensor,
+        cache: &GpuTensor,
+        slot_buf: &GpuTensor,
+        n_kv_heads: i32,
+        head_dim: i32,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("swa_ring_write_f32_buf",
+            kernels::SWA_RING_WRITE_BUF_SRC, "swa_ring_write_f32_buf")?;
+        let kp = kv.buf.as_ptr();
+        let cp = cache.buf.as_ptr();
+        let sb = slot_buf.buf.as_ptr();
+        let mut nh = n_kv_heads;
+        let mut hd = head_dim;
+        let mut wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+        ];
+        let grid = ((head_dim + 255) / 256) as u32;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(kp); b.push_ptr(cp); b.push_ptr(sb);
+            b.push_i32(nh); b.push_i32(hd); b.push_i32(wn);
+            b
+        };
+        self.launch_maybe_blob(
+            "swa_ring_write_f32_buf",
+            [grid, 1, 1], [256, 1, 1], 0, &mut params,
+            blob_builder,
+        )
+    }
+
     /// V4F SWA-windowed attention with attn_sink (multi-position).
     /// Generalises `v4f_attn_pos0` to attend over a cache of up to
     /// `window` past KV positions.

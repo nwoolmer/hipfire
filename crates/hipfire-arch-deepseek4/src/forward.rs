@@ -1215,11 +1215,17 @@ pub fn decode_step_with_graph(
             gpu.capture_blobs.len());
     } else {
         // ── Replay phase ───────────────────────────────────────────
-        // Host-only update of the stable pos_array_host[]. The captured
-        // memcpy node will re-read these bytes on graph_launch and
-        // propagate them to pos_array_device, which all per-layer
-        // kernels read via sub_offset slices.
+        // Host-only update of the stable pos_array_host[] AND
+        // attn_state_host[]. The captured memcpy nodes re-read these
+        // bytes on graph_launch and propagate them to the device-side
+        // pos_array_device / attn_state_buf which all per-layer kernels
+        // read via sub_offset slices.
         update_pos_array_host(cfg, state, position);
+        // attn_state depends on state.n_tokens BEFORE increment (the
+        // current position being processed). decode_step normally
+        // increments state.n_tokens at the END of the body, so replay
+        // sees the right pre-increment value.
+        update_attn_state_host(cfg, state, state.n_tokens as u32);
         gpu.graph_launch()
             .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
         state.n_tokens += 1;
@@ -1231,6 +1237,58 @@ pub fn decode_step_with_graph(
     let logits = state.logits.as_ref().unwrap();
     gpu.download_f32(logits)
         .map_err(|e| format!("download logits (graph path): {e:?}"))
+}
+
+/// Update `state.attn_state_host = [slot, n_valid]` and copy to the
+/// device buffer. Called from `precompute_positions` (which is itself
+/// inside the captured region during graph capture) so the captured
+/// memcpy node re-reads the stable host source on every replay.
+///
+/// `slot = state.n_tokens % sliding_window`
+/// `n_valid = min(state.n_tokens + 1, sliding_window)`
+///
+/// Layer-independent: all 43 layers read the same two values.
+pub(crate) fn precompute_attn_state(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    if state.attn_state_buf.is_none() {
+        state.attn_state_buf = Some(
+            gpu.alloc_tensor(&[2], DType::F32)
+                .map_err(|e| format!("alloc attn_state_buf: {e:?}"))?,
+        );
+    }
+    if state.attn_state_host.is_none() {
+        state.attn_state_host = Some(Box::new([0i32; 2]));
+    }
+    let win = cfg.sliding_window as i32;
+    let pos = state.n_tokens as i32;
+    let slot = pos % win;
+    let n_valid = (pos + 1).min(win);
+    let host = state.attn_state_host.as_mut().unwrap();
+    host[0] = slot;
+    host[1] = n_valid;
+    let dev = state.attn_state_buf.as_ref().unwrap();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, 2 * 4)
+    };
+    gpu.memcpy_htod_auto(&dev.buf, bytes)
+        .map_err(|e| format!("htod attn_state: {e:?}"))
+}
+
+/// Update host-only `attn_state_host[]` (no device copy). Used by the
+/// HIP-graphs replay path — the captured memcpy node re-reads this
+/// buffer when graph_launch fires.
+pub(crate) fn update_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, position: u32) {
+    let win = cfg.sliding_window as i32;
+    let pos = position as i32;
+    let slot = pos % win;
+    let n_valid = (pos + 1).min(win);
+    let host = state.attn_state_host.as_mut()
+        .expect("update_attn_state_host: attn_state_host not initialised");
+    host[0] = slot;
+    host[1] = n_valid;
 }
 
 /// Host-only update of `state.pos_array_host[]` for the given position.
@@ -2392,13 +2450,20 @@ fn attn_stub(
             }
         }
         let pos = state.n_tokens as usize;
-        let slot = pos % win;
+        // slot/n_valid live in `state.attn_state_buf` (slot at offset 0,
+        // n_valid at offset 1), populated by precompute_attn_state at
+        // decode_step entry. The _buf kernel variant reads slot from
+        // the device buffer, so the captured launch picks up the new
+        // position on every graph replay without re-capture.
+        let slot_buf = state.attn_state_buf.as_ref()
+            .ok_or_else(|| "attn_state_buf missing (precompute_positions must run first)".to_string())?
+            .sub_offset(0, 1);
         {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-            gpu.swa_ring_write_f32(kv, swa_k, n_kv as i32, head_dim as i32, win as i32, slot as i32)
+            gpu.swa_ring_write_f32_buf(kv, swa_k, &slot_buf, n_kv as i32, head_dim as i32, win as i32)
                 .map_err(|e| format!("swa_k write: {e:?}"))?;
-            gpu.swa_ring_write_f32(kv, swa_v, n_kv as i32, head_dim as i32, win as i32, slot as i32)
+            gpu.swa_ring_write_f32_buf(kv, swa_v, &slot_buf, n_kv as i32, head_dim as i32, win as i32)
                 .map_err(|e| format!("swa_v write: {e:?}"))?;
         }
         let n_valid = (pos + 1).min(win) as i32;
@@ -3228,6 +3293,10 @@ pub(crate) fn precompute_positions(
     };
     gpu.memcpy_htod_auto(&pos_array_device.buf, bytes)
         .map_err(|e| format!("htod pos_array: {e:?}"))?;
+
+    // Also write SWA state (slot, n_valid) — same stable-host-source
+    // pattern. The captured memcpy re-reads this on every graph_launch.
+    precompute_attn_state(cfg, state, gpu)?;
     Ok(())
 }
 
