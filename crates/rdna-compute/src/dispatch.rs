@@ -3826,6 +3826,62 @@ impl Gpu {
         result
     }
 
+    /// Batched twin of `v4f_fused_silu_mul_clamp_mq_rotate`. Grid.y is the
+    /// batch dim — kernel already supports it (per its batch_off
+    /// computation in the kernel body). Fuses silu+mul+clamp+FWHT into
+    /// one launch in batched paths (V4F shared FFN + routed MoE).
+    pub fn v4f_fused_silu_mul_clamp_mq_rotate_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        swiglu_limit: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "v4f_fused_silu_mul_clamp_mq_rotate",
+            kernels::V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC,
+            "v4f_fused_silu_mul_clamp_mq_rotate",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let lim = swiglu_limit;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &lim as *const _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "v4f_fused_silu_mul_clamp_mq_rotate_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "v4f_fused_silu_mul_clamp_mq_rotate",
+            [n_groups, batch_size as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr); b.push_ptr(xrp);
+                b.push_i32(kv); b.push_f32(lim);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Batched `fused_silu_mul_rotate_mq`. Grid.y is the batch dim — processes
     /// N tokens' [N × K] gate/up/x_rot in a single launch.
     pub fn fused_silu_mul_rotate_mq_batched(
