@@ -1212,22 +1212,25 @@ pub fn decode_step_with_graph(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
-    // Opt-in only (HIPFIRE_V4F_GRAPH=1). Naive autoregressive feedback
-    // (same input → same output) passes drift, but a varied-token sequence
-    // (real prompt) diverges at step ~3: `attn_stub` reads
-    // `state.n_tokens` on host, computes `slot = pos % win` and `n_valid`,
-    // passes them as i32 KERNEL ARGS to `swa_ring_write_f32` and the SWA
-    // attention kernels. These get baked into the kernarg blob at capture
-    // time and never update on replay → wrong SWA slot read/write across
-    // positions. Same issue affects MoE expert dispatch (top-k indices
-    // change per token) and possibly the indexer's n_filled-derived args.
-    //
-    // Until these state-dependent kernargs are migrated to device-side
-    // buffers (next session), graphs stay opt-in for users who know they
-    // need single-token replay or self-feedback loops.
-    static GRAPH_OPT_ENV: OnceLock<bool> = OnceLock::new();
-    let graph_on = *GRAPH_OPT_ENV.get_or_init(|| {
-        std::env::var("HIPFIRE_V4F_GRAPH").ok().as_deref() == Some("1")
+    // State-dependent kernargs (SWA slot/n_valid, indexer n_compressed/k_active,
+    // compressor ring/commit slots) all live in `state.attn_state_buf` and
+    // `state.pos_array_device` device buffers now. The captured graph re-reads
+    // those on every replay → byte-equivalent against direct dispatch out to
+    // 200+ steps on gfx1151 (graph_drift_check). Default ON for RDNA3+
+    // (gfx11xx/gfx12xx) where graph capture is mature; opt out with
+    // `HIPFIRE_V4F_GRAPH=0`. Force on for older archs with
+    // `HIPFIRE_V4F_GRAPH=1` (untested — beware kernarg-bake regressions).
+    static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
+    let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_V4F_GRAPH").ok().as_deref() {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        }
+    });
+    let graph_on = env_override.unwrap_or_else(|| {
+        let a = gpu.arch.as_str();
+        a.starts_with("gfx11") || a.starts_with("gfx12")
     });
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
