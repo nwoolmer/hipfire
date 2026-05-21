@@ -1266,10 +1266,22 @@ pub fn decode_step_with_graph(
             _ => None,
         }
     });
-    let graph_on = env_override.unwrap_or_else(|| {
+    let mut graph_on = env_override.unwrap_or_else(|| {
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
     });
+    // Hash-routed layers do a d2h download of scores inside the layer
+    // body (ffn_hash_routed → moe_route → download_f32) for the static
+    // tid2eid expert pick — HIP graph capture rejects this as a
+    // legacy-stream-depends-on-capturing-stream conflict. Disable
+    // graphs when MoE is on and hash layers exist; explicit
+    // HIPFIRE_V4F_GRAPH=1 still forces on (caller's responsibility).
+    if env_override.is_none() && graph_on
+        && cfg.num_hash_layers > 0
+        && env_cache::moe_on()
+    {
+        graph_on = false;
+    }
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
