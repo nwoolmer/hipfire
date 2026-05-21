@@ -126,6 +126,17 @@ mod env_cache {
 /// Caller passes BOTH the FWHT-rotated and plain inputs; helper picks
 /// whichever the weight needs. `m` and `k` are passed-through for the
 /// MQ4 path only — gemv_f32 derives them from the weight's shape.
+/// True if `gemv_auto` for this weight dtype will read the FWHT-rotated
+/// input (`x_rotated` arg), false if it only reads the plain input.
+/// V4F's mq2lloyd-q8 build has F16/Q8 everywhere except the routed
+/// MoE experts (which take a separate path) — meaning most decode-path
+/// rotations into `ffn_x_rot` / `silu_rot` / `q_lat_rot` / etc. are
+/// DEAD WORK (kernel runs, output never read). Use this to skip them.
+#[inline]
+pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
+    !matches!(weight.dtype, DType::F32 | DType::F16 | DType::Q8_0)
+}
+
 fn gemv_auto(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -1797,8 +1808,10 @@ pub fn mtp_forward(
         let stream0 = streams.sub_offset(0, hidden);
         gpu.rmsnorm_f32(&stream0, mtp_final, final_norm, cfg.rms_norm_eps)
             .map_err(|e| format!("mtp final rmsnorm: {e:?}"))?;
-        gpu.rotate_x_mq(final_norm, final_norm_rot, hidden)
-            .map_err(|e| format!("mtp rotate final: {e:?}"))?;
+        if weight_needs_fwht(head) {
+            gpu.rotate_x_mq(final_norm, final_norm_rot, hidden)
+                .map_err(|e| format!("mtp rotate final: {e:?}"))?;
+        }
         let logits = state.logits.as_ref().unwrap();
         gemv_auto(gpu, head, final_norm_rot, final_norm, logits,
             cfg.vocab_size, hidden)?;
@@ -1870,11 +1883,20 @@ fn ffn_stub(
     let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
 
-    // 1. Fused RMSNorm + FWHT rotate for the two MQ4 GEMVs.
-    gpu.fused_rmsnorm_rotate_mq(hc_x_in, ffn_norm, ffn_x_rot,
-        cfg.hidden_size, cfg.rms_norm_eps)
-        .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
-    // 1b. Plain RMSNorm (no FWHT) for F16 non-expert GEMVs.
+    // Skip FWHT rotations when downstream weight dtype doesn't need
+    // them (Q8/F16/F32 paths read x_plain). For v4f-q8-mtp this skips
+    // ~2-3 rotation kernels per layer per token.
+    let gate_up_need_fwht = weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+    let down_needs_fwht = weight_needs_fwht(shared_w2);
+
+    // 1. RMSNorm (+ optional FWHT) for the gate/up GEMVs.
+    if gate_up_need_fwht {
+        gpu.fused_rmsnorm_rotate_mq(hc_x_in, ffn_norm, ffn_x_rot,
+            cfg.hidden_size, cfg.rms_norm_eps)
+            .map_err(|e| format!("fused_rmsnorm_rotate_mq ffn layer {layer_idx}: {e:?}"))?;
+    }
+    // 1b. Plain RMSNorm — always needed (consumed by Q8/F16 gemv path
+    //     AND by the routed MoE input via ffn_x_rot fallthrough).
     gpu.rmsnorm_f32(hc_x_in, ffn_norm, ffn_x_plain, cfg.rms_norm_eps)
         .map_err(|e| format!("rmsnorm_f32 ffn-side plain l{layer_idx}: {e:?}"))?;
 
@@ -1890,9 +1912,12 @@ fn ffn_stub(
     gpu.v4f_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
         .map_err(|e| format!("v4f_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
 
-    // 5. FWHT-rotate the silu-gated vector for the down GEMV.
-    gpu.rotate_x_mq(gate, silu_rot, im)
-        .map_err(|e| format!("rotate_x_mq silu layer {layer_idx}: {e:?}"))?;
+    // 5. FWHT-rotate the silu-gated vector for the down GEMV — only if
+    //    down weight (shared_w2) needs FWHT input.
+    if down_needs_fwht {
+        gpu.rotate_x_mq(gate, silu_rot, im)
+            .map_err(|e| format!("rotate_x_mq silu layer {layer_idx}: {e:?}"))?;
+    }
 
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
     // shared_w2: rotated path uses silu_rot (FWHT'd), plain path uses
@@ -2383,9 +2408,11 @@ fn final_norm_and_head(
     gpu.rmsnorm_f32(head_hc_out, output_norm, final_norm, cfg.rms_norm_eps)
         .map_err(|e| format!("final rmsnorm_f32: {e:?}"))?;
 
-    // 4. FWHT-rotate for MQ4 GEMV.
-    gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
-        .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
+    // 4. FWHT-rotate for MQ4 GEMV — skip if lm_head is Q8/F16/F32.
+    if weight_needs_fwht(head) {
+        gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
+            .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
+    }
 
     // 5. lm_head GEMV. F16 path uses un-rotated final_norm.
     gemv_auto(gpu, head, final_norm_rot, final_norm, logits,
@@ -2657,9 +2684,14 @@ fn attn_stub(
 
     // FWHT-rotate all 8 group slices in one batched launch. attn_out_raw
     // is contiguous [n_groups, per_group_in] so grid.y=n_groups indexes
-    // each group at stride per_group_in.
-    gpu.rotate_x_mq_batched(attn_out_raw, attn_out_raw_rot, per_group_in, n_groups)
-        .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
+    // each group at stride per_group_in. Skip when wo_a is Q8/F16
+    // (gemv_auto reads x_plain in those paths, not x_rotated).
+    let wo_a_needs_fwht = weight_needs_fwht(wo_a);
+    let wo_b_needs_fwht = weight_needs_fwht(wo_b);
+    if wo_a_needs_fwht {
+        gpu.rotate_x_mq_batched(attn_out_raw, attn_out_raw_rot, per_group_in, n_groups)
+            .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
+    }
 
     for g in 0..n_groups {
         let raw_view = attn_out_raw.sub_offset(g * per_group_in, per_group_in);
@@ -2688,8 +2720,10 @@ fn attn_stub(
 
     // FWHT-rotate wo_a_out then wo_b GEMV → final_attn_out [hidden].
     // wo_b path: F32/Q8 use plain wo_a_out; MQ4 uses wo_a_out_rot.
-    gpu.rotate_x_mq(wo_a_out, wo_a_out_rot, groups_o_lora)
-        .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    if wo_b_needs_fwht {
+        gpu.rotate_x_mq(wo_a_out, wo_a_out_rot, groups_o_lora)
+            .map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    }
     gemv_auto(gpu, wo_b, wo_a_out_rot, wo_a_out, final_attn_out,
               cfg.hidden_size, groups_o_lora)?;
 
@@ -3207,10 +3241,18 @@ fn q_lora(
     let q_head_ones = state.q_head_ones.as_ref().unwrap();
     let _ = streams;  // streams not used directly anymore; transform reads hc_x_in
 
-    // 1. Fused RMSNorm + FWHT-rotate hc_x_in → tmp.
-    gpu.fused_rmsnorm_rotate_mq(hc_x_in, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
-        .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
-    // 1b. Plain RMSNorm (no FWHT) → tmp_plain for F16 non-expert GEMVs.
+    // Skip dead FWHT rotations when consuming weights are Q8/F16 (the
+    // V4F-q8 case for both wq_a and wq_b). The gemv_auto dispatch reads
+    // x_plain on those paths; x_rotated is unused.
+    let wq_a_needs_fwht = weight_needs_fwht(wq_a);
+    let wq_b_needs_fwht = weight_needs_fwht(wq_b);
+
+    // 1. RMSNorm (+ optional FWHT) hc_x_in → tmp / tmp_plain.
+    if wq_a_needs_fwht {
+        gpu.fused_rmsnorm_rotate_mq(hc_x_in, attn_norm, tmp, cfg.hidden_size, cfg.rms_norm_eps)
+            .map_err(|e| format!("fused_rmsnorm_rotate_mq layer {layer_idx}: {e:?}"))?;
+    }
+    // 1b. Plain RMSNorm — always needed (compressor + indexer also read tmp_plain).
     gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
         .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
 
@@ -3223,9 +3265,11 @@ fn q_lora(
     gpu.rmsnorm_f32(q_lat, q_norm, q_lat, cfg.rms_norm_eps)
         .map_err(|e| format!("q_norm rmsnorm layer {layer_idx}: {e:?}"))?;
 
-    // 3. Rotate q_lat for the second GEMV.
-    gpu.rotate_x_mq(q_lat, q_lat_rot, cfg.q_lora_rank)
-        .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
+    // 3. Rotate q_lat for the second GEMV — only if wq_b is MQ4.
+    if wq_b_needs_fwht {
+        gpu.rotate_x_mq(q_lat, q_lat_rot, cfg.q_lora_rank)
+            .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
+    }
 
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
     //    Use q_lat (un-rotated) for F16 path; q_lat_rot for MQ4 path.
