@@ -43,7 +43,12 @@ fn main() -> Result<(), String> {
         "usage: v4f_mtp_smoke <model.hfq> [--prompt STR] [--k N] [--windows W] [--moe 0|1]");
 
     let mut prompt = "Generate a fibonacci function in C\n".to_string();
-    let mut k: usize = 4;
+    // K=3 is the measured sweet spot on v4f.mq2lloyd-q8 + MoE:
+    // 62.5% accept, +31% effective tok/s vs plain decode. K=2 has
+    // higher accept (84.4%) but lower throughput; K≥4 collapses
+    // (40% accept at K=4, 28% at K=6). See memory entry
+    // `project_v4f_mtp_hc_plumbing_fixed.md` for the full K-sweep table.
+    let mut k: usize = 3;
     let mut windows: usize = 8;
     let mut use_moe: bool = true;
     while let Some(flag) = args.next() {
