@@ -3617,6 +3617,119 @@ pub(crate) fn update_token_id_host(state: &mut DeepseekV4State, token_id: u32) {
     host[0] = token_id as i32;
 }
 
+/// Per-batch twin of `precompute_positions`. Fills B contiguous stripes
+/// of `(num_hidden_layers + 1) * POS_SLOTS_PER_LAYER` slots in
+/// `pbs.pos_array_device_batch` — one stripe per batch row b at absolute
+/// position `start_pos + b`. Single host-side build, single htod.
+///
+/// Stripe b layout matches the single-position `state.pos_array_device`:
+/// `[layer_idx * 3 + slot]` where slot ∈ {0=qk_pos, 1=main_rope_pos,
+/// 2=indexer_rope_pos}.
+pub(crate) fn precompute_positions_batched(
+    cfg: &DeepseekV4Config,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    start_pos: u32,
+    batch_size: usize,
+) -> Result<(), String> {
+    let slots_per_pos = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
+    let total_i32s = batch_size * slots_per_pos;
+
+    let comp_rope_mode = std::env::var("HIPFIRE_V4F_COMP_ROPE_POS").ok();
+    let comp_rope_mode = comp_rope_mode.as_deref();
+
+    let mut host: Vec<i32> = vec![0i32; total_i32s];
+    for b in 0..batch_size {
+        let pos = (start_pos as usize) + b;
+        let stripe = b * slots_per_pos;
+        for layer_idx in 0..=cfg.num_hidden_layers {
+            let ratio = if layer_idx < cfg.num_hidden_layers {
+                cfg.compress_ratios[layer_idx] as usize
+            } else { 0 };
+            let base = stripe + layer_idx * POS_SLOTS_PER_LAYER;
+            host[base + 0] = pos as i32;
+            if ratio > 0 {
+                let main_rope_pos: i32 = match comp_rope_mode {
+                    Some("end") => pos as i32,
+                    Some("start") => ((pos / ratio) * ratio) as i32,
+                    _ => (((pos / ratio) * ratio) + ratio / 2) as i32,
+                };
+                let indexer_rope_pos = ((pos / ratio) * ratio) as i32;
+                host[base + 1] = main_rope_pos;
+                host[base + 2] = indexer_rope_pos;
+            } else {
+                host[base + 1] = 0;
+                host[base + 2] = 0;
+            }
+        }
+    }
+
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, total_i32s * 4)
+    };
+    gpu.memcpy_htod_auto(&pbs.pos_array_device_batch.buf, bytes)
+        .map_err(|e| format!("htod pos_array_device_batch: {e:?}"))
+}
+
+/// Per-batch twin of `precompute_attn_state`. Fills B contiguous stripes
+/// of 10 slots in `pbs.attn_state_buf_batch` — one stripe per batch row
+/// b at absolute position `start_pos + b`. Slot layout matches
+/// `fill_attn_state_host` (see line ~1389).
+pub(crate) fn precompute_attn_state_batched(
+    cfg: &DeepseekV4Config,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    start_pos: u32,
+    batch_size: usize,
+) -> Result<(), String> {
+    let slots_per_pos = 10;
+    let total_i32s = batch_size * slots_per_pos;
+
+    let win = cfg.sliding_window as i32;
+    let topk = cfg.index_topk as i32;
+    let max_compressed = env_cache::max_compress_pos() as i32;
+
+    let mut host: Vec<i32> = vec![0i32; total_i32s];
+    for b in 0..batch_size {
+        let pos = (start_pos as i32) + b as i32;
+        let stripe = b * slots_per_pos;
+
+        let swa_slot = pos % win;
+        let n_valid_swa = (pos + 1).min(win);
+        let n_compressed_4 = (pos + 1) / 4;
+        let n_compressed_128 = (pos + 1) / 128;
+        let k_active_4 = topk.min(n_compressed_4);
+        let k_active_128 = topk.min(n_compressed_128);
+        let ring_slot_4 = 4 + (pos % 4);
+        let commit_slot_4 = if (pos + 1) % 4 == 0 {
+            let s = pos / 4;
+            if s < max_compressed { s } else { -1 }
+        } else { -1 };
+        let ring_slot_128 = pos % 128;
+        let commit_slot_128 = if (pos + 1) % 128 == 0 {
+            let s = pos / 128;
+            if s < max_compressed { s } else { -1 }
+        } else { -1 };
+
+        host[stripe + 0] = swa_slot;
+        host[stripe + 1] = n_valid_swa;
+        host[stripe + 2] = n_compressed_4;
+        host[stripe + 3] = n_compressed_128;
+        host[stripe + 4] = k_active_4;
+        host[stripe + 5] = k_active_128;
+        host[stripe + 6] = ring_slot_4;
+        host[stripe + 7] = commit_slot_4;
+        host[stripe + 8] = ring_slot_128;
+        host[stripe + 9] = commit_slot_128;
+    }
+
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, total_i32s * 4)
+    };
+    gpu.memcpy_htod_auto(&pbs.attn_state_buf_batch.buf, bytes)
+        .map_err(|e| format!("htod attn_state_buf_batch: {e:?}"))
+}
+
 /// Slice the pos_array for a given layer's slot. Caller passes the slot
 /// constant (0=qk_pos, 1=main_comp_rope, 2=indexer_comp_rope).
 pub(crate) fn pos_slot(
@@ -3839,6 +3952,19 @@ pub struct PrefillBatchScratch {
     /// Separate from `pbs.positions` (which holds the chunk's
     /// [batch_size] absolute positions and is read by the indexer).
     pub comp_positions: GpuTensor,
+    /// Per-batch-position pos_array (Option B per-batch state).
+    /// `[max_batch * (num_hidden_layers + 1) * POS_SLOTS_PER_LAYER]` i32
+    /// stored as F32 — each batch row b occupies a stripe of
+    /// `(L+1) * 3` slots matching the single-position `state.pos_array_device`
+    /// layout. Populated once per chunk by `precompute_positions_batched`,
+    /// then sub-viewed into `state.pos_array_device` during the per-position
+    /// compressor fallback loop so existing per-position kernels read the
+    /// right batch row.
+    pub pos_array_device_batch: GpuTensor,
+    /// Per-batch-position attn_state buffer (Option B per-batch state).
+    /// `[max_batch * ATTN_STATE_SLOTS=10]` i32 stored as F32. Same
+    /// swap-and-sub-view pattern as pos_array_device_batch.
+    pub attn_state_buf_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -3978,6 +4104,17 @@ impl PrefillBatchScratch {
                 t
             },
             comp_positions: alloc(gpu, &[max_batch], "comp_positions", r, log_vram)?,
+            // Per-batch device-side state mirrors of state.pos_array_device
+            // and state.attn_state_buf. Sized to cover B = max_batch rows.
+            // POS_SLOTS_PER_LAYER = 3 per layer, ATTN_STATE_SLOTS = 10 total.
+            pos_array_device_batch: alloc(
+                gpu,
+                &[max_batch * (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER],
+                "pos_array_device_batch", r, log_vram,
+            )?,
+            attn_state_buf_batch: alloc(
+                gpu, &[max_batch * 10], "attn_state_buf_batch", r, log_vram,
+            )?,
             wmma_x_scratch_f16: {
                 // Cover the largest x-tensor size across all batched
                 // WMMA call sites. wo_a's input is [B, G, per_group_in]
@@ -4543,54 +4680,98 @@ fn attention_block_batched_mixed(
             }
         }
     } else {
-        for b in 0..batch_size {
-            let pos = start_pos + b as u32;
-            state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
-            state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
-            state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
-            state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
-
-            let cf_res = if comp_batched {
-                // The pre-batched [B, main_view_proj] buffer is laid out
-                // contiguous-per-row with stride main_view_proj at the
-                // wkv/wgate gemv_auto_batched call.
-                let _ = main_proj_dim; // silence warning when ratio=128
-                compressor_forward_prebatched(
-                    cfg, weights, state, gpu, layer_idx, pos,
-                    /*is_indexer=*/false,
-                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
-                )
-            } else {
-                let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-                compressor_forward(
-                    cfg, weights, state, gpu, layer_idx,
-                    &tmp_view, pos, /*is_indexer=*/false,
-                )
-            };
-            if let Err(e) = cf_res {
-                loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
-                break;
+        // Option B (2026-05-21): populate per-batch pos_array_device +
+        // attn_state_buf in pbs ONCE for this chunk. The per-position
+        // compressor kernels read indices from `state.pos_array_device`
+        // and `state.attn_state_buf` — which only hold ONE position's
+        // slots. To support the per-position fallback for ANY chunk
+        // (including unaligned ones for ratio=128 layers), swap those
+        // pointers to per-batch sub-views inside the loop.
+        if let Err(e) = precompute_positions_batched(
+            cfg, pbs, gpu, start_pos, batch_size,
+        ) {
+            loop_err = Some(format!("precompute_positions_batched l{layer_idx}: {e}"));
+        }
+        if loop_err.is_none() {
+            if let Err(e) = precompute_attn_state_batched(
+                cfg, pbs, gpu, start_pos, batch_size,
+            ) {
+                loop_err = Some(format!("precompute_attn_state_batched l{layer_idx}: {e}"));
             }
-            if ratio == 4 {
-                let cf_res2 = if comp_batched {
+        }
+
+        let slots_per_pos = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
+        let attn_state_slots = 10;
+
+        // Snapshot per-position state pointers so we can restore after
+        // the loop. Decode-time (B=1) uses these; we transiently replace
+        // them with per-batch sub-views.
+        let orig_pos_array_device = state.pos_array_device.take();
+        let orig_attn_state_buf = state.attn_state_buf.take();
+
+        if loop_err.is_none() {
+            for b in 0..batch_size {
+                let pos = start_pos + b as u32;
+                state.tmp = Some(pbs.tmp_batch.sub_offset(b * hidden, hidden));
+                state.tmp_plain = Some(pbs.tmp_plain_batch.sub_offset(b * hidden, hidden));
+                state.q_lat = Some(pbs.q_lat_batch.sub_offset(b * q_rank, q_rank));
+                state.q_lat_rot = Some(pbs.q_lat_rot_batch.sub_offset(b * q_rank, q_rank));
+                // Per-batch sub-views into the chunk-level device buffers.
+                // Layout: stripe b starts at offset (b * stripe) for both.
+                state.pos_array_device = Some(
+                    pbs.pos_array_device_batch.sub_offset(
+                        b * slots_per_pos, slots_per_pos,
+                    )
+                );
+                state.attn_state_buf = Some(
+                    pbs.attn_state_buf_batch.sub_offset(
+                        b * attn_state_slots, attn_state_slots,
+                    )
+                );
+
+                let cf_res = if comp_batched {
+                    let _ = main_proj_dim;
                     compressor_forward_prebatched(
                         cfg, weights, state, gpu, layer_idx, pos,
-                        /*is_indexer=*/true,
-                        &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                        /*is_indexer=*/false,
+                        &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
                     )
                 } else {
-                    let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+                    let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
                     compressor_forward(
                         cfg, weights, state, gpu, layer_idx,
-                        &tmp_view2, pos, /*is_indexer=*/true,
+                        &tmp_view, pos, /*is_indexer=*/false,
                     )
                 };
-                if let Err(e) = cf_res2 {
-                    loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
+                if let Err(e) = cf_res {
+                    loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
                     break;
+                }
+                if ratio == 4 {
+                    let cf_res2 = if comp_batched {
+                        compressor_forward_prebatched(
+                            cfg, weights, state, gpu, layer_idx, pos,
+                            /*is_indexer=*/true,
+                            &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                        )
+                    } else {
+                        let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
+                        compressor_forward(
+                            cfg, weights, state, gpu, layer_idx,
+                            &tmp_view2, pos, /*is_indexer=*/true,
+                        )
+                    };
+                    if let Err(e) = cf_res2 {
+                        loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
+                        break;
+                    }
                 }
             }
         }
+
+        // Restore decode-time per-position state pointers.
+        state.pos_array_device = orig_pos_array_device;
+        state.attn_state_buf = orig_attn_state_buf;
     }
     let _ = main_view_proj;
 
