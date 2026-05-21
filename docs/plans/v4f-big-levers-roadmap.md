@@ -146,6 +146,36 @@ exp-corrected sum) for numerically stable cross-tile combine.
   2-chunk prompt=128. Translation: bench could jump from 19.8 → ~35
   tok/s on 2-chunk runs.
 
+## Update (2026-05-21 evening)
+
+Following measurement on the actually-batched chunked driver post-Option-B:
+
+- **Lever 2 (ZA-fused WMMA)**: shipped opt-in (`b3a0836`), measured −1.5%
+  on v4f.mq2lloyd-q8 at B=64 vs four-call dispatch. Falsified; left as
+  opt-in infrastructure for future shape investigations.
+- **Pre-Lever-3 silent-fallback fix (Option B)** (`0128cc6`): not on
+  the original roadmap. Per-batch device-side `pos_array_device_batch`
+  and `attn_state_buf_batch` in PBS, sub-viewed into state during the
+  per-position fallback loop. **Real win: prompt=128 B=64 MoE 19.8 →
+  42.8 tok/s (+116% / 2.16×)**. The "cross-chunk decay" Lever 3 was
+  designed to attack disappeared (3.42× at p=64 → 3.22× at p=512: only
+  6% drop across 8× chunks). Lever 3 is no longer worth doing.
+- **MTP SKIP_HEAD** (`212b562`): not on the original roadmap. The
+  lm_head + d2h at the end of `mtp_forward` was 60% of per-call cost
+  during prefill MTP fill (logits unused there). Env-gated. Saves 1.3
+  s on a 501-token prompt = −8.9% of prefill stage. Deflated Lever 1's
+  remaining payoff to ~3.4% end-to-end.
+- **Lever 1 (batched MTP fill)** revised: now ~3.4% end-to-end after
+  SKIP_HEAD. ~170 LoC. Modest. Do later when bigger fish are caught.
+
+Remaining open questions:
+- What's the dominant kernel cost inside the now-actually-batched main
+  forward at B=64? (Per-token at p=512: ~24 ms.) That's likely where
+  the next big lever lives.
+- Are the small-perf commits (`9637755`/`46e2f81`/`331533d`/`3419b69`)
+  worth re-benching now that chunk 2+ actually runs them? They were
+  all measured against chunk 1 only.
+
 ## Lever 1 — Batched MTP fill (lowest priority)
 
 ### What
