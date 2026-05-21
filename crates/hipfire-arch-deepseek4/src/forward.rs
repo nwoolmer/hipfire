@@ -4954,48 +4954,29 @@ fn ffn_batched(
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
 
     if hash_routing {
-        // Hash routing: per-batch CPU lookup of static tid2eid → topk_ids,
-        // gather + normalise weights from the (already sqrt_softplus'd)
-        // scores, then upload to the same topk_indices/weights buffers
-        // the score-routed branch uses. Mirrors ffn_hash_routed
-        // line-for-line, applied per batch row.
+        // Hash routing: per-batch GPU-side tid2eid lookup + score gather
+        // + normalize + route_scale, all in one launch. Eliminates the
+        // d2h(scores) + CPU loop + 2× h2d (idx+w) round-trip that the
+        // legacy path used (which stalled the stream per hash layer).
+        // pbs.tokens already holds the chunk's token IDs as [B] i32.
         if tokens.len() < batch_size {
             return Err(format!(
                 "ffn_batched l{layer_idx}: tokens len {} < batch_size {}",
                 tokens.len(), batch_size,
             ));
         }
-        let scores_host = gpu.download_f32(&pbs.moe_scores_batch)
-            .map_err(|e| format!("d2h moe_scores l{layer_idx}: {e:?}"))?;
-        let mut topk_idx_host: Vec<i32> = Vec::with_capacity(batch_size * k_top);
-        let mut topk_w_host:   Vec<f32> = Vec::with_capacity(batch_size * k_top);
-        for b in 0..batch_size {
-            let token_id = tokens[b] as usize;
-            let row = token_id * k_top;
-            if row + k_top > layer.tid2eid_host.len() {
-                return Err(format!(
-                    "ffn_batched hash l{layer_idx}: token_id {token_id} \
-                     out of tid2eid range ({} entries)",
-                    layer.tid2eid_host.len()
-                ));
-            }
-            let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k_top].iter()
-                .map(|&i| i.min((n_exp - 1) as u32))
-                .collect();
-            let scores_b = &scores_host[b * n_exp..(b + 1) * n_exp];
-            let wts = match gather_normalized_weights(scores_b, &topk_ids) {
-                Some(w) => w,
-                None => vec![0.0; k_top],
-            };
-            topk_idx_host.extend(topk_ids.iter().map(|&i| i as i32));
-            topk_w_host.extend(wts.iter().map(|&w| w * route_scale));
-        }
-        let idx_bytes: Vec<u8> = topk_idx_host.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&pbs.moe_topk_indices_batch.buf, &idx_bytes)
-            .map_err(|e| format!("htod hash topk_idx l{layer_idx}: {e:?}"))?;
-        let w_bytes: Vec<u8> = topk_w_host.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&pbs.moe_topk_weights_batch.buf, &w_bytes)
-            .map_err(|e| format!("htod hash topk_w l{layer_idx}: {e:?}"))?;
+        let tid2eid_dev = layer.tid2eid_dev.as_ref().ok_or_else(|| format!(
+            "ffn_batched hash l{layer_idx}: tid2eid_dev missing (pre-FP4 \
+             quant skipped tid2eid; HFQ load_weights should still populate \
+             the device buffer)"
+        ))?;
+        gpu.hash_router_normalize_f32_batched(
+            tid2eid_dev, &pbs.moe_scores_batch, &pbs.tokens,
+            &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+            n_exp as i32, k_top as i32, route_scale, batch_size as i32,
+        ).map_err(|e| format!(
+            "hash_router_normalize_f32_batched l{layer_idx}: {e:?}"
+        ))?;
     } else {
         let gate_bias = layer.gate_bias.as_ref()
             .ok_or_else(|| format!("layer {layer_idx} gate.bias missing"))?;
