@@ -1930,6 +1930,15 @@ pub fn mtp_forward(
     // fixed the input-side full-HC plumbing. With distinct HC streams
     // entering the MTP block, the output head-HC mix becomes meaningful;
     // gated opt-in until validated end-to-end.
+    //
+    // HIPFIRE_V4F_MTP_SKIP_HEAD=1 short-circuits steps 8+9 (return empty
+    // Vec immediately). Use during prefill MTP fill: the loop's only
+    // purpose there is to write the MTP layer's SWA ring, the logits
+    // are never read. Skipping saves the lm_head GEMV + the d2h+sync
+    // (line 1991-92 below) that otherwise stalls the stream per call.
+    if std::env::var("HIPFIRE_V4F_MTP_SKIP_HEAD").ok().as_deref() == Some("1") {
+        return Ok(Vec::new());
+    }
     if state.final_norm.is_none() {
         state.final_norm = Some(gpu.alloc_tensor(&[hidden], DType::F32)
             .map_err(|e| format!("alloc final_norm: {e:?}"))?);

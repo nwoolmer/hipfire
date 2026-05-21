@@ -155,9 +155,11 @@ fn main() -> Result<(), String> {
         //   3. After the last chunk, final_norm_and_head_last_batched(...)
         //      gives last_logits for the first generation token.
         //
-        // Main forward batches → ~2.7× speedup at prompt=64 single chunk.
-        // MTP fill is still per-position; Phase B would batch the MTP
-        // layer block too if Phase A measures a worthwhile win.
+        // Lever 1 measurement instrumentation (2026-05-21): tracks per-stage
+        // wallclock to inform whether batched-MTP fill is worth implementing.
+        let mut main_us_total: u128 = 0;
+        let mut mtp_us_total: u128 = 0;
+        let mut mtp_us_each: Vec<u128> = Vec::new();
         let stream_len = cfg.hc_mult * cfg.hidden_size;
         // mtp_last_hidden is lazily allocated by final_norm_and_head /
         // mtp_forward — but our loop writes into it BEFORE either runs.
@@ -180,10 +182,14 @@ fn main() -> Result<(), String> {
             let chunk = &prompt_tokens[pos_cursor..pos_cursor + chunk_size];
             let is_last_chunk = pos_cursor + chunk_size == prompt_tokens.len();
 
-            // 1. Main forward batched on chunk.
+            // 1. Main forward batched on chunk — TIMED with device sync.
+            let t_main = Instant::now();
             forward_prefill_batch_chunk(
                 &cfg, &weights, &mut state, &mut gpu, &pbs, chunk, pos_cursor as u32,
             )?;
+            gpu.hip.device_synchronize()
+                .map_err(|e| format!("sync after main chunk: {e:?}"))?;
+            main_us_total += t_main.elapsed().as_micros();
 
             // 2. MTP fill for positions [pos_cursor..pos_cursor + chunk_size)
             //    (skip the LAST position of the last chunk — its next_tok is
@@ -203,6 +209,12 @@ fn main() -> Result<(), String> {
             } else {
                 chunk_size
             };
+            // MTP fill inner loop — TIMED with device sync after each call.
+            // Skip lm_head + logits d2h during the fill loop: those outputs
+            // are never read here, and the d2h syncs the stream per call.
+            // The env is scoped to this loop and cleared before spec-decode.
+            std::env::set_var("HIPFIRE_V4F_MTP_SKIP_HEAD", "1");
+            let t_mtp_total = Instant::now();
             for b in 0..mtp_end_b {
                 let absolute_pos = pos_cursor + b;
                 // Copy h_i (= streams_batch[b]) into mtp_last_hidden so
@@ -223,11 +235,18 @@ fn main() -> Result<(), String> {
                 let hidden_ptr: *const rdna_compute::GpuTensor =
                     state.mtp_last_hidden.as_ref().unwrap();
                 let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
+                let t_each = Instant::now();
                 let _ = mtp_forward(
                     &cfg, &weights, &mut state, &mut gpu, hidden, next_tok,
                     absolute_pos as u32,
                 )?;
+                gpu.hip.device_synchronize()
+                    .map_err(|e| format!("sync after mtp_forward b={b}: {e:?}"))?;
+                mtp_us_each.push(t_each.elapsed().as_micros());
             }
+            mtp_us_total += t_mtp_total.elapsed().as_micros();
+            // Restore default so spec-decode draft steps compute logits.
+            std::env::remove_var("HIPFIRE_V4F_MTP_SKIP_HEAD");
 
             pos_cursor += chunk_size;
             state.n_tokens = pos_cursor as u64;
@@ -247,6 +266,34 @@ fn main() -> Result<(), String> {
         // so generation can start cleanly.
         let last_pos = (prompt_tokens.len() - 1) as u32;
         precompute_positions(&cfg, &mut state, &mut gpu, last_pos)?;
+        // ── Lever 1 measurement breakdown ──────────────────────────────
+        eprintln!("\n--- prefill stage breakdown ---");
+        eprintln!(
+            "  main forward total: {:>10} us  ({:.2}s)",
+            main_us_total, main_us_total as f64 / 1e6,
+        );
+        eprintln!(
+            "  mtp fill total    : {:>10} us  ({:.2}s)  [{} calls]",
+            mtp_us_total, mtp_us_total as f64 / 1e6, mtp_us_each.len(),
+        );
+        if !mtp_us_each.is_empty() {
+            mtp_us_each.sort();
+            let n = mtp_us_each.len();
+            let med = mtp_us_each[n / 2];
+            let min = mtp_us_each[0];
+            let max = mtp_us_each[n - 1];
+            let mean = mtp_us_each.iter().sum::<u128>() / n as u128;
+            eprintln!(
+                "  mtp per-call us   : min={min} med={med} mean={mean} max={max}"
+            );
+        }
+        let total = main_us_total + mtp_us_total;
+        if total > 0 {
+            eprintln!(
+                "  mtp share of stage: {:.1}%",
+                100.0 * mtp_us_total as f64 / total as f64
+            );
+        }
     }
     eprintln!("Prefill done in {:.2}s, n_tokens={}",
         pp_start.elapsed().as_secs_f64(), state.n_tokens);
