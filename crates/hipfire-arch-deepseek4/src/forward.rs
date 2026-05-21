@@ -1886,7 +1886,15 @@ fn ffn_stub(
     // Skip FWHT rotations when downstream weight dtype doesn't need
     // them (Q8/F16/F32 paths read x_plain). For v4f-q8-mtp this skips
     // ~2-3 rotation kernels per layer per token.
-    let gate_up_need_fwht = weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+    //
+    // CORRECTNESS: the routed-MoE path (ffn_routed) ALSO reads
+    // ffn_x_rot — routed experts at MQ2-Lloyd consume FWHT-rotated
+    // input. So we must keep the gate/up rotation alive when MoE is
+    // on (HIPFIRE_V4F_MOE=1), regardless of shared weight dtype.
+    let moe_will_run = env_cache::moe_on();
+    let gate_up_need_fwht = moe_will_run
+        || weight_needs_fwht(shared_w1)
+        || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
     // 1. RMSNorm (+ optional FWHT) for the gate/up GEMVs.
