@@ -15,10 +15,17 @@
 
 // `n_stride` and `k_stride` are the STORAGE strides (allocated row size
 // of `scores` and `top_indices`). `n_iter` and `k_fill` are the actual
-// work bounds — typically much smaller for short chunks (n_iter ≈ chunk
-// max n_filled; k_fill = min(topk_max, n_iter)). Iterating only n_iter
-// slots and filling only k_fill ranks is a 100×+ win at low context.
-// Ranks ≥ k_fill get -1 sentinels.
+// work bounds.
+//
+// Fast path: when n_iter <= k_fill (which holds for all batch positions
+// where n_compressed <= topk_max — i.e. context ≤ 8 K with V4F defaults)
+// the top-K is "use all of them"; downstream attention is order-
+// invariant w.r.t. topk_idx ordering, so we can write [0, 1, …,
+// n_iter-1, sentinel-padded] in parallel and skip the O(N^2) loop.
+//
+// Slow path: still single-thread selection sort when n_iter > k_fill.
+// Same caveat as indexer_top_k_buf — port to parallel top-K when long-
+// context prefill at >8 K matters.
 extern "C" __global__ void indexer_top_k_batched(
     const float* __restrict__ scores,
     int*         __restrict__ top_indices,
@@ -32,18 +39,28 @@ extern "C" __global__ void indexer_top_k_batched(
     const int head = blockIdx.x;
     const int b    = blockIdx.y;
     if (head >= n_idx_heads || b >= batch_size) return;
+
+    const size_t out_base    = (size_t)b * n_idx_heads * k_stride
+                             + (size_t)head * k_stride;
+
+    // Fast path: n_iter <= k_fill. Identity-write across all threads.
+    if (n_iter <= k_fill) {
+        for (int i = threadIdx.x; i < k_stride; i += blockDim.x) {
+            top_indices[out_base + i] = (i < n_iter) ? i : -1;
+        }
+        return;
+    }
+
+    // Slow path: actual selection. Single-thread per (head, b) block.
     if (threadIdx.x != 0) return;
 
     const size_t scores_base = (size_t)b * n_idx_heads * n_stride
                              + (size_t)head * n_stride;
-    const size_t out_base    = (size_t)b * n_idx_heads * k_stride
-                             + (size_t)head * k_stride;
 
     extern __shared__ unsigned char taken_smem[];
     char* taken = (char*)taken_smem;
     for (int i = 0; i < n_iter; ++i) taken[i] = 0;
 
-    // Find k_fill best unselected scores.
     for (int rank = 0; rank < k_fill; ++rank) {
         float best = -FLT_MAX;
         int best_idx = -1;
@@ -59,8 +76,6 @@ extern "C" __global__ void indexer_top_k_batched(
             top_indices[out_base + rank] = -1;
         }
     }
-    // Fill remaining ranks (k_fill .. k_stride) with -1 sentinels so
-    // downstream gather treats them as "no expert".
     for (int rank = k_fill; rank < k_stride; ++rank) {
         top_indices[out_base + rank] = -1;
     }

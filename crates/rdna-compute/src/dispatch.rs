@@ -23049,11 +23049,15 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
         ];
         let smem = n_iter as u32;
+        // Block sized to parallelise the fast-path identity write of
+        // up to k_stride indices across threads (each thread writes
+        // k_stride/128 slots via stride). Slow path serialises on
+        // thread 0 — extra threads early-return.
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [n_idx_heads as u32, batch_size as u32, 1],
-                [1, 1, 1],
+                [128, 1, 1],
                 smem,
                 self.stream_ref(),
                 &mut params,
