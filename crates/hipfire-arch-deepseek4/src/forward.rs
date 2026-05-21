@@ -4922,17 +4922,37 @@ fn attention_block_batched_mixed(
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
-    gpu.v4f_attn_swa_topk_batched_f32(
-        &pbs.q_batch,
-        &pbs.swa_staged_batch, &pbs.swa_staged_batch,    // K=V tied
-        &pbs.topk_staged_batch, &pbs.topk_staged_batch,
-        attn_sink,
-        &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
-        &pbs.attn_out_raw_batch,
-        n_heads as i32, head_dim as i32,
-        win as i32, topk_max as i32,
-        batch_size as i32,
-    ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    // HIPFIRE_V4F_ATTN_WMMA=1 routes through the WMMA Q·K^T variant.
+    // Per-PMC measurement, the F32 path is L2-BW-bound (91% L2 hit,
+    // 95% MemUnit busy); WMMA increases compute per L2 byte. Default
+    // OFF until PPL-validated.
+    let attn_wmma = std::env::var("HIPFIRE_V4F_ATTN_WMMA")
+        .map(|s| s == "1").unwrap_or(false);
+    if attn_wmma {
+        gpu.v4f_attn_swa_topk_batched_wmma_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch, &pbs.swa_staged_batch,
+            &pbs.topk_staged_batch, &pbs.topk_staged_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32, head_dim as i32,
+            win as i32, topk_max as i32,
+            batch_size as i32,
+        ).map_err(|e| format!("v4f_attn_swa_topk_batched_wmma l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.v4f_attn_swa_topk_batched_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch, &pbs.swa_staged_batch,    // K=V tied
+            &pbs.topk_staged_batch, &pbs.topk_staged_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32, head_dim as i32,
+            win as i32, topk_max as i32,
+            batch_size as i32,
+        ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 5. Inverse RoPE.
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
@@ -5240,9 +5260,29 @@ fn ffn_batched(
     // 11. Routed expert gate_up (MQ2-Lloyd, scatter-by-expert grouped K4).
     // K4-unrolled variant (4 independent accumulators per thread for ILP).
     // Opt out via HIPFIRE_V4F_GATEUP_K4=0 (default: on).
+    //
+    // MQ2-WMMA opt-in (FALSIFIED at B=64, 2026-05-21): kernels
+    // `gemm_mq2g256_lloyd_moe_gate_up_wmma` and `gemm_mq2g256_lloyd_moe
+    // _down_residual_scaled_wmma` exist as foundation but measured 3×
+    // SLOWER than K4 in production. Reason: single-col WMMA wastes
+    // 15/16 of WMMA hardware (MoE batches don't fill 16x16 tiles
+    // homogeneously at V4F's B=64 / n_exp=256 / k_top=6 — avg 1.5
+    // tuples per expert). Wiring retained as `HIPFIRE_V4F_MQ2_WMMA=1`
+    // opt-in for future investigation at larger B; default off.
+    let mq2_wmma = std::env::var("HIPFIRE_V4F_MQ2_WMMA")
+        .map(|s| s == "1").unwrap_or(false);
     let gate_up_k4 = std::env::var("HIPFIRE_V4F_GATEUP_K4")
         .map(|s| s != "0").unwrap_or(true);
-    if moe_grouped && gate_up_k4 {
+    if mq2_wmma {
+        let n_inputs = (batch_size * hidden) as i64;
+        gpu.convert_f32_to_f16(&pbs.ffn_x_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs)
+            .map_err(|e| format!("convert_f32_to_f16 ffn_x_rot l{layer_idx}: {e:?}"))?;
+        gpu.gemm_mq2g256_lloyd_moe_gate_up_wmma(
+            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.wmma_x_scratch_f16,
+            &pbs.moe_gate_batch, &pbs.moe_up_batch,
+            2 * im, hidden, k_top, batch_size,
+        ).map_err(|e| format!("gemm_mq2g256_moe_gate_up_wmma l{layer_idx}: {e:?}"))?;
+    } else if moe_grouped && gate_up_k4 {
         gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_grouped_k4(
             gate_up_ptrs,
             &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,
@@ -5280,7 +5320,19 @@ fn ffn_batched(
     // Opt out via HIPFIRE_V4F_DOWN_K4=0 (default: on).
     let down_k4 = std::env::var("HIPFIRE_V4F_DOWN_K4")
         .map(|s| s != "0").unwrap_or(true);
-    if moe_grouped && down_k4 {
+    if mq2_wmma {
+        // Same WMMA opt-in: F16-stage the moe_rot_batch and dispatch the
+        // single-col WMMA down kernel. moe_rot_batch is laid out as
+        // [B, K_TOP, IM] contiguous = batch_size * k_top * im floats.
+        let n_inputs = (batch_size * k_top * im) as i64;
+        gpu.convert_f32_to_f16(&pbs.moe_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs)
+            .map_err(|e| format!("convert_f32_to_f16 moe_rot l{layer_idx}: {e:?}"))?;
+        gpu.gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma(
+            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+            &pbs.wmma_x_scratch_f16, &pbs.ffn_out_batch,
+            hidden, im, k_top, batch_size,
+        ).map_err(|e| format!("gemm_mq2g256_moe_down_wmma l{layer_idx}: {e:?}"))?;
+    } else if moe_grouped && down_k4 {
         gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_grouped_k4(
             w2_ptrs,
             &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,

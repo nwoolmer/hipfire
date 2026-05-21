@@ -21371,6 +21371,72 @@ impl Gpu {
         }
     }
 
+    /// WMMA Q·K^T variant of v4f_attn_swa_topk_batched_f32. Same ABI
+    /// and semantics; Phase 2 (Q·K^T) uses WMMA mma_f32_16x16x16_f16.
+    /// P·V stays in the scalar path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_topk_batched_wmma_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor, swa_v: &GpuTensor,
+        topk_k: &GpuTensor, topk_v: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32, head_dim: i32,
+        swa_window: i32, topk_window: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_attn_swa_topk_batched_wmma",
+            kernels::V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC,
+            "v4f_attn_swa_topk_batched_wmma_f32",
+        )?;
+        let func = &self.functions["v4f_attn_swa_topk_batched_wmma_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let tkp = topk_k.buf.as_ptr();
+        let tvp = topk_v.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tkp as *const _ as *mut c_void,
+            &tvp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F head HC mix — compute the per-stream `pre` weights for the
     /// 4-stream → hidden projection before lm_head. Matches upstream
     /// `ParallelHead.hc_head`.
@@ -23541,6 +23607,104 @@ impl Gpu {
         );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// V4F MoE gate_up — Option A single-col WMMA over MQ2-Lloyd weights.
+    /// Each block handles 16 M-rows × 1 batch position; WMMA tile is
+    /// 1/16 col-utilized but throughput per useful output is ~2× over
+    /// the scalar K4 path. Tile-homogeneity safe across MoE expert
+    /// routing (since each block ties to a single expert). Caller must
+    /// stage F32 inputs to F16 via `convert_f32_to_f16` upstream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_gate_up_wmma(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot_f16: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq2g256_lloyd_moe_gate_up_wmma",
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GATE_UP_WMMA_SRC,
+            "gemm_mq2g256_lloyd_moe_gate_up_wmma",
+        )?;
+        let func = &self.functions["gemm_mq2g256_lloyd_moe_gate_up_wmma"];
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot_f16.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut kt_val as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, k_top as u32, batch_size as u32],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
+    /// V4F MoE down — Option A single-col WMMA over MQ2-Lloyd weights
+    /// with scaled residual atomicAdd. Counterpart of
+    /// `gemm_mq2g256_lloyd_moe_gate_up_wmma`. Input `rot_batch_f16` is
+    /// F16-staged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch_f16: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma",
+            kernels::GEMM_MQ2G256_LLOYD_MOE_DOWN_RESIDUAL_SCALED_WMMA_SRC,
+            "gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma",
+        )?;
+        let func = &self.functions["gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma"];
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = rot_batch_f16.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut kt_val as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, k_top as u32, batch_size as u32],
+                [32, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
     }
 
     /// V4F MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with scaled
