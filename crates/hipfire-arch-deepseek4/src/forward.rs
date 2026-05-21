@@ -3930,11 +3930,13 @@ fn attention_block_batched_swa_only(
     }
 
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
-    //    The full [B, n_heads * head_dim] vector at once.
-    gpu.rotate_x_mq_batched(
-        &pbs.attn_out_raw_batch, &pbs.attn_out_raw_rot_batch,
-        n_heads * head_dim, batch_size,
-    ).map_err(|e| format!("rotate attn_out_raw_batch l{layer_idx}: {e:?}"))?;
+    //    Skip if wo_a doesn't need FWHT input (Q8/F16/F32 weights).
+    if weight_needs_fwht(wo_a) {
+        gpu.rotate_x_mq_batched(
+            &pbs.attn_out_raw_batch, &pbs.attn_out_raw_rot_batch,
+            n_heads * head_dim, batch_size,
+        ).map_err(|e| format!("rotate attn_out_raw_batch l{layer_idx}: {e:?}"))?;
+    }
 
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
@@ -4016,10 +4018,13 @@ fn attention_block_batched_swa_only(
     }
 
     // 8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch.
-    gpu.rotate_x_mq_batched(
-        &pbs.wo_a_out_batch, &pbs.wo_a_out_rot_batch,
-        groups_o_lora, batch_size,
-    ).map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    //    Skip if wo_b doesn't need FWHT input.
+    if weight_needs_fwht(wo_b) {
+        gpu.rotate_x_mq_batched(
+            &pbs.wo_a_out_batch, &pbs.wo_a_out_rot_batch,
+            groups_o_lora, batch_size,
+        ).map_err(|e| format!("rotate wo_a_out l{layer_idx}: {e:?}"))?;
+    }
 
     // 9. wo_b GEMV batched: wo_a_out_rot_batch → attn_out_batch.
     //    Standard non-block-diagonal GEMV; gemv_auto_batched handles
@@ -4627,11 +4632,23 @@ fn ffn_batched(
     let hidden = cfg.hidden_size;
     let im = cfg.moe_intermediate_size;
 
-    // 1. Fused RMSNorm + FWHT rotate of hc_x_in_batch → ffn_x_rot_batch.
-    gpu.fused_rmsnorm_rotate_mq_batched(
-        &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_rot_batch,
-        hidden, cfg.rms_norm_eps, batch_size,
-    ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched ffn l{layer_idx}: {e:?}"))?;
+    // Skip dead FWHT rotations on prefill (mirror decode-path FWHT skip).
+    // Routed MoE consumes ffn_x_rot_batch (MQ2-Lloyd → needs FWHT), so keep
+    // the gate/up rotation alive when MoE is on. Down rotation only feeds
+    // shared_w2 — gate purely on shared_w2 dtype.
+    let moe_will_run = env_cache::moe_on();
+    let gate_up_need_fwht = moe_will_run
+        || weight_needs_fwht(shared_w1)
+        || weight_needs_fwht(shared_w3);
+    let down_needs_fwht = weight_needs_fwht(shared_w2);
+
+    // 1. RMSNorm (+ optional FWHT) of hc_x_in_batch → ffn_x_rot_batch.
+    if gate_up_need_fwht {
+        gpu.fused_rmsnorm_rotate_mq_batched(
+            &pbs.hc_x_in_batch, ffn_norm, &pbs.ffn_x_rot_batch,
+            hidden, cfg.rms_norm_eps, batch_size,
+        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched ffn l{layer_idx}: {e:?}"))?;
+    }
 
     // 1b. Plain RMSNorm → ffn_x_plain_batch.
     gpu.rmsnorm_batched(
@@ -4653,10 +4670,12 @@ fn ffn_batched(
         im, batch_size, cfg.swiglu_limit,
     ).map_err(|e| format!("v4f_silu_mul_clamp_f32_batched shared l{layer_idx}: {e:?}"))?;
 
-    // 5. FWHT rotate silu output.
-    gpu.rotate_x_mq_batched(
-        &pbs.ffn_shared_gate_batch, &pbs.ffn_shared_rot_batch, im, batch_size,
-    ).map_err(|e| format!("rotate_x_mq_batched shared silu l{layer_idx}: {e:?}"))?;
+    // 5. FWHT rotate silu output — skip if shared_w2 doesn't need FWHT.
+    if down_needs_fwht {
+        gpu.rotate_x_mq_batched(
+            &pbs.ffn_shared_gate_batch, &pbs.ffn_shared_rot_batch, im, batch_size,
+        ).map_err(|e| format!("rotate_x_mq_batched shared silu l{layer_idx}: {e:?}"))?;
+    }
 
     // 6. Shared down GEMV → ffn_out_batch.
     gemv_auto_batched_wmma(
