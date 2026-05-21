@@ -1587,6 +1587,8 @@ pub const INDEXER_COMPRESSED_K_SCORE_SRC: &str =
     include_str!("../../../kernels/src/indexer_compressed_k_score.hip");
 pub const INDEXER_TOP_K_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k.hip");
+pub const INDEXER_TOP_K_BUF_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf.hip");
 pub const INDEXER_KV_GATHER_SRC: &str =
     include_str!("../../../kernels/src/indexer_kv_gather.hip");
 
@@ -1876,6 +1878,8 @@ pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
 /// like the older indexer_compressed_k_score variant).
 pub const INDEXER_RELU_SCORE_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score.hip");
+pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_buf.hip");
 
 /// V4F indexer-extended attention: gather K/V from main_kv_cache at
 /// top-K compressed-slot indices into a [n_kv, head_dim, K] buffer

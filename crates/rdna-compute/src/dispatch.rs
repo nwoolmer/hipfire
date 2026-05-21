@@ -20198,6 +20198,56 @@ impl Gpu {
     /// `scores[n] = sum_h relu(q[h, :] · k_cache[n, :]) * weights[h]`.
     /// Block per slot N, threads-per-block = H (one head per thread),
     /// LDS reduction across heads.
+    /// HIP-graphs-safe twin of `indexer_relu_score_f32`. Reads `N` from
+    /// a device buffer and launches with a FIXED grid sized to `max_n`
+    /// (typically `HIPFIRE_V4F_MAX_COMPRESS_POS = 2048`). Blocks beyond
+    /// N_buf[0] write a `-inf` sentinel into `scores` so the downstream
+    /// `indexer_top_k_buf` (which also reads N from buf) ignores them.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_relu_score_f32_buf(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        weights: &GpuTensor,
+        scores: &GpuTensor,
+        n_buf: &GpuTensor,
+        max_n: i32,
+        h: i32,
+        d: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("indexer_relu_score_f32_buf",
+            kernels::INDEXER_RELU_SCORE_BUF_SRC, "indexer_relu_score_f32_buf")?;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let nbp = n_buf.buf.as_ptr();
+        let mut hi = h;
+        let mut di = d;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nbp as *const _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(wp);
+            b.push_ptr(sp); b.push_ptr(nbp);
+            b.push_i32(hi); b.push_i32(di);
+            b
+        };
+        self.launch_maybe_blob(
+            "indexer_relu_score_f32_buf",
+            [max_n as u32, 1, 1], [h as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
     pub fn indexer_relu_score_f32(
         &mut self,
         q: &GpuTensor,         // [H, D] F32
@@ -22379,6 +22429,53 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// HIP-graphs-safe twin of `indexer_top_k`. Reads `n_compressed` and
+    /// `k` from device buffers; the output `top_indices` is sized to
+    /// `max_k` per head and ranks ≥ k are filled with `-1` sentinels.
+    /// Shared memory is sized for `max_n_compressed` to keep capture-
+    /// time launch constant.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn indexer_top_k_buf(
+        &mut self,
+        scores: &GpuTensor,
+        top_indices: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        k_buf: &GpuTensor,
+        n_idx_heads: i32,
+        max_n_compressed: i32,
+        max_k: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("indexer_top_k_buf",
+            kernels::INDEXER_TOP_K_BUF_SRC, "indexer_top_k_buf")?;
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let nbp = n_compressed_buf.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let mut h = n_idx_heads;
+        let mut mk = max_k;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &nbp as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut mk as *mut _ as *mut c_void,
+        ];
+        let smem = max_n_compressed as u32;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(sp); b.push_ptr(ti); b.push_ptr(nbp); b.push_ptr(kbp);
+            b.push_i32(h); b.push_i32(mk);
+            b
+        };
+        self.launch_maybe_blob(
+            "indexer_top_k_buf",
+            [n_idx_heads as u32, 1, 1], [1, 1, 1], smem,
+            &mut params, blob_builder,
+        )
     }
 
     /// Phase 2 — Per-head top-k selection.

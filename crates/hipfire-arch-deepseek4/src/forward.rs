@@ -1015,9 +1015,14 @@ fn indexer_forward(
     // Writes happen when `(pos+1) % ratio == 0`. Just-finished pos:
     //   n_filled = (pos + 1) / ratio  (integer)
     let n_filled = (pos + 1) / ratio;
-    if n_filled == 0 { return Ok(0); }
-    let max_compressed: usize = std::env::var("HIPFIRE_V4F_MAX_COMPRESS_POS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+    // HIP-graphs note: the host-side `if n_filled == 0 { return 0 }`
+    // early return was removed. The buf-variant kernels handle n=0
+    // gracefully (relu_score writes -inf sentinels, top_k writes -1
+    // sentinels, downstream gather kernels skip -1 idx). Always
+    // running the kernels means the captured graph contains them
+    // whether warmup hit them or not, fixing graph replay at early
+    // positions.
+    let max_compressed = env_cache::max_compress_pos();
     let n = n_filled.min(max_compressed);
 
     let wq_b = layer.indexer_wq_b.as_ref()
@@ -1076,22 +1081,34 @@ fn indexer_forward(
     gemv_auto(gpu, weights_proj, tmp, tmp_plain, idx_w, h, cfg.hidden_size)?;
 
     // 4. Score: combined relu-weighted dot products.
+    // HIP-graphs-safe: read N (n_compressed_4) from attn_state_buf[2]
+    // instead of baking it as i32 kernarg + sub_offset(0, n*d) view.
+    // We pass the FULL kv_cache and scores pointers; the buf kernel
+    // bounds work to the first N positions and writes -inf to out-of-
+    // range scores so top_k_buf ignores them.
     let kv_cache = state._indexer[layer_idx].indexer_kv_cache.as_ref()
         .ok_or_else(|| "indexer: kv_cache missing".to_string())?;
-    // Sub-view K_cache to just the filled slots.
-    let k_cache_view = kv_cache.sub_offset(0, n * d);
     let scores = state._indexer[layer_idx].index_score.as_ref().unwrap();
-    let scores_view = scores.sub_offset(0, n);
-    gpu.indexer_relu_score_f32(q_idx, &k_cache_view, idx_w, &scores_view,
-        h as i32, d as i32, n as i32)
-        .map_err(|e| format!("idx score l{layer_idx}: {e:?}"))?;
+    let attn_buf = state.attn_state_buf.as_ref()
+        .ok_or_else(|| "indexer: attn_state_buf missing".to_string())?;
+    let n_buf = attn_buf.sub_offset(2, 1);   // n_compressed_4
+    let k_buf = attn_buf.sub_offset(4, 1);   // k_active_4
+    gpu.indexer_relu_score_f32_buf(
+        q_idx, kv_cache, idx_w, scores,
+        &n_buf, max_compressed as i32,
+        h as i32, d as i32,
+    ).map_err(|e| format!("idx score buf l{layer_idx}: {e:?}"))?;
 
-    // 5. Top-K: combined scores [N], single "head".
+    // 5. Top-K: read N + K from device buffers.
     let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-    let k_take = k.min(n);
-    gpu.indexer_top_k(&scores_view, topk,
-        /*n_idx_heads=*/1, n as i32, k_take as i32)
-        .map_err(|e| format!("idx top_k l{layer_idx}: {e:?}"))?;
+    gpu.indexer_top_k_buf(
+        scores, topk,
+        &n_buf, &k_buf,
+        /*n_idx_heads=*/1,
+        max_compressed as i32,
+        k as i32,
+    ).map_err(|e| format!("idx top_k buf l{layer_idx}: {e:?}"))?;
+    let _ = n; // legacy host-computed; not used after migration
 
     Ok(n)
 }
