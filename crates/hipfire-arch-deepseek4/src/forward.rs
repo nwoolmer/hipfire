@@ -4160,7 +4160,7 @@ fn attention_block_batched_swa_only(
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch, MQ4 prerotated).
-    //    Q8_0    → per-(B, G) sequential gemv_auto loop (still TODO).
+    //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
     let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
@@ -4172,6 +4172,15 @@ fn attention_block_batched_swa_only(
                 n_groups as i32, o_lora_rank as i32, per_group_in as i32,
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        DType::Q8_0 if wo_a_batched => {
+            // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
+            // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
+            gpu.wo_per_group_batched_q8_0(
+                wo_a, &pbs.attn_out_raw_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
         }
         DType::Raw if wo_a_batched => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
@@ -4729,7 +4738,7 @@ fn attention_block_batched_mixed(
     // 7. wo_a per-group batched.
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
-    //    Q8_0    → per-(B, G) sequential gemv_auto loop.
+    //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
     let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
@@ -4741,6 +4750,15 @@ fn attention_block_batched_mixed(
                 n_groups as i32, o_lora_rank as i32, per_group_in as i32,
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
+        }
+        DType::Q8_0 if wo_a_batched => {
+            // Q8_0 contract: plain (non-FWHT) input. Same layout
+            // assumption as the swa-only sibling.
+            gpu.wo_per_group_batched_q8_0(
+                wo_a, &pbs.attn_out_raw_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
         }
         DType::Raw if wo_a_batched => {
             gpu.wo_per_group_batched_hfq4g256(

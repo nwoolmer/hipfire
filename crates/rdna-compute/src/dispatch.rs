@@ -21814,6 +21814,57 @@ impl Gpu {
         }
     }
 
+    /// V4F per-group O-LoRA batched GEMV — Q8_0-packed wo_a.
+    /// Sibling of `wo_per_group_batched_hfq4g256` for the Q8 case
+    /// (v4f-mq2lloyd-q8 builds). Single launch in place of B × G
+    /// per-position `gemv_q8_0` calls — collapses the per-(b, g) loop
+    /// in `attention_block_batched_*` for Q8_0 wo_a.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 32 * 34] bytes (Q8_0-packed)
+        x_in: &GpuTensor,    // [B, G, K] plain F32 (no FWHT)
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "wo_per_group_batched_q8_0",
+            kernels::WO_PER_GROUP_BATCHED_Q8_0_SRC,
+            "wo_per_group_batched_q8_0",
+        )?;
+        let func = &self.functions["wo_per_group_batched_q8_0"];
+        let wp = wo_a.buf.as_ptr();
+        let xp = x_in.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_size as u32, g as u32],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// V4F per-group O-LoRA batched GEMV — HFQ4G256-packed wo_a.
     /// Sibling of `wo_per_group_batched_f32` for the MQ4 case. Input
     /// `x_in` must be FWHT-pre-rotated. Single launch in place of B×G

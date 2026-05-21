@@ -1793,6 +1793,13 @@ pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256.hip");
 
+/// V4F per-group O-LoRA batched GEMV for Q8_0-packed wo_a (Phase D,
+/// 2026-05-21). Sibling of `wo_per_group_batched_hfq4g256` for the
+/// v4f-mq2lloyd-q8 build where wo_a is Q8_0. Single launch in place of
+/// B × G `gemv_q8_0` calls — collapses ~32k per-chunk dispatches.
+pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");
+
 /// V4F MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
