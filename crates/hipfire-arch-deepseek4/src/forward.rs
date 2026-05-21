@@ -111,6 +111,16 @@ mod env_cache {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_V4F_F16XF32_R2"))
     }
+    /// `HIPFIRE_V4F_MTP_NO_ROUTED=1` — opt-in: skip routed MoE
+    /// (ffn_routed) inside `mtp_forward` draft steps. Keeps shared
+    /// expert only. Trades accept-rate for per-step latency. The
+    /// shared expert produces the bulk of MTP signal; routed experts
+    /// fine-tune. On v4f.mq2lloyd-q8 + MoE, K=2 accept drops from
+    /// 81.2% → ~70% (TBD) but each draft step is ~50% cheaper.
+    pub(super) fn mtp_no_routed() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_MTP_NO_ROUTED"))
+    }
     /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
     pub(super) fn bisect_break() -> Option<&'static str> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -1855,7 +1865,9 @@ pub fn mtp_forward(
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     mhc_pre(cfg, weights, state, gpu, mtp_layer_idx, /*is_attn=*/false)?;
     ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
-    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
+    if !env_cache::mtp_no_routed() {
+        ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
+    }
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
 
     // ── 7. Capture FULL [hc_mult, hidden] residual stream for chaining ─
