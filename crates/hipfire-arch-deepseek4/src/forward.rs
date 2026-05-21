@@ -89,6 +89,17 @@ mod env_cache {
                 .ok().and_then(|s| s.parse().ok())
         })
     }
+    /// `HIPFIRE_V4F_ATTN` — when "pos0", attn_stub uses the diagnostic
+    /// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
+    pub(super) fn attn_pos0() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() == Some("pos0"))
+    }
+    /// `HIPFIRE_V4F_NO_MIXED` — opt out of the mixed (SWA + main_kv) attn path.
+    pub(super) fn no_mixed() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_MIXED"))
+    }
     /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
     pub(super) fn bisect_break() -> Option<&'static str> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -2351,7 +2362,7 @@ fn attn_stub(
 
     // SWA is now the production default. Pos-0 path retained only as a
     // diagnostic/regression-check escape hatch via HIPFIRE_V4F_ATTN=pos0.
-    let use_swa = std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() != Some("pos0");
+    let use_swa = !env_cache::attn_pos0();
 
     let q = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
@@ -2407,7 +2418,7 @@ fn attn_stub(
         // per-position post-kv_norm post-RoPE K=V).
         //
         // Env opt-out: HIPFIRE_V4F_NO_MIXED=1 falls back to SWA-only.
-        let no_mixed = std::env::var("HIPFIRE_V4F_NO_MIXED").ok().as_deref() == Some("1");
+        let no_mixed = env_cache::no_mixed();
         let do_mixed = !no_mixed
             && layer.compress_ratio > 0
             && state._indexer[layer_idx].main_kv_cache.is_some();
