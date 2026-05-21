@@ -5184,13 +5184,24 @@ fn q_lora_batched(
     let n_heads = cfg.num_attention_heads;
     let head_dim = cfg.head_dim;
 
-    // 1. Fused RMSNorm + FWHT-rotate batched: hc_x_in_batch → tmp_batch.
-    gpu.fused_rmsnorm_rotate_mq_batched(
-        hc_x_in_batch, attn_norm, &pbs.tmp_batch,
-        hidden, cfg.rms_norm_eps, batch_size,
-    ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched l{layer_idx}: {e:?}"))?;
+    // Skip FWHT rotations when weights don't need them. Also covers the
+    // compressor (consumes tmp_batch as well, but only for MQ4 wkv/wgate
+    // which are F16 in v4f-q8-mtp → no FWHT). Indexer compressor wkv/wgate
+    // are F16 too. So we can skip both rotations when wq_a/wq_b are
+    // Q8/F16 AND there's no MQ4 compressor (which there isn't on v4f-q8-mtp).
+    let wq_a_needs_fwht = weight_needs_fwht(wq_a);
+    let wq_b_needs_fwht = weight_needs_fwht(wq_b);
+
+    // 1. RMSNorm (+ optional FWHT) batched.
+    if wq_a_needs_fwht {
+        gpu.fused_rmsnorm_rotate_mq_batched(
+            hc_x_in_batch, attn_norm, &pbs.tmp_batch,
+            hidden, cfg.rms_norm_eps, batch_size,
+        ).map_err(|e| format!("fused_rmsnorm_rotate_mq_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 1b. Plain RMSNorm batched: hc_x_in_batch → tmp_plain_batch.
+    //     Always needed (compressor + indexer read tmp_plain_batch).
     gpu.rmsnorm_batched(
         hc_x_in_batch, attn_norm, &pbs.tmp_plain_batch,
         batch_size, hidden, cfg.rms_norm_eps,
@@ -5207,9 +5218,11 @@ fn q_lora_batched(
         batch_size, q_rank, cfg.rms_norm_eps,
     ).map_err(|e| format!("q_norm rmsnorm_batched l{layer_idx}: {e:?}"))?;
 
-    // 4. FWHT rotate q_lat → q_lat_rot for the MQ4 wq_b path.
-    gpu.rotate_x_mq_batched(&pbs.q_lat_batch, &pbs.q_lat_rot_batch, q_rank, batch_size)
-        .map_err(|e| format!("rotate_x_mq_batched q_lat l{layer_idx}: {e:?}"))?;
+    // 4. FWHT rotate q_lat → q_lat_rot for the MQ4 wq_b path — skip if not MQ4.
+    if wq_b_needs_fwht {
+        gpu.rotate_x_mq_batched(&pbs.q_lat_batch, &pbs.q_lat_rot_batch, q_rank, batch_size)
+            .map_err(|e| format!("rotate_x_mq_batched q_lat l{layer_idx}: {e:?}"))?;
+    }
 
     // 5. wq_b GEMV batched: q_lat_rot* → q_batch. M = n_heads*head_dim, K = q_lora_rank.
     let q_total = n_heads * head_dim;
