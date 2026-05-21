@@ -1865,6 +1865,14 @@ pub const GEMM_F32_PER_OUTPUT_V4_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// V4F ZA-fused F16-WMMA — 4-way M-axis fan-out variant of
+/// gemm_f16_x_f16_wmma. Single launch replaces 4 separate F16-WMMA
+/// matmuls in V4F's compressor batched path (comp_wkv, comp_wgate,
+/// idx_wkv, idx_wgate). All four weights are F16-native and share the
+/// same input.
+pub const GEMM_F16_X_F16_WMMA_ZA4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_za4.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations.
 pub const CONVERT_F32_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/convert_f32_to_f16.hip");

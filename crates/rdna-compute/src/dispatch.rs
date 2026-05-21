@@ -23753,6 +23753,77 @@ impl Gpu {
         }
     }
 
+    /// V4F ZA-fused F16-WMMA — single launch replaces 4 separate
+    /// `gemm_f16_x_f16_wmma` calls that share input `x_f16`. Each of
+    /// the 4 weights produces its own output buffer; thread-row routing
+    /// inside the kernel picks (A, Y) per row based on cumulative M
+    /// offsets `[0, m0, m0+m1, m0+m1+m2, m0+m1+m2+m3]`.
+    ///
+    /// Used by V4F's compressor batched path (`attention_block_batched_mixed`,
+    /// forward.rs ~4425): comp_wkv + comp_wgate + idx_wkv + idx_wgate.
+    /// At ratio=128 layers only the first 2 weights are valid; pass
+    /// m2 = m3 = 0 and the routing skips them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_za4(
+        &mut self,
+        a0_f16: &GpuTensor, a1_f16: &GpuTensor,
+        a2_f16: &GpuTensor, a3_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y0_f32: &GpuTensor, y1_f32: &GpuTensor,
+        y2_f32: &GpuTensor, y3_f32: &GpuTensor,
+        m0: usize, m1: usize, m2: usize, m3: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16_x_f16_wmma_za4",
+            kernels::GEMM_F16_X_F16_WMMA_ZA4_SRC,
+            "gemm_f16_x_f16_wmma_za4",
+        )?;
+        let func = &self.functions["gemm_f16_x_f16_wmma_za4"];
+        let a0 = a0_f16.buf.as_ptr();
+        let a1 = a1_f16.buf.as_ptr();
+        let a2 = a2_f16.buf.as_ptr();
+        let a3 = a3_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let y0 = y0_f32.buf.as_ptr();
+        let y1 = y1_f32.buf.as_ptr();
+        let y2 = y2_f32.buf.as_ptr();
+        let y3 = y3_f32.buf.as_ptr();
+        let mut m0_i = m0 as i32;
+        let mut m1_i = m1 as i32;
+        let mut m2_i = m2 as i32;
+        let mut m3_i = m3 as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a0 as *const _ as *mut c_void,
+            &a1 as *const _ as *mut c_void,
+            &a2 as *const _ as *mut c_void,
+            &a3 as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &y0 as *const _ as *mut c_void,
+            &y1 as *const _ as *mut c_void,
+            &y2 as *const _ as *mut c_void,
+            &y3 as *const _ as *mut c_void,
+            &mut m0_i as *mut _ as *mut c_void,
+            &mut m1_i as *mut _ as *mut c_void,
+            &mut m2_i as *mut _ as *mut c_void,
+            &mut m3_i as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let total_m = m0 + m1 + m2 + m3;
+        let grid_m = ((total_m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, grid_b, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// F32 GEMM per-output with float4 vector loads.
     pub fn gemm_f32_per_output_v4(
         &mut self,

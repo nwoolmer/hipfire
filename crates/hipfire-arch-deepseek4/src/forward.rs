@@ -4432,23 +4432,64 @@ fn attention_block_batched_mixed(
             // V4F compressor uses FWHT-rotated input (tmp_batch) when the
             // weight is MQ4-style, and plain input (tmp_plain_batch) when
             // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
-            gpu.gemm_f16_x_f16_wmma(
-                wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_kv_batch,
-                real_main_proj, hidden, batch_size,
-            ).map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
-            gpu.gemm_f16_x_f16_wmma(
-                wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_score_batch,
-                real_main_proj, hidden, batch_size,
-            ).map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
-            if ratio == 4 {
+            //
+            // Phase D (2026-05-21): ZA-fused 4-way M-axis dispatch when
+            // all 4 compressor weights are F16-native. Default OFF —
+            // bench on v4f.mq2lloyd-q8 prompt=128 B=64 measured 19.3
+            // tok/s (ON) vs 19.6 tok/s (OFF), a −1.5% drift within
+            // session noise. Hypothesis: at B=64 the 4 separate WMMA
+            // matmuls already saturate the wave budget; the fused
+            // kernel's per-thread routing branches add overhead without
+            // extra parallelism (same block count: total_m/16 × B/16 =
+            // 256 either way). Kept opt-in for future shape investigations
+            // (different B / different M sizes / Q8-stacked extension).
+            // Enable with HIPFIRE_V4F_COMP_F16_WMMA_FUSED=1.
+            let za_fused = std::env::var("HIPFIRE_V4F_COMP_F16_WMMA_FUSED")
+                .map(|s| s == "1").unwrap_or(false);
+            if za_fused && ratio == 4 {
+                gpu.gemm_f16_x_f16_wmma_za4(
+                    wkv_f16.unwrap(), wgate_f16.unwrap(),
+                    idx_wkv_f16.unwrap(), idx_wgate_f16.unwrap(),
+                    &pbs.tmp_plain_batch_f16,
+                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch,
+                    &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch,
+                    real_main_proj, real_main_proj, idx_proj_dim, idx_proj_dim,
+                    hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma_za4 comp l{layer_idx}: {e:?}"))?;
+            } else if za_fused && ratio == 128 {
+                // ratio==128 has no indexer compressor — only main wkv+wgate.
+                // Pass the two zero-sized M params to skip the idx fan-out.
+                gpu.gemm_f16_x_f16_wmma_za4(
+                    wkv_f16.unwrap(), wgate_f16.unwrap(),
+                    wkv_f16.unwrap(),  // dummy (m2=0 → no reads)
+                    wkv_f16.unwrap(),  // dummy (m3=0 → no reads)
+                    &pbs.tmp_plain_batch_f16,
+                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch,
+                    &pbs.comp_main_kv_batch,  // dummy (m2=0 → no writes)
+                    &pbs.comp_main_kv_batch,  // dummy (m3=0 → no writes)
+                    real_main_proj, real_main_proj, 0, 0,
+                    hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma_za4 comp ratio=128 l{layer_idx}: {e:?}"))?;
+            } else {
+                // Legacy 4-call (or 2-call) sequential dispatch.
                 gpu.gemm_f16_x_f16_wmma(
-                    idx_wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_kv_batch,
-                    idx_proj_dim, hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
+                    wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_kv_batch,
+                    real_main_proj, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
                 gpu.gemm_f16_x_f16_wmma(
-                    idx_wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_score_batch,
-                    idx_proj_dim, hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
+                    wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_score_batch,
+                    real_main_proj, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
+                if ratio == 4 {
+                    gpu.gemm_f16_x_f16_wmma(
+                        idx_wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_kv_batch,
+                        idx_proj_dim, hidden, batch_size,
+                    ).map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
+                    gpu.gemm_f16_x_f16_wmma(
+                        idx_wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_score_batch,
+                        idx_proj_dim, hidden, batch_size,
+                    ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
+                }
             }
         } else {
             gemv_auto_batched_wmma(
