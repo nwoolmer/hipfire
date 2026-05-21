@@ -2554,10 +2554,19 @@ fn attn_stub(
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
-            gpu.v4f_attn_swa(q, swa_k, swa_v, attn_sink, attn_out_raw,
+            // HIP-graphs-safe: n_valid comes from attn_state_buf[1]
+            // (populated by precompute_attn_state at decode_step entry).
+            // The legacy `gpu.v4f_attn_swa(...n_valid kernarg...)` would
+            // bake n_valid at capture time → broken on graph replay.
+            let n_valid_buf = state.attn_state_buf.as_ref()
+                .ok_or_else(|| "attn_state_buf missing".to_string())?
+                .sub_offset(1, 1);
+            let _ = n_valid; // legacy host-computed value; not used after migration
+            gpu.v4f_attn_swa_buf(q, swa_k, swa_v, attn_sink, attn_out_raw,
+                &n_valid_buf,
                 n_heads as i32, head_dim as i32, n_groups as i32,
-                n_valid, win as i32,
-            ).map_err(|e| format!("v4f_attn_swa: {e:?}"))?;
+                win as i32,
+            ).map_err(|e| format!("v4f_attn_swa_buf: {e:?}"))?;
         }
     }
 

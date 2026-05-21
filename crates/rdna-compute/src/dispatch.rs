@@ -20659,6 +20659,61 @@ impl Gpu {
     /// Generalises `v4f_attn_pos0` to attend over a cache of up to
     /// `window` past KV positions.
     #[allow(dead_code, clippy::too_many_arguments)]
+    /// HIP-graphs-safe twin of `v4f_attn_swa`: reads `n_valid` from a
+    /// device buffer instead of an i32 kernarg.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_buf(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_valid_buf: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        o_groups: i32,
+        window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_swa_buf",
+            kernels::V4F_ATTN_SWA_BUF_SRC, "v4f_attn_swa_buf")?;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let nvp = n_valid_buf.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut og = o_groups;
+        let mut wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut og as *mut _ as *mut c_void,
+            &mut wn as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+            b.push_ptr(sp); b.push_ptr(op); b.push_ptr(nvp);
+            b.push_i32(nh); b.push_i32(hd); b.push_i32(og); b.push_i32(wn);
+            b
+        };
+        self.launch_maybe_blob(
+            "v4f_attn_swa_buf",
+            [n_heads as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
     pub fn v4f_attn_swa(
         &mut self,
         q: &GpuTensor,

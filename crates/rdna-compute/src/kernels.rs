@@ -1607,6 +1607,11 @@ pub const V4F_ATTN_POS0_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_pos0.hip");
 pub const V4F_ATTN_SWA_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa.hip");
+
+/// HIP-graphs-safe twin of `v4f_attn_swa`: reads `n_valid` from a
+/// device buffer instead of an i32 kernarg.
+pub const V4F_ATTN_SWA_BUF_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_buf.hip");
 pub const SWA_RING_WRITE_SRC: &str =
     include_str!("../../../kernels/src/swa_ring_write.hip");
 
