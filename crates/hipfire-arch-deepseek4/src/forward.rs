@@ -1210,6 +1210,9 @@ pub fn decode_step(
     // bulk write at decode-step entry. Per-layer kernels then read
     // their slot via `pos_slot(state, layer_idx, slot)`.
     precompute_positions(cfg, state, gpu, position)?;
+    // Stage current token_id to device for the GPU hash-router
+    // (consumed by `hash_router_normalize_f32_buf` on hash layers).
+    precompute_token_id(state, gpu, token_id)?;
 
     // 1. Token embedding → initial residual streams.
     //    V4F uses `hc_mult = 4` parallel streams. Init pattern is
@@ -1266,22 +1269,16 @@ pub fn decode_step_with_graph(
             _ => None,
         }
     });
-    let mut graph_on = env_override.unwrap_or_else(|| {
+    let graph_on = env_override.unwrap_or_else(|| {
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
     });
-    // Hash-routed layers do a d2h download of scores inside the layer
-    // body (ffn_hash_routed → moe_route → download_f32) for the static
-    // tid2eid expert pick — HIP graph capture rejects this as a
-    // legacy-stream-depends-on-capturing-stream conflict. Disable
-    // graphs when MoE is on and hash layers exist; explicit
-    // HIPFIRE_V4F_GRAPH=1 still forces on (caller's responsibility).
-    if env_override.is_none() && graph_on
-        && cfg.num_hash_layers > 0
-        && env_cache::moe_on()
-    {
-        graph_on = false;
-    }
+    // Note: prior to bc6353e the hash-routed MoE path did a d2h of
+    // router scores inside the layer body — that broke HIP graph
+    // capture. Replaced by `hash_router_normalize_f32_buf` which
+    // reads token_id from a device buffer (staged by
+    // `precompute_token_id` at decode entry), so MoE+hash layers
+    // are now graph-safe and no guard is needed.
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
@@ -1308,11 +1305,13 @@ pub fn decode_step_with_graph(
 
     if gpu.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────
-        // precompute_positions is called INSIDE the capture so the
-        // captured memcpy node re-reads pos_array_host on each replay.
+        // precompute_positions + precompute_token_id are called INSIDE
+        // the capture so the captured memcpy nodes re-read their stable
+        // host sources on each replay.
         gpu.begin_graph_capture()
             .map_err(|e| format!("begin_graph_capture: {e:?}"))?;
         precompute_positions(cfg, state, gpu, position)?;
+        precompute_token_id(state, gpu, token_id)?;
         let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
         gpu.end_graph_capture()
             .map_err(|e| format!("end_graph_capture: {e:?}"))?;
@@ -1325,17 +1324,18 @@ pub fn decode_step_with_graph(
             gpu.capture_blobs.len());
     } else {
         // ── Replay phase ───────────────────────────────────────────
-        // Host-only update of the stable pos_array_host[] AND
-        // attn_state_host[]. The captured memcpy nodes re-read these
-        // bytes on graph_launch and propagate them to the device-side
-        // pos_array_device / attn_state_buf which all per-layer kernels
-        // read via sub_offset slices.
+        // Host-only update of the stable pos_array_host[], attn_state
+        // _host[], and token_id_host[]. The captured memcpy nodes
+        // re-read these bytes on graph_launch and propagate them to
+        // the device-side pos_array_device / attn_state_buf /
+        // token_id_buf which all per-layer kernels read.
         update_pos_array_host(cfg, state, position);
         // attn_state depends on state.n_tokens BEFORE increment (the
         // current position being processed). decode_step normally
         // increments state.n_tokens at the END of the body, so replay
         // sees the right pre-increment value.
         update_attn_state_host(cfg, state, state.n_tokens as u32);
+        update_token_id_host(state, token_id);
         gpu.graph_launch()
             .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
         state.n_tokens += 1;
@@ -2381,13 +2381,22 @@ fn ffn_hash_routed(
 
     // GPU-side hash-router lookup + normalize + scale. Replaces the
     // d2h(scores) + host gather + h2d(topk_idx, topk_w) round-trip.
-    // Host fallback kicks in if tid2eid_dev is missing (older HFQs or
-    // upload failure at load).
+    // Prefer the `_buf` variant (reads token_id from device) so the
+    // captured HIP graph re-reads token_id on every replay. Falls
+    // back to the kernarg variant or host gather if prerequisites
+    // (tid2eid_dev, token_id_buf) are missing.
     if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
-        gpu.hash_router_normalize_f32(
-            tid2eid_dev, scores, topk_idx_dev, topk_w_dev,
-            token_id as i32, n_exp as i32, k as i32, route_scale_override,
-        ).map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
+        if let Some(token_id_buf) = state.token_id_buf.as_ref() {
+            gpu.hash_router_normalize_f32_buf(
+                tid2eid_dev, scores, token_id_buf, topk_idx_dev, topk_w_dev,
+                n_exp as i32, k as i32, route_scale_override,
+            ).map_err(|e| format!("hash_router_normalize_buf hash l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.hash_router_normalize_f32(
+                tid2eid_dev, scores, topk_idx_dev, topk_w_dev,
+                token_id as i32, n_exp as i32, k as i32, route_scale_override,
+            ).map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
+        }
     } else {
         // Fallback: d2h + host gather + h2d.
         let scores_host = gpu.download_f32(scores)
@@ -3559,6 +3568,46 @@ pub(crate) fn precompute_positions(
     // pattern. The captured memcpy re-reads this on every graph_launch.
     precompute_attn_state(cfg, state, gpu)?;
     Ok(())
+}
+
+/// Lazy-alloc + populate `state.token_id_buf` (and stable host source
+/// `state.token_id_host`) for the current step's token. The captured
+/// htod node re-reads `token_id_host` on every graph replay, so the
+/// HIP-graphs-safe `hash_router_normalize_f32_buf` kernel sees the
+/// per-replay token_id.
+pub(crate) fn precompute_token_id(
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+) -> Result<(), String> {
+    if state.token_id_buf.is_none() {
+        state.token_id_buf = Some(
+            gpu.alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("alloc token_id_buf: {e:?}"))?,
+        );
+    }
+    if state.token_id_host.is_none() {
+        state.token_id_host = Some(Box::new([0i32; 1]));
+    }
+    let host = state.token_id_host.as_mut().unwrap();
+    host[0] = token_id as i32;
+    let dev = state.token_id_buf.as_ref().unwrap();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, 4)
+    };
+    gpu.memcpy_htod_auto(&dev.buf, bytes)
+        .map_err(|e| format!("htod token_id: {e:?}"))?;
+    Ok(())
+}
+
+/// Host-only update of `token_id_host[0]`. Used by the HIP-graphs
+/// replay path — the captured memcpy node re-reads this byte on
+/// graph_launch and propagates to `token_id_buf`.
+pub(crate) fn update_token_id_host(state: &mut DeepseekV4State, token_id: u32) {
+    let host = state.token_id_host.as_mut()
+        .expect("update_token_id_host: token_id_host not initialised \
+                 (call precompute_token_id first)");
+    host[0] = token_id as i32;
 }
 
 /// Slice the pos_array for a given layer's slot. Caller passes the slot

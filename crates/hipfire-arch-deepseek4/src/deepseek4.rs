@@ -647,6 +647,17 @@ pub struct DeepseekV4State {
     /// `hipMalloc not permitted under stream capture` and fail.
     pub ar_forward_warmed_up: bool,
 
+    /// Single-i32 device buffer holding the current step's `token_id`.
+    /// Read by `hash_router_normalize_f32_buf` so the captured graph
+    /// re-reads it on every replay (mirrors the `pos_array_*` pattern).
+    /// Lazy-allocated by the first hash-routed layer that needs it.
+    pub token_id_buf: Option<rdna_compute::GpuTensor>,
+
+    /// Stable host-side source for `token_id_buf`. The captured htod
+    /// node re-reads this pointer on every graph_launch — must be a
+    /// heap allocation so the address survives across replays.
+    pub token_id_host: Option<Box<[i32; 1]>>,
+
     /// Ten-slot device buffer for SWA + compressor runtime state.
     /// Layout (all i32 stored as F32 bits):
     ///   [0] swa_slot          = pos % sliding_window
@@ -812,6 +823,8 @@ impl DeepseekV4State {
             pos_array_device: None,
             pos_array_host: None,
             ar_forward_warmed_up: false,
+            token_id_buf: None,
+            token_id_host: None,
             attn_state_buf: None,
             attn_state_host: None,
             attn_out: None,

@@ -20400,6 +20400,58 @@ impl Gpu {
         )
     }
 
+    /// HIP-graphs-safe twin of `hash_router_normalize_f32` — reads
+    /// `token_id` from `token_id_buf[0]` (device-resident) instead of
+    /// a kernarg, so the captured graph re-reads it on every replay.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn hash_router_normalize_f32_buf(
+        &mut self,
+        tid2eid: &GpuTensor,
+        scores: &GpuTensor,
+        token_id_buf: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: i32,
+        k: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hash_router_normalize_f32_buf",
+            kernels::HASH_ROUTER_NORMALIZE_BUF_SRC,
+            "hash_router_normalize_f32_buf",
+        )?;
+        let tp = tid2eid.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let tb = token_id_buf.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kv = k;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tb as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(tb);
+            b.push_ptr(ip); b.push_ptr(wp);
+            b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b
+        };
+        self.launch_maybe_blob(
+            "hash_router_normalize_f32_buf",
+            [1, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+
     /// HIP-graphs-safe in-place RMSNorm at `base + slot_buf[0] * n`.
     /// -1 sentinel → no-op. Single block (head_dim ≤ 512).
     #[allow(dead_code, clippy::too_many_arguments)]

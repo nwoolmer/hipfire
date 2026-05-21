@@ -1649,6 +1649,12 @@ pub const RMSNORM_AT_SLOT_BUF_SRC: &str =
 pub const HASH_ROUTER_NORMALIZE_SRC: &str =
     include_str!("../../../kernels/src/hash_router_normalize_f32.hip");
 
+/// HIP-graphs-safe twin of `HASH_ROUTER_NORMALIZE_SRC` — reads
+/// `token_id` from a device buffer so the captured graph re-reads
+/// it on every replay.
+pub const HASH_ROUTER_NORMALIZE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/hash_router_normalize_f32_buf.hip");
+
 /// HIP-graphs-safe in-place YaRN-aware tail RoPE at slot `slot_buf[0]` of a
 /// base buffer; -1 sentinel → no-op. Single-tensor (n_heads_q=1, n_heads_k=0).
 /// Pass freq_scale=1.0, ext_factor=0.0 to recover plain rope_tail_interleaved.
