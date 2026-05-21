@@ -563,19 +563,19 @@ pub struct DeepseekV4State {
     pub mtp_e_norm_scratch: Option<rdna_compute::GpuTensor>,
 
     /// MTP pre-block scratch — RMSNorm output of the hidden input
-    /// `[hidden]` F32. Holds `mtp_hnorm(h_n)`. Same lazy-allocation
-    /// pattern as `mtp_e_norm_scratch`.
+    /// `[hc_mult, hidden]` F32. Holds `mtp_hnorm(h_n)` applied per HC row
+    /// (rmsnorm_batched). Same lazy-allocation pattern as
+    /// `mtp_e_norm_scratch`. Reallocated if hc_mult ever changes.
     pub mtp_h_norm_scratch: Option<rdna_compute::GpuTensor>,
 
-    /// Post-layer-block hidden state `[hidden]` F32 from the most-recent
-    /// `decode_step` or `mtp_forward` call. This is stream 0 of the
-    /// residual streams AFTER the standard layer block (and HC mixes)
-    /// but BEFORE the final RMSNorm + lm_head. V3 paper §4 calls this
-    /// `h_n` (post-decode-step) / `h_{n+k}` (post-mtp-forward step k);
-    /// it's the input the MTP block's `h_proj` reads from. Populated by
-    /// both code paths so `speculative_decode_step` can chain K
-    /// iterations without the caller having to track which function
-    /// produced the hidden.
+    /// Post-layer-block residual stream `[hc_mult, hidden]` F32 from the
+    /// most-recent `decode_step` or `mtp_forward` call. Per antirez/ds4
+    /// reference, V4F MTP consumes the FULL HC stream (not just stream 0)
+    /// of the previous position as its `h_n` input — capturing only stream
+    /// 0 discards 75% of the HC signal and empirically pins K=2 acceptance
+    /// at ~50%. Populated by both `final_norm_and_head` (decode path) and
+    /// `mtp_forward` step 7 so `speculative_decode_step` can chain K MTP
+    /// iterations.
     pub mtp_last_hidden: Option<rdna_compute::GpuTensor>,
 
     /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of

@@ -1711,10 +1711,16 @@ pub fn mtp_forward(
         }
     }
 
-    if h_n.shape != [cfg.hidden_size] && h_n.shape != [1, cfg.hidden_size] {
+    // Full-HC plumbing: h_n must be the previous position's complete
+    // [hc_mult, hidden] residual stream (per antirez/ds4 reference). The
+    // legacy `[hidden]` shape (stream 0 only) is rejected — it produces
+    // the broken ~50% acceptance path. final_norm_and_head and the
+    // verify-pass capture in spec_decode now populate the full stream.
+    let expected_shape = [cfg.hc_mult, cfg.hidden_size];
+    if h_n.shape != expected_shape && h_n.numel() != cfg.hc_mult * cfg.hidden_size {
         return Err(format!(
-            "mtp_forward: h_n shape {:?} != [hidden_size={}]",
-            h_n.shape, cfg.hidden_size,
+            "mtp_forward: h_n shape {:?} != [hc_mult={}, hidden_size={}]",
+            h_n.shape, cfg.hc_mult, cfg.hidden_size,
         ));
     }
     if cfg.num_nextn_predict_layers == 0 {
@@ -1745,9 +1751,16 @@ pub fn mtp_forward(
         state.mtp_e_norm_scratch = Some(gpu.alloc_tensor(&[hidden], DType::F32)
             .map_err(|e| format!("alloc mtp_e_norm_scratch: {e:?}"))?);
     }
-    if state.mtp_h_norm_scratch.is_none() {
-        state.mtp_h_norm_scratch = Some(gpu.alloc_tensor(&[hidden], DType::F32)
-            .map_err(|e| format!("alloc mtp_h_norm_scratch: {e:?}"))?);
+    // mtp_h_norm_scratch holds the per-HC-row rmsnorm output, sized
+    // [hc_mult, hidden] for the full-HC pipeline. Realloc if shape grew
+    // from a legacy [hidden] allocation.
+    let h_norm_len = hc_mult * hidden;
+    let h_norm_needs_realloc = state.mtp_h_norm_scratch.as_ref()
+        .map(|t| t.numel() != h_norm_len).unwrap_or(true);
+    if h_norm_needs_realloc {
+        state.mtp_h_norm_scratch = Some(
+            gpu.alloc_tensor(&[hc_mult, hidden], DType::F32)
+                .map_err(|e| format!("alloc mtp_h_norm_scratch: {e:?}"))?);
     }
     if state.logits.is_none() {
         state.logits = Some(gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
@@ -1767,8 +1780,8 @@ pub fn mtp_forward(
     }
 
     // ── 3. RMSNorm both inputs ─────────────────────────────────────────
-    // e_norm = mtp_enorm(embed)  → mtp_e_norm_scratch
-    // h_norm = mtp_hnorm(h_n)    → mtp_h_norm_scratch
+    // e_norm = mtp_enorm(embed)              → mtp_e_norm_scratch [hidden]
+    // h_norm = mtp_hnorm(h_n) per HC row    → mtp_h_norm_scratch [hc_mult, hidden]
     {
         let embed_scratch = state.embed_scratch.as_ref().unwrap();
         let e_out = state.mtp_e_norm_scratch.as_ref().unwrap();
@@ -1777,21 +1790,25 @@ pub fn mtp_forward(
     }
     {
         let h_out = state.mtp_h_norm_scratch.as_ref().unwrap();
-        gpu.rmsnorm_f32(h_n, mtp_hnorm, h_out, cfg.rms_norm_eps)
-            .map_err(|e| format!("mtp rmsnorm_h: {e:?}"))?;
+        gpu.rmsnorm_batched(h_n, mtp_hnorm, h_out, hc_mult, hidden, cfg.rms_norm_eps)
+            .map_err(|e| format!("mtp rmsnorm_h batched: {e:?}"))?;
     }
 
-    // ── 4. x_in = mtp_e_proj @ e_norm + mtp_h_proj @ h_norm ────────────
-    // gemv_auto dispatches on the weight's GpuTensor.dtype:
-    //   - Q8F16 → gemv_q8_0   (plain input)         ← v4f-q8-mtp uses this
-    //   - F16   → gemm_f16_x_f16_wmma at B=1        (plain input)
-    //   - MQ4   → gemv_mq4g256_prerotated           (rotated input)
+    // ── 4. Populate residual_streams from full HC plumbing ─────────────
+    // Per antirez/ds4 reference:
+    //   1. x_e   = mtp_e_proj @ e_norm                  (single [hidden])
+    //   2. residual_streams[h] = mtp_h_proj @ h_norm[h] for each HC row h
+    //   3. residual_streams[h] += x_e                  (broadcast e_proj)
     //
-    // For the MQ4 fallback path we'd need a FWHT-rotated copy of the norm
-    // outputs; in v4f-q8-mtp these matrices are Q8F16 so the `x_rotated`
-    // argument is unused. We pass `mtp_h_norm_scratch` itself as the dummy
-    // rotated alias — it's the right size and content doesn't matter for
-    // Q8/F16 paths.
+    // gemv_auto dispatches on the weight's GpuTensor.dtype:
+    //   - Q8F16 → gemv_q8_0   (plain input)
+    //   - F16   → gemv_f16_xf32 / gemm_f16_x_f16_wmma  (plain input)
+    //   - MQ4   → gemv_mq4g256_prerotated              (rotated input)
+    //
+    // For MQ4 (Raw) MTP weights we'd need FWHT-rotated norm outputs; the
+    // upfront dtype check (above) rejects MQ4 e_proj/h_proj for that
+    // reason. With Q8/F16/F32 the `x_rotated` argument is unused; we pass
+    // mtp_h_norm_scratch (any tensor of correct size) as a dummy.
     {
         let e_norm = state.mtp_e_norm_scratch.as_ref().unwrap();
         let dummy_rotated = state.mtp_h_norm_scratch.as_ref().unwrap();
@@ -1799,28 +1816,27 @@ pub fn mtp_forward(
         gemv_auto(gpu, mtp_e_proj, dummy_rotated, e_norm, tmp, hidden, hidden)?;
     }
     {
-        let h_norm = state.mtp_h_norm_scratch.as_ref().unwrap();
+        let h_norm_full = state.mtp_h_norm_scratch.as_ref().unwrap();
+        let streams = state.residual_streams.as_ref().unwrap();
         let dummy_rotated = state.mtp_e_norm_scratch.as_ref().unwrap();
-        let embed_scratch = state.embed_scratch.as_ref().unwrap();
-        // Reuse embed_scratch as the h_proj output buffer — its previous
-        // content (raw embed of next_token) is no longer needed.
-        gemv_auto(gpu, mtp_h_proj, dummy_rotated, h_norm, embed_scratch, hidden, hidden)?;
-        let tmp = state.tmp.as_ref().unwrap();
-        gpu.add_inplace_f32(tmp, embed_scratch)
-            .map_err(|e| format!("mtp x_in add: {e:?}"))?;
+        // Per-HC-row h_proj. mtp_h_proj is the same [hidden, hidden]
+        // weight matrix for every row; the inputs differ (per-row h_norm)
+        // so a B=hc_mult batched GEMM would amortize weight loads — left
+        // as a future optimization (hc_mult=4 keeps total work small).
+        for h in 0..hc_mult {
+            let h_norm_row = h_norm_full.sub_offset(h * hidden, hidden);
+            let dst_row = streams.sub_offset(h * hidden, hidden);
+            gemv_auto(gpu, mtp_h_proj, dummy_rotated, &h_norm_row, &dst_row, hidden, hidden)?;
+        }
     }
-
-    // ── 5. Broadcast x_in (now in state.tmp) to all hc_mult streams ────
-    // Matches `init_residual_streams`' HC init (per antirez ds4
-    // `hc_from_plain_embedding`): all streams start equal, not [x, 0,0,0].
+    // ── 5. Broadcast-add x_e (in state.tmp) into every HC row ─────────
     {
         let streams = state.residual_streams.as_ref().unwrap();
         let src = state.tmp.as_ref().unwrap();
-        let bytes = hidden * 4;
         for h in 0..hc_mult {
-            let dst = streams.sub_offset(h * hidden, hidden);
-            gpu.memcpy_dtod_auto(&dst.buf, &src.buf, bytes)
-                .map_err(|e| format!("mtp d2d copy stream {h}: {e:?}"))?;
+            let row = streams.sub_offset(h * hidden, hidden);
+            gpu.add_inplace_f32(&row, src)
+                .map_err(|e| format!("mtp x_e broadcast-add stream {h}: {e:?}"))?;
         }
     }
 
@@ -1842,17 +1858,23 @@ pub fn mtp_forward(
     ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
 
-    // ── 7. Capture stream 0 → mtp_last_hidden for chaining ────────────
+    // ── 7. Capture FULL [hc_mult, hidden] residual stream for chaining ─
+    // Subsequent MTP iterations consume this as their h_n input. The
+    // full-HC capture matches the antirez/ds4 reference pattern; legacy
+    // stream-0-only capture is what pinned K=2 accept at ~50%.
     {
-        if state.mtp_last_hidden.is_none() {
-            state.mtp_last_hidden = Some(gpu.alloc_tensor(&[hidden], DType::F32)
-                .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?);
+        let stream_len = hc_mult * hidden;
+        let need_realloc = state.mtp_last_hidden.as_ref()
+            .map(|t| t.numel() != stream_len).unwrap_or(true);
+        if need_realloc {
+            state.mtp_last_hidden = Some(
+                gpu.alloc_tensor(&[hc_mult, hidden], DType::F32)
+                    .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?);
         }
         let streams = state.residual_streams.as_ref().unwrap();
-        let stream0 = streams.sub_offset(0, hidden);
         let dst = state.mtp_last_hidden.as_ref().unwrap();
-        gpu.memcpy_dtod_auto(&dst.buf, &stream0.buf, hidden * 4)
-            .map_err(|e| format!("capture stream0 → mtp_last_hidden: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&dst.buf, &streams.buf, stream_len * 4)
+            .map_err(|e| format!("capture full HC → mtp_last_hidden: {e:?}"))?;
     }
 
     // ── 8. mtp_final_norm + shared lm_head → logits ───────────────────
@@ -2452,30 +2474,23 @@ fn final_norm_and_head(
 
     // 2.5. Capture h_n for downstream MTP / spec-decode.
     //
-    // OPEN QUESTION (empirical): which value does V4F's MTP head_proj
-    // expect as its h-input?
-    //   (A) main's stream 0 (residual_streams[0, :])
-    //   (B) main's post-head-HC-mixed (head_hc_out)
-    //   (C) main's post-output-norm (final_norm)
-    //
-    // Measured K=2 short-prompt acceptance:
-    //   (A): ~50%  ← used to be our convention
-    //   (B): ~25%  ← worse, surprised since MTP ships hc_head_* tensors
-    // (C) untested.
-    //
-    // Sticking with (A) until a definitive signal (e.g. byte-equal
-    // against an antirez ds4 reference) says otherwise. MTP's own
-    // hc_head_* matrices are still used in mtp_forward step 7 for its
-    // OUTPUT pipeline (lm_head input), not for processing main's input.
-    if state.mtp_last_hidden.is_none() {
-        state.mtp_last_hidden = Some(gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
-            .map_err(|e| format!("alloc mtp_last_hidden in final_norm_and_head: {e:?}"))?);
+    // V4F MTP consumes the FULL [hc_mult, hidden] HC stream of the
+    // previous position, not stream 0 alone (per antirez/ds4 reference
+    // `metal_graph_eval_mtp_draft_from_hc`, ds4.c:12852). The prior
+    // stream-0-only capture discarded 75% of the HC signal and pinned
+    // K=2 acceptance at ~50%.
+    let mtp_hidden_len = cfg.hc_mult * cfg.hidden_size;
+    let mtp_needs_realloc = state.mtp_last_hidden.as_ref()
+        .map(|t| t.numel() != mtp_hidden_len).unwrap_or(true);
+    if mtp_needs_realloc {
+        state.mtp_last_hidden = Some(
+            gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], DType::F32)
+                .map_err(|e| format!("alloc mtp_last_hidden in final_norm_and_head: {e:?}"))?);
     }
     {
-        let stream0 = streams.sub_offset(0, cfg.hidden_size);
         let dst = state.mtp_last_hidden.as_ref().unwrap();
-        gpu.memcpy_dtod_auto(&dst.buf, &stream0.buf, cfg.hidden_size * 4)
-            .map_err(|e| format!("capture stream0 → mtp_last_hidden: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&dst.buf, &streams.buf, mtp_hidden_len * 4)
+            .map_err(|e| format!("capture full HC streams → mtp_last_hidden: {e:?}"))?;
     }
 
     // 3. RMSNorm of the combined stream output.

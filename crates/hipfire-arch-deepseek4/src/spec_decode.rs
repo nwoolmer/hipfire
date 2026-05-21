@@ -253,25 +253,27 @@ fn speculative_decode_impl(
     }
 
     // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
-    // Capture stream 0 of pbs.streams_batch[accepted_tokens.len() - 1, :, :].
-    // Matches main forward's capture convention (stream 0, pre-head-HC).
-    // The verify pass's internal final_norm_and_head_all_batched wrote
-    // the LAST batch position's stream 0 to mtp_last_hidden, but we want
-    // the (accepted_tokens.len()-1)-th position — overwrite from pbs.
+    // Capture the FULL [hc_mult, hidden] residual stream of
+    // pbs.streams_batch[accepted_tokens.len() - 1, :, :]. Matches the
+    // antirez/ds4 reference MTP HC plumbing (see project memory entry
+    // `project_v4f_mtp_hc_plumbing_gap`). Stream-0-only capture was what
+    // discarded 75% of HC signal and pinned K=2 accept at ~50%.
     {
         let last_idx = accepted_tokens.len() - 1;
         let stream_len = cfg.hc_mult * cfg.hidden_size;
         let off = last_idx * stream_len;
-        let last_stream0 = pbs.streams_batch.sub_offset(off, cfg.hidden_size);
-        if state.mtp_last_hidden.is_none() {
+        let last_full = pbs.streams_batch.sub_offset(off, stream_len);
+        let need_realloc = state.mtp_last_hidden.as_ref()
+            .map(|t| t.numel() != stream_len).unwrap_or(true);
+        if need_realloc {
             state.mtp_last_hidden = Some(
-                gpu.alloc_tensor(&[cfg.hidden_size], rdna_compute::DType::F32)
+                gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
                     .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?
             );
         }
         let dst = state.mtp_last_hidden.as_ref().unwrap();
-        gpu.memcpy_dtod_auto(&dst.buf, &last_stream0.buf, cfg.hidden_size * 4)
-            .map_err(|e| format!("capture verify-pass stream0: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&dst.buf, &last_full.buf, stream_len * 4)
+            .map_err(|e| format!("capture verify-pass full HC streams: {e:?}"))?;
     }
 
     // ── 7. Restore state.n_tokens to the post-accept position ─────────
