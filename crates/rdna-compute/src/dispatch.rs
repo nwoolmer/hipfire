@@ -20253,6 +20253,106 @@ impl Gpu {
     /// gathered values; pass 1.0 for pass-through, larger to compensate
     /// for compressor.norm undershoot.
     #[allow(clippy::too_many_arguments)]
+    /// HIP-graphs-safe twin of `v4f_topk_kv_gather_f32`: reads K_buf[0]
+    /// and N_compressed_buf[0] from device buffers. Launches with a
+    /// FIXED grid sized to `max_k` (so capture sees a constant grid);
+    /// blocks beyond K_buf[0] early-return.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_topk_kv_gather_f32_buf(
+        &mut self,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        max_k: i32,         // upper bound on K — sets the captured grid size
+        head_dim: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_f32_buf",
+            kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
+            "v4f_topk_kv_gather_f32_buf",
+        )?;
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let ncp = n_compressed_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &ncp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp); b.push_ptr(ip); b.push_ptr(op);
+            b.push_ptr(kbp); b.push_ptr(ncp);
+            b.push_i32(hd); b.push_i32(os); b.push_i32(co); b.push_f32(sc);
+            b
+        };
+        self.launch_maybe_blob(
+            "v4f_topk_kv_gather_f32_buf",
+            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
+    /// HIP-graphs-safe twin of `v4f_topk_kv_gather_identity_f32`.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_topk_kv_gather_identity_f32_buf(
+        &mut self,
+        kv_cache: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        max_k: i32,
+        head_dim: i32,
+        out_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "v4f_topk_kv_gather_identity_f32_buf",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC,
+            "v4f_topk_kv_gather_identity_f32_buf",
+        )?;
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp); b.push_ptr(op); b.push_ptr(kbp);
+            b.push_i32(hd); b.push_i32(os);
+            b
+        };
+        self.launch_maybe_blob(
+            "v4f_topk_kv_gather_identity_f32_buf",
+            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
     pub fn v4f_topk_kv_gather_f32(
         &mut self,
         kv_cache: &GpuTensor,    // [N_compressed, head_dim] F32
@@ -20351,6 +20451,68 @@ impl Gpu {
     /// indexer-gathered top-K K/V (`topk_k/v` [n_kv=1, head_dim,
     /// topk_window]) under a single joint softmax with `attn_sink` as
     /// an extra entry.
+    /// HIP-graphs-safe twin of `v4f_attn_swa_topk_f32`. Reads
+    /// `n_valid_swa` + `n_active_topk` from device buffers. Grid is
+    /// fixed at `n_heads` so capture sees constant launch shape.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn v4f_attn_swa_topk_f32_buf(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor, swa_v: &GpuTensor,
+        topk_k: &GpuTensor, topk_v: &GpuTensor,
+        attn_sink: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_valid_swa_buf: &GpuTensor,
+        n_active_topk_buf: &GpuTensor,
+        n_heads: i32, head_dim: i32,
+        swa_window: i32, topk_window: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("v4f_attn_swa_topk_f32_buf",
+            kernels::V4F_ATTN_SWA_TOPK_BUF_SRC, "v4f_attn_swa_topk_f32_buf")?;
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let tkp = topk_k.buf.as_ptr();
+        let tvp = topk_v.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let nvp = n_valid_swa_buf.buf.as_ptr();
+        let nap = n_active_topk_buf.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &tkp as *const _ as *mut c_void,
+            &tvp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+            b.push_ptr(tkp); b.push_ptr(tvp); b.push_ptr(sp); b.push_ptr(op);
+            b.push_ptr(nvp); b.push_ptr(nap);
+            b.push_i32(nh); b.push_i32(hd); b.push_i32(sw); b.push_i32(tw);
+            b
+        };
+        self.launch_maybe_blob(
+            "v4f_attn_swa_topk_f32_buf",
+            [n_heads as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn v4f_attn_swa_topk_f32(
         &mut self,

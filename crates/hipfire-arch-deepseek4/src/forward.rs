@@ -1255,40 +1255,52 @@ pub(crate) fn precompute_attn_state(
 ) -> Result<(), String> {
     if state.attn_state_buf.is_none() {
         state.attn_state_buf = Some(
-            gpu.alloc_tensor(&[2], DType::F32)
+            gpu.alloc_tensor(&[6], DType::F32)
                 .map_err(|e| format!("alloc attn_state_buf: {e:?}"))?,
         );
     }
     if state.attn_state_host.is_none() {
-        state.attn_state_host = Some(Box::new([0i32; 2]));
+        state.attn_state_host = Some(Box::new([0i32; 6]));
     }
-    let win = cfg.sliding_window as i32;
-    let pos = state.n_tokens as i32;
-    let slot = pos % win;
-    let n_valid = (pos + 1).min(win);
-    let host = state.attn_state_host.as_mut().unwrap();
-    host[0] = slot;
-    host[1] = n_valid;
+    fill_attn_state_host(cfg, state, state.n_tokens as u32);
+    let host = state.attn_state_host.as_ref().unwrap();
     let dev = state.attn_state_buf.as_ref().unwrap();
     let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, 2 * 4)
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, 6 * 4)
     };
     gpu.memcpy_htod_auto(&dev.buf, bytes)
         .map_err(|e| format!("htod attn_state: {e:?}"))
+}
+
+/// Internal helper: fill `state.attn_state_host[0..6]` from `position`
+/// using V4F's compress-ratio + index_topk constants. Used by both
+/// `precompute_attn_state` (decode entry) and `update_attn_state_host`
+/// (graph replay path).
+fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, position: u32) {
+    let win = cfg.sliding_window as i32;
+    let topk = cfg.index_topk as i32;       // V4F: 512
+    let pos = position as i32;
+    let slot = pos % win;
+    let n_valid_swa = (pos + 1).min(win);
+    let n_compressed_4 = (pos + 1) / 4;
+    let n_compressed_128 = (pos + 1) / 128;
+    let k_active_4 = topk.min(n_compressed_4);
+    let k_active_128 = topk.min(n_compressed_128);
+    let host = state.attn_state_host.as_mut()
+        .expect("fill_attn_state_host: attn_state_host not initialised");
+    host[0] = slot;
+    host[1] = n_valid_swa;
+    host[2] = n_compressed_4;
+    host[3] = n_compressed_128;
+    host[4] = k_active_4;
+    host[5] = k_active_128;
 }
 
 /// Update host-only `attn_state_host[]` (no device copy). Used by the
 /// HIP-graphs replay path — the captured memcpy node re-reads this
 /// buffer when graph_launch fires.
 pub(crate) fn update_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, position: u32) {
-    let win = cfg.sliding_window as i32;
-    let pos = position as i32;
-    let slot = pos % win;
-    let n_valid = (pos + 1).min(win);
-    let host = state.attn_state_host.as_mut()
-        .expect("update_attn_state_host: attn_state_host not initialised");
-    host[0] = slot;
-    host[1] = n_valid;
+    fill_attn_state_host(cfg, state, position);
 }
 
 /// Host-only update of `state.pos_array_host[]` for the given position.
@@ -2496,61 +2508,61 @@ fn attn_stub(
                         .map_err(|e| format!("alloc gathered_k l{layer_idx}: {e:?}"))?
                 );
             }
-            let ratio = layer.compress_ratio as usize;
-            // n_compressed: number of compressed slots committed so far.
-            // Compressor commits a slot every `ratio` steps when
-            // (pos+1) % ratio == 0. With state.n_tokens being the
-            // just-incremented position, n_committed = (state.n_tokens) / ratio.
-            // Actually since we're at the END of attn_stub's pos (= state.n_tokens
-            // before increment), and the compressor ran BEFORE attn_stub:
-            //   at pos p with (p+1)%ratio==0, compressor wrote slot p/ratio.
-            //   n_committed after compressor = (p+1) / ratio.
-            let n_compressed = ((pos + 1) / ratio).min(topk_max);
+            // n_compressed / k_active values for the current position are
+            // pre-computed into state.attn_state_buf (slots 2-5) by
+            // precompute_attn_state. Select the right slot based on
+            // layer.compress_ratio so the captured graph reads the right
+            // host-updated value on every replay.
+            //   ratio=4  → n_compressed at slot 2, k_active at slot 4
+            //   ratio=128 → n_compressed at slot 3, k_active at slot 5
+            let attn_buf = state.attn_state_buf.as_ref()
+                .ok_or_else(|| "attn_state_buf missing".to_string())?;
+            let (n_compressed_buf, k_active_buf) = if layer.compress_ratio == 4 {
+                (attn_buf.sub_offset(2, 1), attn_buf.sub_offset(4, 1))
+            } else {
+                (attn_buf.sub_offset(3, 1), attn_buf.sub_offset(5, 1))
+            };
 
-            let k_active = if n_compressed == 0 {
-                0
-            } else if layer.compress_ratio == 4
-                && state._indexer[layer_idx].topk_idx_indices.is_some()
-            {
-                // ratio=4: gather using indexer top-K. The topk_idx_indices
-                // was populated by indexer_forward — it has up to index_topk
-                // entries, padded with -1 sentinels beyond n_compressed.
+            let use_topk_gather = layer.compress_ratio == 4
+                && state._indexer[layer_idx].topk_idx_indices.is_some();
+            if use_topk_gather {
+                // ratio=4 path: indexer top-K gather. Launch with fixed
+                // grid = topk_max so capture sees a constant grid; lanes
+                // past K_buf[0] early-return.
                 let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
-                let k = cfg.index_topk.min(n_compressed);
-                gpu.v4f_topk_kv_gather_f32(
+                gpu.v4f_topk_kv_gather_f32_buf(
                     main_kv_cache, topk_idx, gathered_k,
-                    k as i32, head_dim as i32, n_compressed as i32,
-                    topk_max as i32, 0, /*scale=*/1.0,
-                ).map_err(|e| format!("mixed gather (idx) l{layer_idx}: {e:?}"))?;
-                k
+                    &k_active_buf, &n_compressed_buf,
+                    topk_max as i32, head_dim as i32, topk_max as i32, 0, 1.0,
+                ).map_err(|e| format!("mixed gather (idx,buf) l{layer_idx}: {e:?}"))?;
             } else {
-                // ratio=128 (or fallback): no indexer, attend to all
-                // n_compressed entries directly. Copy main_kv_cache[0..n]
-                // into gathered_k[0..n] (transposed layout).
+                // ratio=128 (or fallback): identity gather over first K rows.
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
-                gpu.v4f_topk_kv_gather_identity_f32(
-                    main_kv_cache, gathered_k,
-                    n_compressed as i32, head_dim as i32, topk_max as i32,
-                ).map_err(|e| format!("mixed gather (all) l{layer_idx}: {e:?}"))?;
-                n_compressed
-            };
+                gpu.v4f_topk_kv_gather_identity_f32_buf(
+                    main_kv_cache, gathered_k, &k_active_buf,
+                    topk_max as i32, head_dim as i32, topk_max as i32,
+                ).map_err(|e| format!("mixed gather (all,buf) l{layer_idx}: {e:?}"))?;
+            }
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();
             let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
+            let n_valid_buf = attn_buf.sub_offset(1, 1);
             // Joint softmax: scores = Q·K for [swa_k, gathered_k, attn_sink],
             // single normalization, V = swa_v + gathered_v (K=V tied, so
-            // we pass gathered_k as V too).
-            gpu.v4f_attn_swa_topk_f32(
+            // we pass gathered_k as V too). n_valid_swa + n_active_topk
+            // come from the device-side attn_state_buf.
+            gpu.v4f_attn_swa_topk_f32_buf(
                 q, swa_k, swa_v, gathered_k, gathered_k,
                 attn_sink, attn_out_raw,
+                &n_valid_buf, &k_active_buf,
                 n_heads as i32, head_dim as i32,
                 win as i32, topk_max as i32,
-                n_valid, k_active as i32,
-            ).map_err(|e| format!("v4f_attn_swa_topk l{layer_idx}: {e:?}"))?;
+            ).map_err(|e| format!("v4f_attn_swa_topk_buf l{layer_idx}: {e:?}"))?;
+            let _ = n_valid; // legacy host-computed value not used after migration
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
             let swa_v = state._attention[layer_idx].swa_v.as_ref().unwrap();

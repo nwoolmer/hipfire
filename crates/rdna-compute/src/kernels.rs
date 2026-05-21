@@ -1612,6 +1612,21 @@ pub const V4F_ATTN_SWA_SRC: &str =
 /// device buffer instead of an i32 kernarg.
 pub const V4F_ATTN_SWA_BUF_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa_buf.hip");
+
+/// HIP-graphs-safe twin of `v4f_attn_swa_topk_f32`: reads `n_valid_swa`
+/// + `n_active_topk` from device buffers.
+pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
+    include_str!("../../../kernels/src/v4f_attn_swa_topk_buf.hip");
+
+/// HIP-graphs-safe twin of `v4f_topk_kv_gather_f32`: reads K + N_compressed
+/// from device buffers. Launch with fixed grid = MAX_K; lanes beyond K
+/// early-return.
+pub const V4F_TOPK_KV_GATHER_BUF_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_buf.hip");
+
+/// HIP-graphs-safe twin of `v4f_topk_kv_gather_identity_f32`.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC: &str =
+    include_str!("../../../kernels/src/v4f_topk_kv_gather_identity_buf.hip");
 pub const SWA_RING_WRITE_SRC: &str =
     include_str!("../../../kernels/src/swa_ring_write.hip");
 

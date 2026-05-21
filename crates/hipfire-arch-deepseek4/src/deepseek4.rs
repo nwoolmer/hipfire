@@ -641,21 +641,23 @@ pub struct DeepseekV4State {
     /// `hipMalloc not permitted under stream capture` and fail.
     pub ar_forward_warmed_up: bool,
 
-    /// Two-slot device buffer for SWA attention runtime state:
-    ///   [0] = slot      = state.n_tokens % sliding_window
-    ///   [1] = n_valid   = min(state.n_tokens + 1, sliding_window)
-    /// Both are derived from `state.n_tokens` at decode_step entry. Used
-    /// by the `_buf` variants of `swa_ring_write_f32` and the SWA
-    /// attention kernels so those kernels can be HIP-graph-captured
-    /// without baking position-derived integers into the kernarg blob.
-    /// All 43 layers read the SAME slot/n_valid values, so one shared
-    /// buffer is enough.
+    /// Six-slot device buffer for SWA attention runtime state:
+    ///   [0] slot              = state.n_tokens % sliding_window
+    ///   [1] n_valid_swa       = min(state.n_tokens + 1, sliding_window)
+    ///   [2] n_compressed_4    = (state.n_tokens + 1) / 4      (ratio=4 layers)
+    ///   [3] n_compressed_128  = (state.n_tokens + 1) / 128    (ratio=128 layers)
+    ///   [4] k_active_4        = min(index_topk, n_compressed_4)
+    ///   [5] k_active_128      = min(topk_window, n_compressed_128)
+    /// All values derived from `state.n_tokens` at decode_step entry; the
+    /// `_buf` variants of SWA / topk-gather / topk-attention kernels read
+    /// the relevant slots so captured HIP graphs pick up new positions on
+    /// each replay without re-capture.
     pub attn_state_buf: Option<rdna_compute::GpuTensor>,
     /// Stable-pointer host source for `attn_state_buf`. Same rationale
     /// as `pos_array_host`: captured memcpy nodes re-read this pointer
     /// on each graph replay and find the values written for the current
     /// position.
-    pub attn_state_host: Option<Box<[i32; 2]>>,
+    pub attn_state_host: Option<Box<[i32; 6]>>,
 
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
