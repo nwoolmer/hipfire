@@ -1144,10 +1144,20 @@ pub fn decode_step_with_graph(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
-    static GRAPH_OPT_ENV: OnceLock<bool> = OnceLock::new();
-    let graph_on = *GRAPH_OPT_ENV.get_or_init(|| {
-        std::env::var("HIPFIRE_V4F_GRAPH").ok().as_deref() == Some("1")
+    // Default policy: graphs ON for gfx11 (RDNA3/3.5) and gfx12 (RDNA4),
+    // OFF for others (RDNA1/2, CDNA) until A/B'd. Same architecture
+    // policy as the Qwen35 path. Explicit `HIPFIRE_V4F_GRAPH=0/1` wins.
+    static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
+    let graph_override = *GRAPH_OPT_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_V4F_GRAPH").ok().as_deref() {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            _ => None,
+        }
     });
+    let graph_arch_default =
+        gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+    let graph_on = graph_override.unwrap_or(graph_arch_default);
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
