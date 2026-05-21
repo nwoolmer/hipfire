@@ -1856,9 +1856,11 @@ pub fn mtp_forward(
         let streams = state.residual_streams.as_ref().unwrap();
         let dummy_rotated = state.mtp_e_norm_scratch.as_ref().unwrap();
         // Per-HC-row h_proj. mtp_h_proj is the same [hidden, hidden]
-        // weight matrix for every row; the inputs differ (per-row h_norm)
-        // so a B=hc_mult batched GEMM would amortize weight loads — left
-        // as a future optimization (hc_mult=4 keeps total work small).
+        // weight matrix for every row; the inputs differ (per-row h_norm).
+        // Tried batched GEMM (B=hc_mult=4) for weight-load amortization —
+        // measured 5% SLOWER (17.07 → 16.05 tok/s at K=3) because the
+        // batched-chunked Q8 path has setup overhead that beats the
+        // amortization at B=4. Keep the per-row loop.
         for h in 0..hc_mult {
             let h_norm_row = h_norm_full.sub_offset(h * hidden, hidden);
             let dst_row = streams.sub_offset(h * hidden, hidden);
