@@ -16,9 +16,18 @@
 //!   HIPFIRE_V4F_TEMP=F         sampling temperature (default 0.7; 0 = greedy argmax)
 //!   HIPFIRE_V4F_TOP_K=N        top-K filter before softmax (default 40; 0 = full vocab)
 //!   HIPFIRE_V4F_SEED=N         PRNG seed (default: time-based)
+//!   HIPFIRE_V4F_SPEC_DECODE=1  opt-in MTP speculative decode (default off — plain
+//!                              decode is faster on current V4F MQ2-Lloyd accept rates;
+//!                              spec-decode is exposed for experiments / model evolution).
+//!   HIPFIRE_V4F_SPEC_K=N       draft tokens per spec-decode window (default 3)
 
 use hipfire_arch_deepseek4::{
-    forward::{decode_step, forward_prefill_batch_chunked, PrefillBatchScratch},
+    forward::{
+        decode_step_with_graph, final_norm_and_head_last_batched,
+        forward_prefill_batch_chunk, forward_prefill_batch_chunked,
+        mtp_forward, precompute_positions, PrefillBatchScratch,
+    },
+    spec_decode::{logits_argmax, speculative_decode_step_with_pbs},
     DeepseekV4, DeepseekV4State,
 };
 use hipfire_runtime::arch::Architecture;
@@ -92,6 +101,13 @@ fn main() -> Result<(), String> {
         .ok().and_then(|s| s.parse().ok())
         .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0xC0FFEE));
     let mut rng = Xorshift::new(seed);
+    // Speculative decode opt-in. Default off because at current V4F MQ2-Lloyd
+    // accept rates (~50% K=2, ~53% K=3) spec decode is slower than plain
+    // decode_step_with_graph. Kept available for experiments and for when
+    // accept rates improve via better MTP plumbing.
+    let spec_mode = std::env::var("HIPFIRE_V4F_SPEC_DECODE").ok().as_deref() == Some("1");
+    let spec_k: usize = std::env::var("HIPFIRE_V4F_SPEC_K")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
 
     eprintln!("Loading V4F from {path}...");
     let mut hfq = HfqFile::open(std::path::Path::new(&path))
@@ -117,10 +133,13 @@ fn main() -> Result<(), String> {
     let mut state = DeepseekV4State::new(&cfg)?;
 
     // Batched prefill scratch — allocated once, reused for every turn.
-    // B=64 matches the bench memory ("V4F batched prefill 23.2 → 44 tok/s @ B=64").
-    // PrefillBatchScratch::new prints VRAM cost when HIPFIRE_V4F_PBS_VRAM=1.
+    // B=16 chosen 2026-05-21 from a 3-trials/cell sweep at prompt=706:
+    // B=8=39.2, B=16=44.5, B=32=44.2, B=64=43.3, B=128=43.0, B=512=42.3 tok/s.
+    // Plateau B=16..128 with gradual decline past 128 from L2/InfCache spill
+    // on activations. Override via HIPFIRE_V4F_PP_BATCH; print VRAM cost
+    // via HIPFIRE_V4F_PBS_VRAM=1.
     let pbs_max_batch: usize = std::env::var("HIPFIRE_V4F_PP_BATCH")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
 
     eprintln!("V4F ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
@@ -176,15 +195,26 @@ fn main() -> Result<(), String> {
         // longer than the chunk size; falls back to per-token decode
         // internally if a chunk's path errors.
         //
-        // `decode_step` increments state.n_tokens internally; the batched
-        // path uses start_pos directly and does NOT touch state.n_tokens.
-        // We update it manually below so the subsequent TG decode_step
-        // calls write SWA at the right ring slots.
+        // In spec-decode mode, we run the chunk loop manually so we can
+        // interleave per-position mtp_forward calls — this populates the
+        // MTP layer's SWA cache so the first spec-decode window has warm
+        // MTP state. (Plain decode doesn't need this and skips it.)
+        //
+        // The batched path uses start_pos directly and does NOT touch
+        // state.n_tokens. We update it manually below so the subsequent
+        // TG decode_step calls write SWA at the right ring slots.
         let pp_start = Instant::now();
         let start_pp_pos = pos;
-        let last_logits = forward_prefill_batch_chunked(
-            &cfg, &weights, &mut state, &mut gpu, &prompt_tokens, start_pp_pos, &pbs,
-        )?;
+        let last_logits = if spec_mode {
+            prefill_with_mtp_fill(
+                &cfg, &weights, &mut state, &mut gpu, &pbs,
+                &prompt_tokens, start_pp_pos,
+            )?
+        } else {
+            forward_prefill_batch_chunked(
+                &cfg, &weights, &mut state, &mut gpu, &prompt_tokens, start_pp_pos, &pbs,
+            )?
+        };
         pos = start_pp_pos + prompt_tokens.len() as u32;
         state.n_tokens = pos as u64;
         let pp_elapsed = pp_start.elapsed();
@@ -193,12 +223,48 @@ fn main() -> Result<(), String> {
         let tg_start = Instant::now();
         let mut tok = sample_token(&last_logits, temp, top_k, &mut rng);
         let mut generated: Vec<u32> = Vec::with_capacity(max_gen as usize);
-        for _ in 0..max_gen {
-            if !raw_mode && tok == eos_tok { break; }
-            generated.push(tok);
-            let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos)?;
-            pos += 1;
-            tok = sample_token(&logits, temp, top_k, &mut rng);
+        if spec_mode {
+            // Greedy verifier — sampler is bypassed in spec mode (the
+            // smoke flow takes the verifier's argmax to keep accept
+            // semantics deterministic). Temperature/top-k only apply
+            // to plain-decode mode.
+            let mut spec_last_token = tok;
+            let mut spec_last_position = pos;
+            let mut last_hidden_ref = state.mtp_last_hidden.as_ref()
+                .map(|t| t as *const _);
+            while generated.len() < max_gen as usize {
+                if !raw_mode && spec_last_token == eos_tok { break; }
+                let lh: Option<&rdna_compute::GpuTensor> = unsafe {
+                    last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+                };
+                let r = speculative_decode_step_with_pbs(
+                    &cfg, &weights, &mut state, &mut gpu, &pbs,
+                    spec_last_token, spec_last_position, lh, spec_k,
+                )?;
+                for t in &r.accepted_tokens {
+                    if generated.len() >= max_gen as usize { break; }
+                    if !raw_mode && *t == eos_tok { break; }
+                    generated.push(*t);
+                }
+                if let Some(&t) = r.accepted_tokens.last() {
+                    spec_last_position += r.accepted_tokens.len() as u32;
+                    spec_last_token = t;
+                }
+                last_hidden_ref = state.mtp_last_hidden.as_ref()
+                    .map(|t| t as *const _);
+                pos = spec_last_position;
+                if !raw_mode && spec_last_token == eos_tok { break; }
+            }
+            // Re-seed `tok` so the post-TG sampling check (above) lines up.
+            let _ = (tok, &logits_argmax);
+        } else {
+            for _ in 0..max_gen {
+                if !raw_mode && tok == eos_tok { break; }
+                generated.push(tok);
+                let logits = decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, tok, pos)?;
+                pos += 1;
+                tok = sample_token(&logits, temp, top_k, &mut rng);
+            }
         }
         let tg_elapsed = tg_start.elapsed();
 
@@ -216,4 +282,86 @@ fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Manual-chunk prefill with per-position MTP fill interleaved.
+///
+/// Mirrors the v4f_mtp_smoke "batched main + per-position MTP" path.
+/// Used when HIPFIRE_V4F_SPEC_DECODE=1 so the MTP layer's SWA cache
+/// gets populated during prefill — without this, the first spec-decode
+/// draft step sees an empty MTP attention history.
+///
+/// Returns logits at the LAST position (for the first generated token).
+fn prefill_with_mtp_fill(
+    cfg: &hipfire_arch_deepseek4::DeepseekV4Config,
+    weights: &hipfire_arch_deepseek4::DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    prompt_tokens: &[u32],
+    start_pos: u32,
+) -> Result<Vec<f32>, String> {
+    let stream_len = cfg.hc_mult * cfg.hidden_size;
+    if state.mtp_last_hidden.is_none() {
+        state.mtp_last_hidden = Some(
+            gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+                .map_err(|e| format!("alloc mtp_last_hidden (spec prefill): {e:?}"))?
+        );
+    }
+    // compressor_forward_prebatched reads pos_array_device via pos_slot()
+    // for any compressed layer. Init to start_pos; the MTP-fill loop
+    // refreshes per-position.
+    precompute_positions(cfg, state, gpu, start_pos)?;
+
+    let mut last_logits: Vec<f32> = vec![];
+    let mut pos_cursor: usize = 0;
+    while pos_cursor < prompt_tokens.len() {
+        let chunk_size = (prompt_tokens.len() - pos_cursor).min(pbs.max_batch);
+        let chunk = &prompt_tokens[pos_cursor..pos_cursor + chunk_size];
+        let abs_chunk_start = start_pos as usize + pos_cursor;
+        let is_last_chunk = pos_cursor + chunk_size == prompt_tokens.len();
+
+        forward_prefill_batch_chunk(
+            cfg, weights, state, gpu, pbs, chunk, abs_chunk_start as u32,
+        )?;
+
+        // MTP fill: positions [abs_chunk_start..abs_chunk_start + chunk_size).
+        // Skip the global last position — its next-token is unknown
+        // (it's what we're about to generate). Skip lm_head + logits
+        // d2h during the fill loop via HIPFIRE_V4F_MTP_SKIP_HEAD=1.
+        std::env::set_var("HIPFIRE_V4F_MTP_SKIP_HEAD", "1");
+        let mtp_end_b = if is_last_chunk {
+            chunk_size.saturating_sub(1)
+        } else {
+            chunk_size
+        };
+        for b in 0..mtp_end_b {
+            let absolute_pos = abs_chunk_start + b;
+            let off = b * stream_len;
+            let slice = pbs.streams_batch.sub_offset(off, stream_len);
+            let dst = state.mtp_last_hidden.as_ref().unwrap();
+            gpu.memcpy_dtod_auto(&dst.buf, &slice.buf, stream_len * 4)
+                .map_err(|e| format!("d2d streams[{b}]→mtp_last_hidden: {e:?}"))?;
+            let next_tok = prompt_tokens[pos_cursor + b + 1];
+            state.n_tokens = absolute_pos as u64;
+            precompute_positions(cfg, state, gpu, absolute_pos as u32)?;
+            // SAFETY: state.mtp_last_hidden lives for the rest of this call;
+            // mtp_forward only reads from it before writing to it.
+            let hidden_ptr: *const rdna_compute::GpuTensor =
+                state.mtp_last_hidden.as_ref().unwrap();
+            let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
+            let _ = mtp_forward(cfg, weights, state, gpu, hidden, next_tok, absolute_pos as u32)?;
+        }
+        std::env::remove_var("HIPFIRE_V4F_MTP_SKIP_HEAD");
+
+        pos_cursor += chunk_size;
+        state.n_tokens = (abs_chunk_start + chunk_size) as u64;
+
+        if is_last_chunk {
+            last_logits = final_norm_and_head_last_batched(
+                cfg, weights, state, pbs, gpu, chunk_size,
+            )?;
+        }
+    }
+    Ok(last_logits)
 }
