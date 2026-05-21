@@ -54,8 +54,10 @@ fn mem_stats() -> (f64, f64) {
 fn rss_mark(label: &str) {
     let (proc_gb, sys_gb) = mem_stats();
     eprintln!("[MEM] {label:<32} proc={proc_gb:>6.2} GiB | sys-used={sys_gb:>6.2} GiB");
-    if sys_gb > 115.0 {
-        eprintln!("[MEM] *** SYSTEM-USED OVER 115 GiB — aborting to avoid OOM ***");
+    let limit_gb: f64 = std::env::var("HIPFIRE_V4F_MEM_GUARD_GB")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(115.0);
+    if sys_gb > limit_gb {
+        eprintln!("[MEM] *** SYSTEM-USED OVER {limit_gb} GiB — aborting to avoid OOM ***");
         std::process::exit(2);
     }
 }
