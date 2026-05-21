@@ -121,6 +121,20 @@ mod env_cache {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_V4F_MTP_NO_ROUTED"))
     }
+    /// `HIPFIRE_V4F_MTP_HEAD_HC` — default ON since 2026-05-21: route
+    /// the MTP output (step 8 of mtp_forward) through head-HC mix using
+    /// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
+    /// main model's final_norm_and_head head-HC reduction. Without
+    /// this, MTP step 8 reads only stream 0 — discarding 75% of HC
+    /// signal at the head boundary (same architectural pattern as the
+    /// input-side HC fix shipped in 82224ad). Opt out with =0 for
+    /// debugging or pre-fix-compat builds.
+    pub(super) fn mtp_head_hc_on() -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("HIPFIRE_V4F_MTP_HEAD_HC").ok().as_deref() != Some("0")
+        })
+    }
     /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
     pub(super) fn bisect_break() -> Option<&'static str> {
         static V: OnceLock<Option<String>> = OnceLock::new();
@@ -1889,10 +1903,19 @@ pub fn mtp_forward(
             .map_err(|e| format!("capture full HC → mtp_last_hidden: {e:?}"))?;
     }
 
-    // ── 8. mtp_final_norm + shared lm_head → logits ───────────────────
-    // Stream 0 → mtp_final_norm → lm_head. The MTP head-HC tensors
-    // (mtp.0.hc_head_*) are intentionally unused here — see memory
-    // entry; using them measured WORSE acceptance than skipping.
+    // ── 8. final_norm + lm_head → logits ──────────────────────────────
+    // Two paths (mirrors the main-model `final_norm_and_head`):
+    //   - default (legacy): stream 0 → mtp_final_norm → lm_head. Reads
+    //     only 1 of 4 HC streams; discards 75% of head signal.
+    //   - HIPFIRE_V4F_MTP_HEAD_HC=1: head-HC mix(streams, mtp.0.hc_head_*)
+    //     → mtp_final_norm → lm_head. Uses the MTP's own head-HC weights
+    //     to reduce [hc_mult, hidden] → [hidden] before norm.
+    //
+    // The legacy path was the original choice because an earlier head-HC
+    // experiment measured WORSE acceptance — but that was BEFORE 82224ad
+    // fixed the input-side full-HC plumbing. With distinct HC streams
+    // entering the MTP block, the output head-HC mix becomes meaningful;
+    // gated opt-in until validated end-to-end.
     if state.final_norm.is_none() {
         state.final_norm = Some(gpu.alloc_tensor(&[hidden], DType::F32)
             .map_err(|e| format!("alloc final_norm: {e:?}"))?);
@@ -1901,17 +1924,49 @@ pub fn mtp_forward(
         state.final_norm_rot = Some(gpu.alloc_tensor(&[hidden], DType::F32)
             .map_err(|e| format!("alloc final_norm_rot: {e:?}"))?);
     }
-    let final_norm = state.final_norm.as_ref().unwrap();
-    let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
-    {
+    // Run head-HC mix or legacy stream-0 path; result lands in
+    // `state.final_norm` via rmsnorm.
+    let use_head_hc = env_cache::mtp_head_hc_on()
+        && mtp.mtp_hc_head_fn.is_some()
+        && mtp.mtp_hc_head_base.is_some();
+    if use_head_hc {
+        if state.head_hc_pre.is_none() {
+            state.head_hc_pre = Some(gpu.alloc_tensor(&[hc_mult], DType::F32)
+                .map_err(|e| format!("alloc head_hc_pre (mtp): {e:?}"))?);
+        }
+        if state.head_hc_out.is_none() {
+            state.head_hc_out = Some(gpu.alloc_tensor(&[hidden], DType::F32)
+                .map_err(|e| format!("alloc head_hc_out (mtp): {e:?}"))?);
+        }
+        let streams = state.residual_streams.as_ref().unwrap();
+        let head_hc_pre = state.head_hc_pre.as_ref().unwrap();
+        let head_hc_out = state.head_hc_out.as_ref().unwrap();
+        let hc_head_fn = mtp.mtp_hc_head_fn.as_ref().unwrap();
+        let hc_head_base = mtp.mtp_hc_head_base.as_ref().unwrap();
+        let x_dim = hidden * hc_mult;
+        gpu.hc_head_compute_pre(streams, hc_head_fn, hc_head_base, head_hc_pre,
+            hc_mult as i32, x_dim as i32,
+            mtp.mtp_hc_head_scale, cfg.rms_norm_eps, cfg.hc_eps,
+        ).map_err(|e| format!("mtp hc_head_compute_pre: {e:?}"))?;
+        gpu.hc_input_map_4stream(head_hc_pre, streams, head_hc_out, hidden as i32)
+            .map_err(|e| format!("mtp hc_input_map: {e:?}"))?;
+        let final_norm = state.final_norm.as_ref().unwrap();
+        gpu.rmsnorm_f32(head_hc_out, mtp_final, final_norm, cfg.rms_norm_eps)
+            .map_err(|e| format!("mtp final rmsnorm (head-HC): {e:?}"))?;
+    } else {
         let streams = state.residual_streams.as_ref().unwrap();
         let stream0 = streams.sub_offset(0, hidden);
+        let final_norm = state.final_norm.as_ref().unwrap();
         gpu.rmsnorm_f32(&stream0, mtp_final, final_norm, cfg.rms_norm_eps)
-            .map_err(|e| format!("mtp final rmsnorm: {e:?}"))?;
-        if weight_needs_fwht(head) {
-            gpu.rotate_x_mq(final_norm, final_norm_rot, hidden)
-                .map_err(|e| format!("mtp rotate final: {e:?}"))?;
-        }
+            .map_err(|e| format!("mtp final rmsnorm (stream0): {e:?}"))?;
+    }
+    let final_norm = state.final_norm.as_ref().unwrap();
+    let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
+    if weight_needs_fwht(head) {
+        gpu.rotate_x_mq(final_norm, final_norm_rot, hidden)
+            .map_err(|e| format!("mtp rotate final: {e:?}"))?;
+    }
+    {
         let logits = state.logits.as_ref().unwrap();
         gemv_auto(gpu, head, final_norm_rot, final_norm, logits,
             cfg.vocab_size, hidden)?;
