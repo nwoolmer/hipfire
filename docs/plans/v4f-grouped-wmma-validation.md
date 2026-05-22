@@ -188,3 +188,69 @@ L2 / Infinity Cache spill). B=341 is not realistic.
 
 Both of these are unblocked by the Gate 1 finding (they don't
 require WMMA C-fragment fill on the MoE side).
+
+---
+
+## Addendum (2026-05-22) — B-sweep with MoE-on shows Path B IS viable at large B
+
+After the initial Gate 1 fail at B=16, ran a full B-sweep with
+HIPFIRE_V4F_UPLOAD_EXPERTS=1 properly set, using the new load-once
+harness `examples/bench_v4f_b_sweep.rs` (avoids the 80 GB re-read
+per trial). Routing distributions captured at each B via the same
+dump mechanism; analysis script at `analyze_v4f_tile_fill_sweep.py`.
+
+### Speedup and tile fill across B (3 trials each, median)
+
+| B | tok/s | mean tile fill | full-16 tiles | ≥12-fill tiles | =1-slot tiles |
+|---|---|---|---|---|---|
+| 16  | 43.94 | 14.9 % | 0.0 % | 3.0 %  | 61.5 % |
+| 32  | **45.06** ← peak | 20.3 % | 3.7 % | 6.3 %  | 49.5 % |
+| 64  | 43.82 | 27.0 % | 8.2 % | 11.1 % | 38.7 % |
+| 128 | 43.01 | 34.5 % | 13.5 % | 17.4 % | 27.1 % |
+| 256 | 42.36 | 46.6 % | 24.3 % | 30.2 % | 17.8 % |
+| 512 | 42.37 | **61.7 %** | **40.8 %** | **48.4 %** | 10.3 % |
+
+### Two clean findings
+
+**1. Cache spill is NOT what limits prefill at large B.** Going B=32
+to B=512 costs only -6 % tok/s (45.06 → 42.37). If activation
+cache pressure were the bottleneck we'd see 30-50 % drop. It isn't.
+
+**2. Compute (scalar codebook decode) dominates uniformly across B.**
+The MoE GEMV runs the same per-(b, krank) decode + FMA chain
+regardless of neighbor routing. Routing concentration doesn't help
+the SCALAR path. Only WMMA-grouped would benefit.
+
+**3. Tile fill IS high enough at large B.** At B=512, mean tile fill
+is 62 % and 41 % of tiles are completely full. **Above the 50 %
+Gate 1 threshold.** Scatter-grouped WMMA MoE WOULD be a viable
+lever at B ≥ 256.
+
+### Revised decision: Path B' (revised) — chunk-size-gated dispatch
+
+Build the scatter-grouped WMMA MoE kernel, **but dispatch it only
+when `chunk_size ≥ 256`**. Smaller chunks (the typical case) stay
+on the scalar K4 path.
+
+Projected scope of the win:
+- Per-MoE-call: 1.3-1.5× faster (tile fill 50-62 %, vs near-100 %
+  in qwen35's 32-slots/expert regime which got 2×)
+- MoE share of GPU time: 46 %
+- Whole-prefill at B=512: ~10-15 % win → **~50 tok/s on long prompts**
+
+When the win applies:
+- Long prompts (≥ 1K tokens) where running multiple chunks at
+  B=512 is worthwhile
+- NOT typical interactive use (50-1K tokens prefill stays on
+  scalar K4)
+
+Engineering cost (revised):
+- Port `gemm_hfq4g256_moe_grouped_mmq.gfx1151.hip` pattern (exists
+  on origin/master) to MQ2-Lloyd codebook decode: ~400-600 LoC
+- Add chunk-size-gated dispatch in `ffn_batched`: ~30 LoC
+- Validation: bench at multiple B + multiple prompt lengths,
+  confirm scalar fallback is byte-equal to current at small B
+
+Pre-condition: validate that long-prompt prefill at B=512 actually
+runs WITHOUT cache-spill regression at our hardware — see the
+4K-token sanity check below.
