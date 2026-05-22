@@ -5408,41 +5408,27 @@ pub fn forward_prefill_batch_chunked(
         return Err("forward_prefill_batch_chunked: empty tokens".to_string());
     }
 
-    // Try the chunked batched path. If it fails (mixed-attention layer
-    // not yet wired), fall back to per-token decode_step. The fallback
-    // is byte-identical to current sequential prefill semantics.
+    // Strict batched-only path. Any chunk failure surfaces immediately —
+    // we do NOT silently fall back to per-token decode_step. The original
+    // fallback masked a real correctness bug in chunk 2+ (per-batch state
+    // not initialised; see Option B fix, memory entry
+    // `feedback_v4f_chunked_silent_fallback_bug`). Keeping the fallback
+    // hides any future regression in the same place.
     let mut pos_cursor = start_pos as usize;
     let mut remaining = tokens;
     while !remaining.is_empty() {
         let take = remaining.len().min(pbs.max_batch);
         let chunk = &remaining[..take];
-        match forward_prefill_batch_chunk(
+        forward_prefill_batch_chunk(
             cfg, weights, state, gpu, pbs, chunk, pos_cursor as u32,
-        ) {
-            Ok(()) => {
-                // If this was the last chunk, run the head on the last
-                // batch position.
-                if take == remaining.len() {
-                    return final_norm_and_head_last_batched(
-                        cfg, weights, state, pbs, gpu, take,
-                    );
-                }
-                pos_cursor += take;
-                remaining = &remaining[take..];
-            }
-            Err(_) => {
-                // Chunk failed (mixed-attention layer not wired).
-                // Fall through to per-token decode_step for this and
-                // remaining chunks.
-                let mut last_logits = Vec::new();
-                for (i, &tok) in remaining.iter().enumerate() {
-                    last_logits = decode_step(
-                        cfg, weights, state, gpu, tok, (pos_cursor + i) as u32,
-                    )?;
-                }
-                return Ok(last_logits);
-            }
+        )?;
+        if take == remaining.len() {
+            return final_norm_and_head_last_batched(
+                cfg, weights, state, pbs, gpu, take,
+            );
         }
+        pos_cursor += take;
+        remaining = &remaining[take..];
     }
     Err("forward_prefill_batch_chunked: chunk loop completed without producing logits".to_string())
 }
