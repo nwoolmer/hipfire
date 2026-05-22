@@ -1855,6 +1855,178 @@ pub fn mtp_forward(
     Ok(logits_host)
 }
 
+/// Batched twin of `mtp_forward` — processes `batch_size` MTP positions
+/// in a single pass through the MTP layer block (Phase A4, 2026-05-22).
+///
+/// Inputs:
+/// - `h_n_streams`: `[batch_size, hc_mult, hidden]` — the per-batch full
+///   HC residual streams from the main forward's `pbs.streams_batch`.
+/// - `next_tokens`: `[batch_size]` — the next-position tokens (T_{i+1}).
+/// - `start_pos`: absolute position of the first batch slot.
+///
+/// Post-state:
+/// - `pbs.streams_batch` contains the per-batch MTP-layer output residuals.
+/// - `state.mtp_last_hidden` contains the LAST batch position's MTP
+///   output stream (the chaining input to subsequent spec-decode windows).
+/// - `state._attention[mtp_layer_idx]` SWA cache has slots for the
+///   processed positions written.
+///
+/// Skips lm_head + logits d2h (only the SWA-fill purpose is exercised).
+///
+/// At batch_size == 1 this is byte-equivalent to `mtp_forward` modulo
+/// FP reduction-order noise inherent to the batched kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_forward_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    h_n_streams: &GpuTensor,
+    next_tokens: &[u32],
+    start_pos: u32,
+    batch_size: usize,
+) -> Result<(), String> {
+    if batch_size == 0 {
+        return Err("mtp_forward_batched: batch_size == 0".to_string());
+    }
+    if batch_size > pbs.max_batch {
+        return Err(format!(
+            "mtp_forward_batched: batch_size {batch_size} > pbs.max_batch {}",
+            pbs.max_batch
+        ));
+    }
+    if next_tokens.len() != batch_size {
+        return Err(format!(
+            "mtp_forward_batched: next_tokens.len {} != batch_size {batch_size}",
+            next_tokens.len()
+        ));
+    }
+    let mtp = weights.mtp_layer.as_ref()
+        .ok_or_else(|| "mtp_forward_batched: weights.mtp_layer is None".to_string())?;
+    let mtp_enorm  = mtp.mtp_enorm.as_ref().ok_or("mtp_forward_batched: mtp_enorm missing")?;
+    let mtp_hnorm  = mtp.mtp_hnorm.as_ref().ok_or("mtp_forward_batched: mtp_hnorm missing")?;
+    let mtp_e_proj = mtp.mtp_e_proj.as_ref().ok_or("mtp_forward_batched: mtp_e_proj missing")?;
+    let mtp_h_proj = mtp.mtp_h_proj.as_ref().ok_or("mtp_forward_batched: mtp_h_proj missing")?;
+    for (name, t) in [("mtp_e_proj", mtp_e_proj), ("mtp_h_proj", mtp_h_proj)] {
+        match t.dtype {
+            DType::F32 | DType::F16 | DType::Q8_0 => {}
+            other => return Err(format!(
+                "mtp_forward_batched: {name} dtype {other:?} unsupported")),
+        }
+    }
+    if cfg.num_nextn_predict_layers == 0 {
+        return Err("mtp_forward_batched: cfg.num_nextn_predict_layers == 0".to_string());
+    }
+
+    let hidden = cfg.hidden_size;
+    let hc_mult = cfg.hc_mult;
+    let stream_len = hc_mult * hidden;
+    let mtp_layer_idx = cfg.num_hidden_layers;
+
+    // Lazy alloc state.mtp_last_hidden.
+    if state.mtp_last_hidden.is_none() {
+        state.mtp_last_hidden = Some(
+            gpu.alloc_tensor(&[hc_mult, hidden], DType::F32)
+                .map_err(|e| format!("alloc mtp_last_hidden: {e:?}"))?);
+    }
+
+    let token_embd = weights.token_embd.as_ref()
+        .ok_or("mtp_forward_batched: token_embd not uploaded")?;
+
+    // ── 1. Upload next_tokens [batch_size] ─────────────────────────────
+    let tokens_host: Vec<i32> = next_tokens.iter().map(|&t| t as i32).collect();
+    let token_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, batch_size * 4)
+    };
+    gpu.memcpy_htod_auto(&pbs.mtp_tokens_batch.buf, token_bytes)
+        .map_err(|e| format!("mtp_forward_batched htod tokens: {e:?}"))?;
+
+    // ── 2. Batched embed → pbs.mtp_embed_batch ─────────────────────────
+    gpu.embedding_lookup_q8_batched(
+        token_embd, &pbs.mtp_embed_batch, &pbs.mtp_tokens_batch, batch_size, hidden,
+    ).map_err(|e| format!("mtp embedding_lookup_q8_batched: {e:?}"))?;
+
+    // ── 3. Batched RMSNorm both inputs ─────────────────────────────────
+    // e_norm = mtp_enorm(embed_batch) → mtp_e_norm_batch [B, hidden]
+    gpu.rmsnorm_batched(
+        &pbs.mtp_embed_batch, mtp_enorm, &pbs.mtp_e_norm_batch,
+        batch_size, hidden, cfg.rms_norm_eps,
+    ).map_err(|e| format!("mtp rmsnorm_e batched: {e:?}"))?;
+    // h_norm = mtp_hnorm(h_n_streams) per (batch, HC row) — treat as
+    // batch_size * hc_mult rows of length hidden.
+    gpu.rmsnorm_batched(
+        h_n_streams, mtp_hnorm, &pbs.mtp_h_norm_batch,
+        batch_size * hc_mult, hidden, cfg.rms_norm_eps,
+    ).map_err(|e| format!("mtp rmsnorm_h batched: {e:?}"))?;
+
+    // ── 4. Batched e_proj GEMV: mtp_e_norm_batch → mtp_x_e_batch ───────
+    // dummy_rotated is unused for F32/F16/Q8 weight dtypes (guarded above).
+    gemv_auto_batched_wmma(
+        gpu, mtp_e_proj, &pbs.mtp_h_norm_batch, &pbs.mtp_e_norm_batch,
+        &pbs.mtp_x_e_batch, hidden, hidden, batch_size, None,
+    )?;
+
+    // ── 5. Batched h_proj GEMV — flatten (B, hc_mult) as one batch dim.
+    // Input mtp_h_norm_batch [B * hc_mult, hidden] → output streams_batch
+    // [B * hc_mult, hidden]. mtp_h_proj is the same weight for every
+    // (batch, HC) row.
+    gemv_auto_batched_wmma(
+        gpu, mtp_h_proj, &pbs.mtp_e_norm_batch, &pbs.mtp_h_norm_batch,
+        &pbs.streams_batch, hidden, hidden, batch_size * hc_mult, None,
+    )?;
+
+    // ── 6. Broadcast-add x_e_b into every HC row of streams_batch_b ───
+    // streams_batch[b][h] += mtp_x_e_batch[b] for h in 0..hc_mult, b in 0..B.
+    for b in 0..batch_size {
+        let x_e_b = pbs.mtp_x_e_batch.sub_offset(b * hidden, hidden);
+        for h in 0..hc_mult {
+            let off = b * stream_len + h * hidden;
+            let row = pbs.streams_batch.sub_offset(off, hidden);
+            gpu.add_inplace_f32(&row, &x_e_b)
+                .map_err(|e| format!("mtp x_e add b={b} h={h}: {e:?}"))?;
+        }
+    }
+
+    // ── 7. Populate per-batch positions + attn_state for the MTP layer.
+    //   Positions: start_pos + b.
+    //   attn_state: slot = (start_pos + b) % swa_window; n_valid = min(start_pos + b + 1, swa_window).
+    precompute_positions_batched(cfg, pbs, gpu, start_pos, batch_size)?;
+    precompute_attn_state_batched(cfg, pbs, gpu, start_pos, batch_size)?;
+
+    // ── 8. Standard batched layer block at layer_idx = mtp_layer_idx ──
+    // The MTP layer has compress_ratio = 0 so attention_block_batched_swa_only
+    // is the right path. Hash routing is N/A (mtp_layer_idx >= num_hash_layers).
+    let n = batch_size;
+    mhc_pre_batched(cfg, weights, pbs, gpu, mtp_layer_idx, /*is_attn=*/true, n)?;
+    q_lora_batched(cfg, weights, pbs, &pbs.hc_x_in_batch, gpu, mtp_layer_idx, n)?;
+    kv_joint_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n)?;
+    apply_tail_rope_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n)?;
+    attention_block_batched_swa_only(
+        cfg, weights, state, pbs, gpu, mtp_layer_idx, start_pos, n,
+    )?;
+    hc_attn_mix_batched(cfg, pbs, gpu, n)?;
+    mhc_pre_batched(cfg, weights, pbs, gpu, mtp_layer_idx, /*is_attn=*/false, n)?;
+    // ffn_batched takes `tokens` for the hash-routed path; MTP layer is
+    // not hash-routed (mtp_layer_idx >= num_hash_layers), so the value
+    // is ignored. Pass an empty slice.
+    let tokens_dummy: &[u32] = &[];
+    ffn_batched(cfg, weights, pbs, gpu, mtp_layer_idx, n, tokens_dummy)?;
+    hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
+
+    // ── 9. Capture the LAST batch position's residual stream → mtp_last_hidden.
+    //    Subsequent spec-decode windows read from this.
+    {
+        let last_off = (batch_size - 1) * stream_len;
+        let last_slice = pbs.streams_batch.sub_offset(last_off, stream_len);
+        let dst = state.mtp_last_hidden.as_ref().unwrap();
+        gpu.memcpy_dtod_auto(&dst.buf, &last_slice.buf, stream_len * 4)
+            .map_err(|e| format!("mtp d2d streams[last] → mtp_last_hidden: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
 /// FFN block (partial — shared expert only; routed experts pending).
 ///
 /// V4F has one shared expert + 256 routed experts (top-6 selected
@@ -3756,6 +3928,25 @@ pub struct PrefillBatchScratch {
     /// `[max_batch * ATTN_STATE_SLOTS=10]` i32 stored as F32. Same
     /// swap-and-sub-view pattern as pos_array_device_batch.
     pub attn_state_buf_batch: GpuTensor,
+    /// Batched MTP next-token ids `[max_batch]` stored as F32 (i32-in-F32
+    /// slot pattern). Per-position next-token id, fed to the batched
+    /// embedding lookup at the start of `mtp_forward_batched`.
+    pub mtp_tokens_batch: GpuTensor,
+    /// Batched MTP embed output `[max_batch, hidden]`. embedding_lookup_q8
+    /// _batched writes one row per batch position from `mtp_tokens_batch`.
+    pub mtp_embed_batch: GpuTensor,
+    /// Batched MTP e_norm output `[max_batch, hidden]`. `mtp_enorm`
+    /// applied to `mtp_embed_batch` per batch row.
+    pub mtp_e_norm_batch: GpuTensor,
+    /// Batched MTP h_norm output `[max_batch, hc_mult, hidden]`. `mtp_hnorm`
+    /// applied to the main forward's `streams_batch` per (batch, HC row).
+    /// Consumed by the per-HC `mtp_h_proj` GEMV that writes the new
+    /// `streams_batch` contents at the start of the MTP layer block.
+    pub mtp_h_norm_batch: GpuTensor,
+    /// Batched MTP x_e output `[max_batch, hidden]`. `mtp_e_proj @ e_norm`
+    /// per batch row; broadcast-added to every HC row of the rebuilt
+    /// streams_batch.
+    pub mtp_x_e_batch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -3869,6 +4060,11 @@ impl PrefillBatchScratch {
             attn_state_buf_batch: alloc(
                 gpu, &[max_batch * 10], "attn_state_buf_batch",
             )?,
+            mtp_tokens_batch:  alloc(gpu, &[max_batch], "mtp_tokens_batch")?,
+            mtp_embed_batch:   alloc(gpu, &[max_batch, hidden], "mtp_embed_batch")?,
+            mtp_e_norm_batch:  alloc(gpu, &[max_batch, hidden], "mtp_e_norm_batch")?,
+            mtp_h_norm_batch:  alloc(gpu, &[max_batch, hc_mult, hidden], "mtp_h_norm_batch")?,
+            mtp_x_e_batch:     alloc(gpu, &[max_batch, hidden], "mtp_x_e_batch")?,
             wmma_x_scratch_f16: {
                 // Cover the largest x-tensor size across all batched
                 // WMMA call sites. wo_a's input is [B, G, per_group_in]

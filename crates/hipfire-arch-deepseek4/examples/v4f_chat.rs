@@ -25,7 +25,7 @@ use hipfire_arch_deepseek4::{
     forward::{
         decode_step_with_graph, final_norm_and_head_last_batched,
         forward_prefill_batch_chunk, forward_prefill_batch_chunked,
-        mtp_forward, precompute_positions, PrefillBatchScratch,
+        mtp_forward_batched, precompute_positions, PrefillBatchScratch,
     },
     spec_decode::{logits_argmax, speculative_decode_step_with_pbs},
     DeepseekV4, DeepseekV4State,
@@ -308,8 +308,7 @@ fn prefill_with_mtp_fill(
         );
     }
     // compressor_forward_prebatched reads pos_array_device via pos_slot()
-    // for any compressed layer. Init to start_pos; the MTP-fill loop
-    // refreshes per-position.
+    // for any compressed layer. Init to start_pos.
     precompute_positions(cfg, state, gpu, start_pos)?;
 
     let mut last_logits: Vec<f32> = vec![];
@@ -320,43 +319,74 @@ fn prefill_with_mtp_fill(
         let abs_chunk_start = start_pos as usize + pos_cursor;
         let is_last_chunk = pos_cursor + chunk_size == prompt_tokens.len();
 
+        // 1. Batched main forward over this chunk's positions. After this,
+        //    pbs.streams_batch holds [chunk_size, hc_mult, hidden] residuals
+        //    — these are the per-position h_n inputs the MTP layer needs.
         forward_prefill_batch_chunk(
             cfg, weights, state, gpu, pbs, chunk, abs_chunk_start as u32,
         )?;
 
-        // MTP fill: positions [abs_chunk_start..abs_chunk_start + chunk_size).
-        // Skip the global last position — its next-token is unknown
-        // (it's what we're about to generate). Skip lm_head + logits
-        // d2h during the fill loop via HIPFIRE_V4F_MTP_SKIP_HEAD=1.
+        // 2. Snapshot streams_batch → mtp_h_norm_batch BEFORE running
+        //    final_norm_and_head_last_batched (it doesn't mutate
+        //    streams_batch but will after future fusions) and BEFORE
+        //    mtp_forward_batched overwrites streams_batch. Cheap: one d2d
+        //    of chunk_size * hc_mult * hidden floats per chunk.
+        //    We can dodge the snapshot by running MTP BEFORE the head —
+        //    the head reads streams_batch[last] AFTER MTP would have
+        //    written to it. So we capture the head-input row BEFORE
+        //    running MTP, run MTP (overwriting streams_batch), then run
+        //    head from the captured row.
+
+        // Capture the last position's stream for the head on the last
+        // chunk, BEFORE mtp_forward_batched overwrites streams_batch.
+        let last_stream_pre_mtp: Option<rdna_compute::GpuTensor> =
+            if is_last_chunk {
+                let off = (chunk_size - 1) * stream_len;
+                let src = pbs.streams_batch.sub_offset(off, stream_len);
+                let mut snap = gpu.alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], rdna_compute::DType::F32)
+                    .map_err(|e| format!("alloc head_input_snap: {e:?}"))?;
+                gpu.memcpy_dtod_auto(&snap.buf, &src.buf, stream_len * 4)
+                    .map_err(|e| format!("d2d streams[last] → head_input_snap: {e:?}"))?;
+                snap.shape = vec![cfg.hc_mult, cfg.hidden_size];
+                Some(snap)
+            } else {
+                None
+            };
+
+        // 3. Batched MTP fill — single pass through the MTP layer for all
+        //    mtp_end_b positions in this chunk. Skip the global last
+        //    position (next-token unknown, that's what we're about to
+        //    generate).
         std::env::set_var("HIPFIRE_V4F_MTP_SKIP_HEAD", "1");
-        let mtp_end_b = if is_last_chunk {
-            chunk_size.saturating_sub(1)
-        } else {
-            chunk_size
-        };
-        for b in 0..mtp_end_b {
-            let absolute_pos = abs_chunk_start + b;
-            let off = b * stream_len;
-            let slice = pbs.streams_batch.sub_offset(off, stream_len);
-            let dst = state.mtp_last_hidden.as_ref().unwrap();
-            gpu.memcpy_dtod_auto(&dst.buf, &slice.buf, stream_len * 4)
-                .map_err(|e| format!("d2d streams[{b}]→mtp_last_hidden: {e:?}"))?;
-            let next_tok = prompt_tokens[pos_cursor + b + 1];
-            state.n_tokens = absolute_pos as u64;
-            precompute_positions(cfg, state, gpu, absolute_pos as u32)?;
-            // SAFETY: state.mtp_last_hidden lives for the rest of this call;
-            // mtp_forward only reads from it before writing to it.
-            let hidden_ptr: *const rdna_compute::GpuTensor =
-                state.mtp_last_hidden.as_ref().unwrap();
-            let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
-            let _ = mtp_forward(cfg, weights, state, gpu, hidden, next_tok, absolute_pos as u32)?;
+        let mtp_end_b = if is_last_chunk { chunk_size.saturating_sub(1) } else { chunk_size };
+        if mtp_end_b > 0 {
+            // h_n_streams view: pbs.streams_batch[0..mtp_end_b] flat.
+            let h_n_streams = pbs.streams_batch.sub_offset(0, mtp_end_b * stream_len);
+            // Next-tokens for each batched position b is prompt[pos_cursor + b + 1].
+            let next_tokens: Vec<u32> = (0..mtp_end_b)
+                .map(|b| prompt_tokens[pos_cursor + b + 1])
+                .collect();
+            mtp_forward_batched(
+                cfg, weights, state, gpu, pbs,
+                &h_n_streams, &next_tokens, abs_chunk_start as u32, mtp_end_b,
+            )?;
         }
         std::env::remove_var("HIPFIRE_V4F_MTP_SKIP_HEAD");
 
         pos_cursor += chunk_size;
         state.n_tokens = (abs_chunk_start + chunk_size) as u64;
 
+        // 4. Last chunk: run final_norm_and_head from the SNAPSHOT we
+        //    captured pre-MTP (streams_batch is now MTP outputs). We
+        //    write the snapshot back into the last slot so the existing
+        //    final_norm_and_head_last_batched can read it.
         if is_last_chunk {
+            if let Some(snap) = last_stream_pre_mtp {
+                let off = (chunk_size - 1) * stream_len;
+                let dst = pbs.streams_batch.sub_offset(off, stream_len);
+                gpu.memcpy_dtod_auto(&dst.buf, &snap.buf, stream_len * 4)
+                    .map_err(|e| format!("d2d restore streams[last] for head: {e:?}"))?;
+            }
             last_logits = final_norm_and_head_last_batched(
                 cfg, weights, state, pbs, gpu, chunk_size,
             )?;
