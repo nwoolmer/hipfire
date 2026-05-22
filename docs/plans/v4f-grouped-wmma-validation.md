@@ -111,3 +111,80 @@ Day 1: ~80 LoC (instrumentation + analysis script). ~3 hours.
 Day 2: ~150 LoC (test harness for the existing qwen35 kernel at V4F
 shape + comparison driver). ~5 hours.
 Total: 1 day to a clean go/no-go decision.
+
+---
+
+## Verdict (2026-05-22) — Path B is DEAD at V4F shape
+
+### Gate 1 — FAIL (decisive)
+
+Measured by env-gated `HIPFIRE_V4F_DUMP_TOPK` dump of `moe_topk_indices
+_batch` from a real v4f_chat prefill (708-token prompt, B=16, all 43
+layers, model `v4f.mq2lloyd-q8.hfq`). Analysis script:
+`/tmp/analyze_topk.py`.
+
+| Metric | Result |
+|---|---|
+| Average tile fill (when 96 slots sorted by expert, grouped in 16-wide tiles) | **15.1 %** (threshold: 50 %) |
+| Median tile fill | 15.4 % |
+| Max tile fill (best layer) | 21.4 % |
+| Unique experts active per layer | mean 41.6 of 256 (min 28, max 73) |
+| Longest same-expert run per layer | mean 12.2 slots (max 15) |
+
+**Histogram of same-expert run lengths in a 16-slot tile:**
+
+| Run length | Tiles | Share | Cumulative |
+|---|---|---|---|
+| 1 | 1064 | **59.4 %** | 59.4 % |
+| 2 | 306 | 17.1 % | 76.5 % |
+| 3 | 142 | 7.9 % | 84.5 % |
+| 4 | 71 | 4.0 % | 88.4 % |
+| 5–8 | 123 | 6.9 % | 95.3 % |
+| 9–15 | 84 | 4.7 % | 100 % |
+
+**Interpretation.** A grouped WMMA kernel that requires 16-slot
+tiles would see 59 % of tiles holding a single slot — the WMMA C
+fragment would be 15 of 16 columns idle on those tiles. The
+expected throughput at 15 % fill ≈ 0.15 × (raw WMMA win). Even if
+a hypothetical V4F-shape grouped WMMA kernel doubled the scalar
+K4 path at 100 % fill, at 15 % fill it would be 0.3 × scalar —
+strictly slower.
+
+This is structurally the SAME failure mode as the previously
+measured "single-col WMMA at 3× slower" experiment, just expressed
+through the routing-distribution lens.
+
+### Gate 2 — not run (Gate 1 alone is decisive)
+
+The qwen35 family of grouped-WMMA-MoE kernels (e.g.
+`gemm_hfq4g256_moe_grouped_mmq.gfx1151.hip`) exists on origin/master
+but isn't on this branch. Running Gate 2 by cherry-picking the kernel
+would require ~150 LoC of harness work. Skipped: Gate 1's 15.1 % tile
+fill makes Gate 2's outcome arithmetically determined regardless of
+how good the kernel is.
+
+### Final decision: STOP
+
+Do NOT port qwen35-style grouped-WMMA-MoE to MQ2-Lloyd. The V4F
+routing distribution (K_TOP=6, n_experts=256, B=16) gives 0.4 slots
+per expert on average — there is nothing for scatter-grouped tiles
+to amortize across.
+
+### Routing-distribution arithmetic — what would unblock Path B
+
+To raise tile fill above 50 %, we'd need average slots-per-expert
+≥ 8. With V4F's K_TOP=6 and n_experts=256, that requires B such
+that `B × K_TOP / n_experts ≥ 8` → `B ≥ 341`. V4F's batched prefill
+sweet spot is B=16 (per the earlier sweep — B=128+ regresses from
+L2 / Infinity Cache spill). B=341 is not realistic.
+
+### Where the prefill speedup lever actually lives
+
+- **Path A (sub-2-bit MoE quant, per `docs/plans/v4f-sub-mq2-quant-
+  research.md`)**: reduces per-call MoE bytes proportional to bpw
+  reduction. Doesn't depend on tile-fill; works at any B.
+- **Path C (lower-precision attention K/V)**: 14.3 % of GPU time at
+  F32; switching to F16 KV ≈ 7 % prefill gain. Quality risk.
+
+Both of these are unblocked by the Gate 1 finding (they don't
+require WMMA C-fragment fill on the MoE side).

@@ -4986,6 +4986,36 @@ fn ffn_batched(
         ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
     }
 
+    // Gate 1 validation (2026-05-22): dump per-layer topk_indices to a
+    // file for routing-distribution analysis. Append mode — one
+    // [B, K_TOP] block of i32 per layer per chunk. Off by default.
+    if let Ok(path) = std::env::var("HIPFIRE_V4F_DUMP_TOPK") {
+        use std::io::Write;
+        let raw = gpu.download_f32(&pbs.moe_topk_indices_batch)
+            .map_err(|e| format!("dump_topk download: {e:?}"))?;
+        // moe_topk_indices_batch is stored i32-in-F32-slots; reinterpret.
+        let n = batch_size * k_top;
+        let mut indices: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            indices.push(raw[i].to_bits() as i32);
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&path)
+            .map_err(|e| format!("dump_topk open {path}: {e:?}"))?;
+        // Header: layer_idx | batch_size | k_top — 3 i32s
+        let header = [layer_idx as i32, batch_size as i32, k_top as i32];
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(header.as_ptr() as *const u8, 12)
+        };
+        f.write_all(header_bytes)
+            .map_err(|e| format!("dump_topk write header: {e:?}"))?;
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4)
+        };
+        f.write_all(data_bytes)
+            .map_err(|e| format!("dump_topk write data: {e:?}"))?;
+    }
+
     // 11. Routed expert gate_up (MQ2-Lloyd K4-unrolled indexed batched).
     gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
         gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
