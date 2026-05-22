@@ -1881,11 +1881,6 @@ pub const GEMM_HFQ4G256_WMMA_SRC: &str =
 pub const GEMM_Q8_0_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_wmma.hip");
 
-/// WMMA per-group HFQ4G256 batched GEMV for V4F's wo_a block-diagonal
-/// projection. F16 input. Drop-in for `wo_per_group_batched_hfq4g256`.
-pub const WO_PER_GROUP_BATCHED_HFQ4G256_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256_wmma.hip");
-
 /// V4F compressor batched ALIGNED compress events. Replaces the
 /// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)
 /// with a single launch over N_events. Handles both overlap=true

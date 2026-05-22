@@ -136,8 +136,7 @@ fn main() -> Result<(), String> {
     // B=16 chosen 2026-05-21 from a 3-trials/cell sweep at prompt=706:
     // B=8=39.2, B=16=44.5, B=32=44.2, B=64=43.3, B=128=43.0, B=512=42.3 tok/s.
     // Plateau B=16..128 with gradual decline past 128 from L2/InfCache spill
-    // on activations. Override via HIPFIRE_V4F_PP_BATCH; print VRAM cost
-    // via HIPFIRE_V4F_PBS_VRAM=1.
+    // on activations. Override via HIPFIRE_V4F_PP_BATCH.
     let pbs_max_batch: usize = std::env::var("HIPFIRE_V4F_PP_BATCH")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;

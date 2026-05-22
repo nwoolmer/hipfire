@@ -738,8 +738,8 @@ pub struct DeepseekV4State {
     pub topk_indices: Option<rdna_compute::GpuTensor>,
     /// Per-routed-expert output scratch `[hidden]` F32. Reused for
     /// each of the K=6 selected experts; weighted-accumulated into
-    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Only used by
-    /// the non-fused fallback path (HIPFIRE_V4F_NO_FUSED_MOE=1).
+    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Legacy
+    /// fallback-path scratch (no longer reachable from forward.rs).
     pub routed_expert_out: Option<rdna_compute::GpuTensor>,
 
     /// Phase 1 perf: fused MoE dispatch scratch.

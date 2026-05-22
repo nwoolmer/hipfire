@@ -21964,48 +21964,6 @@ impl Gpu {
         }
     }
 
-    /// WMMA per-group HFQ4G256 batched GEMV for V4F wo_a. F16 input,
-    /// F32 output. Caller must stage `x_in` to F16 (use
-    /// `convert_f32_to_f16` on the FWHT-rotated input).
-    #[allow(clippy::too_many_arguments)]
-    pub fn wo_per_group_batched_hfq4g256_wmma(
-        &mut self,
-        wo_a: &GpuTensor, x_f16: &GpuTensor, y_out: &GpuTensor,
-        g: i32, m: i32, k: i32, batch_size: i32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "wo_per_group_batched_hfq4g256_wmma",
-            kernels::WO_PER_GROUP_BATCHED_HFQ4G256_WMMA_SRC,
-            "wo_per_group_batched_hfq4g256_wmma",
-        )?;
-        let func = &self.functions["wo_per_group_batched_hfq4g256_wmma"];
-        let wp = wo_a.buf.as_ptr();
-        let xp = x_f16.buf.as_ptr();
-        let yp = y_out.buf.as_ptr();
-        let mut gi = g;
-        let mut mi = m;
-        let mut ki = k;
-        let mut bs = batch_size;
-        let mut params: Vec<*mut c_void> = vec![
-            &wp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut gi as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-        ];
-        let grid_m = ((m + 15) / 16) as u32;
-        let grid_b = ((batch_size + 15) / 16) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func, [grid_m, grid_b, g as u32], [32, 1, 1], 0,
-                self.stream_ref(), &mut params,
-            )
-        }
-    }
-
     /// V4F per-group O-LoRA batched GEMV — Q8_0-packed wo_a.
     /// Sibling of `wo_per_group_batched_hfq4g256` for the Q8 case
     /// (v4f-mq2lloyd-q8 builds). Single launch in place of B × G

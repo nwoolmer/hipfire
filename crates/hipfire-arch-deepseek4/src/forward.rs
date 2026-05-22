@@ -32,46 +32,16 @@ mod env_cache {
     fn flag_one(name: &'static str) -> bool {
         std::env::var(name).ok().as_deref() == Some("1")
     }
-    fn flag_not_one(name: &'static str) -> bool {
-        std::env::var(name).ok().as_deref() != Some("1")
-    }
 
     /// `HIPFIRE_V4F_MOE` — must be "1" for ffn_routed to actually dispatch.
     pub(super) fn moe_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_V4F_MOE"))
     }
-    /// `HIPFIRE_V4F_NO_MAIN_ROPE` — when set, skips the main-compressor YaRN RoPE.
-    pub(super) fn no_main_rope() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_MAIN_ROPE"))
-    }
-    /// `HIPFIRE_V4F_NO_YARN` — when set, reverts to single-theta RoPE.
-    pub(super) fn no_yarn() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_YARN"))
-    }
-    /// `HIPFIRE_V4F_NO_COMPRESSOR` — diagnostic: skip compressor + indexer.
-    pub(super) fn no_compressor() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_COMPRESSOR"))
-    }
-    /// True unless `HIPFIRE_V4F_NO_FUSED_MOE=1`. Default-on use of the
-    /// fused MoE down+residual indexed kernel (vs the legacy per-expert
-    /// k=0..6 × 3 GEMV loop).
-    pub(super) fn fused_moe_on() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_not_one("HIPFIRE_V4F_NO_FUSED_MOE"))
-    }
     /// `HIPFIRE_V4F_SKIP_FFN` — diagnostic: zero ffn_out to isolate attn growth.
     pub(super) fn skip_ffn() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_V4F_SKIP_FFN"))
-    }
-    /// `HIPFIRE_V4F_CPU_TOPK` — fallback CPU top-k for MoE routing.
-    pub(super) fn cpu_topk() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_CPU_TOPK"))
     }
     /// `HIPFIRE_V4F_MAX_COMPRESS_POS` — cap on the compressed-KV scan length.
     pub(super) fn max_compress_pos() -> usize {
@@ -81,45 +51,11 @@ mod env_cache {
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(2048)
         })
     }
-    /// `HIPFIRE_V4F_FORWARD_LAYER_END` — early-stop the decode layer loop.
-    pub(super) fn forward_layer_end() -> Option<usize> {
-        static V: OnceLock<Option<usize>> = OnceLock::new();
-        *V.get_or_init(|| {
-            std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
-                .ok().and_then(|s| s.parse().ok())
-        })
-    }
     /// `HIPFIRE_V4F_ATTN` — when "pos0", attn_stub uses the diagnostic
     /// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
     pub(super) fn attn_pos0() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| std::env::var("HIPFIRE_V4F_ATTN").ok().as_deref() == Some("pos0"))
-    }
-    /// `HIPFIRE_V4F_NO_MIXED` — opt out of the mixed (SWA + main_kv) attn path.
-    pub(super) fn no_mixed() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_NO_MIXED"))
-    }
-    /// `HIPFIRE_V4F_F16XF32_R2=1` — opt-in: route gemv_auto F16-weight
-    /// decode through the multirow R=2 GEMV. Drift-gate byte-eq, but
-    /// the perf delta on V4F-mq2lloyd-q8 decode is +0.7% on gfx1151
-    /// (within noise) because F16-weight GEMVs aren't the bottleneck
-    /// for this build — Q8/MQ4 GEMVs dominate. Kept for future tuning
-    /// (other models, other archs) without becoming an unmonitored
-    /// default.
-    pub(super) fn f16xf32_r2_on() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_F16XF32_R2"))
-    }
-    /// `HIPFIRE_V4F_MTP_NO_ROUTED=1` — opt-in: skip routed MoE
-    /// (ffn_routed) inside `mtp_forward` draft steps. Keeps shared
-    /// expert only. Trades accept-rate for per-step latency. The
-    /// shared expert produces the bulk of MTP signal; routed experts
-    /// fine-tune. On v4f.mq2lloyd-q8 + MoE, K=2 accept drops from
-    /// 81.2% → ~70% (TBD) but each draft step is ~50% cheaper.
-    pub(super) fn mtp_no_routed() -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| flag_one("HIPFIRE_V4F_MTP_NO_ROUTED"))
     }
     /// `HIPFIRE_V4F_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
@@ -133,17 +69,6 @@ mod env_cache {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| {
             std::env::var("HIPFIRE_V4F_MTP_HEAD_HC").ok().as_deref() != Some("0")
-        })
-    }
-    /// `HIPFIRE_V4F_BISECT_BREAK` — bisection stop point (rare).
-    pub(super) fn bisect_break() -> Option<&'static str> {
-        static V: OnceLock<Option<String>> = OnceLock::new();
-        let opt = V.get_or_init(|| std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok());
-        // SAFETY: the String inside the OnceLock outlives the process.
-        // We return its &str view as 'static for ergonomic comparison.
-        opt.as_deref().map(|s| {
-            let leaked: &'static str = unsafe { std::mem::transmute(s) };
-            leaked
         })
     }
 }
@@ -199,9 +124,6 @@ fn gemv_auto(
                 .map(|s| s == "1").unwrap_or(false);
             if use_wmma {
                 gemv_f16_x_decode(gpu, weight, x_plain, y, m, k)
-            } else if env_cache::f16xf32_r2_on() {
-                gpu.gemv_f16_xf32_multirow_r2(weight, x_plain, y, m, k)
-                    .map_err(|e| format!("gemv_f16_xf32_multirow_r2: {e:?}"))
             } else {
                 gpu.gemv_f16_xf32(weight, x_plain, y, m, k)
                     .map_err(|e| format!("gemv_f16_xf32: {e:?}"))
@@ -655,7 +577,7 @@ fn compressor_forward_impl(
         } else {
             layer_rope_params(cfg, layer.compress_ratio)
         };
-    let do_rope = is_indexer || !env_cache::no_main_rope();
+    let do_rope = true;
 
     // Capture attn_state_buf slot views BEFORE borrowing l_state — we
     // need a non-overlapping immutable borrow of state.
@@ -966,15 +888,13 @@ fn compressor_forward_batched(
         gpu.memcpy_htod_auto(&pbs.comp_positions.buf, pos_bytes)
             .map_err(|e| format!("htod comp positions l{layer_idx}: {e:?}"))?;
 
-        let no_main_rope = std::env::var("HIPFIRE_V4F_NO_MAIN_ROPE")
-            .ok().as_deref() == Some("1");
         if is_indexer {
             gpu.rope_tail_interleaved_batched(
                 &kv_cache_out, &kv_cache_out, &pbs.comp_positions,
                 1, 0, head_dim as i32, cfg.qk_rope_head_dim as i32,
                 cfg.compress_rope_theta, n_events_capped as i32,
             ).map_err(|e| format!("comp idx rope batched l{layer_idx}: {e:?}"))?;
-        } else if !no_main_rope {
+        } else {
             let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
                 layer_rope_params(cfg, layer.compress_ratio);
             gpu.rope_tail_yarn_interleaved_batched(
@@ -1489,17 +1409,10 @@ pub fn decode_step_body(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    // Optional early-stop for bisection: env HIPFIRE_V4F_FORWARD_LAYER_END=N
-    // halts after layer N-1 (exclusive bound) — leaves residual_streams in
-    // their just-after-layer-(N-1) state for cross-path comparison.
-    let layer_end: usize = env_cache::forward_layer_end()
-        .unwrap_or(cfg.num_hidden_layers);
-    let bisect_break = env_cache::bisect_break();
-    let no_compressor = env_cache::no_compressor();
     let skip_ffn = env_cache::skip_ffn();
 
     // 2. Per-layer forward.
-    for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
+    for layer_idx in 0..cfg.num_hidden_layers {
         let layer = weights.resolve_layer(layer_idx);
         let l_state = &mut state._indexer[layer_idx];
         let l_attn  = &mut state._attention[layer_idx];
@@ -1542,18 +1455,11 @@ pub fn decode_step_body(
         //
         //     When compress_ratio == 0: skip; attention reads SWA only.
         //
-        // Phase 3c: run main + indexer compressors. Both consume the FWHT-
-        // rotated post-attn_norm input held in `state.tmp` (populated by
-        // q_lora's fused_rmsnorm_rotate_mq step above). Gated on
-        // HIPFIRE_V4F_RUN_COMPRESSOR (default off until phases 4-5 land,
-        // since the cache fill alone does not affect attention output yet
-        // but does consume VRAM + GEMV cycles per layer per token).
         // V4F compressor + indexer (antirez-faithful default behavior):
-        // Always run for ratio>0 layers (no env gate). Antirez ds4 runs
-        // compressor unconditionally for compressed layers and the
-        // indexer for ratio==4 layers (ds4.c:7505-7555).
-        // Env opt-out: HIPFIRE_V4F_NO_COMPRESSOR=1 for diagnosis.
-        if layer.compress_ratio > 0 && !no_compressor {
+        // Always run for ratio>0 layers. Antirez ds4 runs compressor
+        // unconditionally for compressed layers and the indexer for
+        // ratio==4 layers (ds4.c:7505-7555).
+        if layer.compress_ratio > 0 {
             let tmp_view = {
                 let t = state.tmp.as_ref().unwrap();
                 t.sub_offset(0, t.numel())
@@ -1572,22 +1478,8 @@ pub fn decode_step_body(
 
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
 
-        // Bisection break: stop after hc_attn_mix (= attn-side residual update
-        // applied, FFN side not yet). Useful for isolating divergence in the
-        // FFN-side stages from divergence in the attention-side stages.
-        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && bisect_break == Some("after_attn_mix")
-        {
-            return Ok(Vec::new());
-        }
-
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/false)?;
-        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && bisect_break == Some("after_mhc_pre_ffn")
-        {
-            return Ok(Vec::new());
-        }
         if !skip_ffn {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
             if layer_idx < cfg.num_hash_layers {
@@ -1606,43 +1498,6 @@ pub fn decode_step_body(
                 .map_err(|e| format!("memset ffn_out: {e:?}"))?;
         }
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
-
-        // Optional magnitude diagnostic, gated on HIPFIRE_V4F_DUMP_MAG.
-        if std::env::var("HIPFIRE_V4F_DUMP_MAG").ok().as_deref() == Some("1") {
-            let streams = state.residual_streams.as_ref().unwrap();
-            let attn_out = state.attn_out.as_ref().unwrap();
-            let ffn_out = state.ffn_out.as_ref().unwrap();
-            let host = gpu.download_f32(streams).unwrap_or_default();
-            let host_attn = gpu.download_f32(attn_out).unwrap_or_default();
-            let host_ffn = gpu.download_f32(ffn_out).unwrap_or_default();
-            let rms = |v: &[f32]| (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
-            let max = |v: &[f32]| v.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
-            eprintln!("[layer {layer_idx:>2}] streams rms={:.4} max={:.4} | attn_out rms={:.4} max={:.4} | ffn_out rms={:.4} max={:.4}",
-                rms(&host), max(&host), rms(&host_attn), max(&host_attn), rms(&host_ffn), max(&host_ffn));
-        }
-
-        // Phase 5 debug: dump SWA K vs main_kv_cache K magnitudes for the
-        // first indexer-active layer. Helps next session diagnose the
-        // K-space mismatch causing phase 5 regression at ctx>128.
-        if layer.compress_ratio == 4
-            && std::env::var("HIPFIRE_V4F_DUMP_PHASE5_K").ok().as_deref() == Some("1")
-            && state._attention[layer_idx].swa_k.is_some()
-            && state._indexer[layer_idx].main_kv_cache.is_some()
-        {
-            let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
-            let main_kv = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
-            let swa_host = gpu.download_f32(swa_k).unwrap_or_default();
-            let main_host = gpu.download_f32(main_kv).unwrap_or_default();
-            let rms = |v: &[f32]| {
-                let n = v.iter().filter(|x| **x != 0.0).count().max(1);
-                (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / n as f64).sqrt()
-            };
-            let max = |v: &[f32]| v.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
-            let n_compressed = (state.n_tokens as usize + 1) / 4;
-            let main_view = &main_host[0..n_compressed.max(1) * cfg.head_dim];
-            eprintln!("[L{layer_idx:>2} K-spaces] swa_k rms={:.4} max={:.4} | main_kv_cache[0..{}] rms={:.4} max={:.4}",
-                rms(&swa_host), max(&swa_host), n_compressed, rms(main_view), max(main_view));
-        }
     }
 
     // 3. Final norm + LM head. The head-HC mix INSIDE final_norm_and_head
@@ -1893,9 +1748,7 @@ pub fn mtp_forward(
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     mhc_pre(cfg, weights, state, gpu, mtp_layer_idx, /*is_attn=*/false)?;
     ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
-    if !env_cache::mtp_no_routed() {
-        ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
-    }
+    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx)?;
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
 
     // ── 7. Capture FULL [hc_mult, hidden] residual stream for chaining ─
@@ -2162,12 +2015,12 @@ fn ffn_routed(
     //    uses BIASED scores while the routing weights use UNBIASED scores
     //    (per upstream model.py: Gate.forward). The GPU top-K kernel
     //    `v4f_moe_topk_bias_aware_f32` handles this two-score semantic in
-    //    one launch, eliminating the per-layer D2H/CPU/H2D round-trip
-    //    used by the legacy fallback below (HIPFIRE_V4F_CPU_TOPK=1).
+    //    one launch, eliminating the per-layer D2H/CPU/H2D round-trip.
     moe_route(cfg, weights, state, gpu, layer_idx)?;
 
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
+    let _ = n_exp;
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
@@ -2178,25 +2031,8 @@ fn ffn_routed(
         std::env::var("HIPFIRE_V4F_ROUTE_SCALE")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(2.2)
     });
-    let cpu_topk = env_cache::cpu_topk();
 
-    // Legacy CPU top-K (kept for parity testing under HIPFIRE_V4F_CPU_TOPK=1).
-    let (topk_ids, wts): (Vec<u32>, Vec<f32>) = if cpu_topk {
-        let scores_dev = state.router_scores.as_ref().unwrap();
-        let scores_host = gpu.download_f32(scores_dev)
-            .map_err(|e| format!("d2h scores l{layer_idx}: {e:?}"))?;
-        match bias_aware_topk_weights(&scores_host[..n_exp], &layer.gate_bias_host, k)
-        {
-            Some(x) => x,
-            None => return Ok(()),  // degenerate router output (sum <= 0)
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    if env_cache::fused_moe_on()
-        && layer.expert_gate_up_blob.is_some()
-    {
+    if layer.expert_gate_up_blob.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
         // k_top per-expert silu_clamp+rotate. Replaces the per-expert
         // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
@@ -2226,27 +2062,15 @@ fn ffn_routed(
         }
         let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
         let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
-        if cpu_topk {
-            // Legacy CPU/H2D path. topk_ids and wts populated above.
-            let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-            let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-            gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
-                .map_err(|e| format!("htod topk_indices l{layer_idx}: {e:?}"))?;
-            let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-            let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-            gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
-                .map_err(|e| format!("htod topk_weights l{layer_idx}: {e:?}"))?;
-        } else {
-            // GPU top-K: bias-aware select + normalize + route_scale in one
-            // launch, outputs straight into topk_idx_dev / topk_w_dev.
-            let scores_dev = state.router_scores.as_ref().unwrap();
-            let bias_dev = layer.gate_bias.as_ref()
-                .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
-            gpu.v4f_moe_topk_bias_aware_f32(
-                scores_dev, bias_dev, topk_idx_dev, topk_w_dev,
-                n_exp as i32, k_top as i32, route_scale_override,
-            ).map_err(|e| format!("v4f_moe_topk_bias_aware l{layer_idx}: {e:?}"))?;
-        }
+        // GPU top-K: bias-aware select + normalize + route_scale in one
+        // launch, outputs straight into topk_idx_dev / topk_w_dev.
+        let scores_dev = state.router_scores.as_ref().unwrap();
+        let bias_dev = layer.gate_bias.as_ref()
+            .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
+        gpu.v4f_moe_topk_bias_aware_f32(
+            scores_dev, bias_dev, topk_idx_dev, topk_w_dev,
+            cfg.n_routed_experts as i32, k_top as i32, route_scale_override,
+        ).map_err(|e| format!("v4f_moe_topk_bias_aware l{layer_idx}: {e:?}"))?;
 
         let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
         let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
@@ -2288,13 +2112,10 @@ fn ffn_routed(
 
     // Per-expert fallback path is no longer reachable: separate w1/w3
     // blobs are no longer uploaded (only the combined gate_up blob).
-    // HIPFIRE_V4F_NO_FUSED_MOE=1 yields a hard error rather than silent
-    // shared-only fallback.
-    let _ = (wts, topk_ids, route_scale_override);
+    let _ = route_scale_override;
     Err(format!(
-        "deepseek4: HIPFIRE_V4F_NO_FUSED_MOE=1 but layer {layer_idx} \
-         has no separate w1/w3 blobs (only combined gate_up). Unset the \
-         env var or rebuild the loader with separate-blob uploads."))
+        "deepseek4: layer {layer_idx} has no separate w1/w3 blobs (only \
+         combined gate_up). Rebuild the loader with separate-blob uploads."))
 }
 
 /// Hash-routed FFN dispatch (V4F layers 0..num_hash_layers = 0..3).
@@ -2321,17 +2142,6 @@ fn ffn_hash_routed(
     token_id: u32,
 ) -> Result<(), String> {
     if !env_cache::moe_on() {
-        return Ok(());
-    }
-    // Bisection knob: disable hash routing on layers 0..num_hash_layers.
-    // Existing v4f.mq2lloyd-fp4fix shipped without tid2eid → hash routing
-    // was silently no-op (returned at tid2eid empty check). The new HFQ
-    // (v4f.mq2lloyd-f16compress.hfq) includes tid2eid so the path runs
-    // for the first time. If the static-routing math has a bug (e.g.
-    // wrong score normalisation vs upstream's pre-softplus gather), this
-    // flag bisects: HIPFIRE_V4F_NO_HASH=1 reproduces the old shared-only
-    // behaviour on hash layers.
-    if std::env::var("HIPFIRE_V4F_NO_HASH").ok().as_deref() == Some("1") {
         return Ok(());
     }
     let layer = weights.resolve_layer(layer_idx);
@@ -2740,10 +2550,7 @@ fn attn_stub(
         // wkv outputs with compressor.norm + RoPE applied; raw KV is the
         // per-position post-kv_norm post-RoPE K=V).
         //
-        // Env opt-out: HIPFIRE_V4F_NO_MIXED=1 falls back to SWA-only.
-        let no_mixed = env_cache::no_mixed();
-        let do_mixed = !no_mixed
-            && layer.compress_ratio > 0
+        let do_mixed = layer.compress_ratio > 0
             && state._indexer[layer_idx].main_kv_cache.is_some();
 
         if do_mixed {
@@ -2836,25 +2643,18 @@ fn attn_stub(
     // (ds4.c:7868, 7874)
     let pos_buf = state.pos_buf.as_ref()
         .ok_or_else(|| "pos_buf not allocated".to_string())?;
-    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if env_cache::no_yarn() {
-            gpu.rope_tail_inverse(attn_out_raw, pos_buf,
-                n_heads as i32, head_dim as i32,
-                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-            ).map_err(|e| format!("rope_tail_inverse (no-yarn) l{layer_idx}: {e:?}"))?;
-        } else {
-            let layer = weights.resolve_layer(layer_idx);
-            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-                layer_rope_params(cfg, layer.compress_ratio);
-            gpu.rope_tail_yarn_interleaved(
-                attn_out_raw, attn_out_raw, pos_buf,
-                n_heads as i32, 0,
-                head_dim as i32,
-                cfg.qk_rope_head_dim as i32,
-                freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
-                /*inverse=*/1,
-            ).map_err(|e| format!("rope_tail_yarn_interleaved (inverse) l{layer_idx}: {e:?}"))?;
-        }
+    {
+        let layer = weights.resolve_layer(layer_idx);
+        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+            layer_rope_params(cfg, layer.compress_ratio);
+        gpu.rope_tail_yarn_interleaved(
+            attn_out_raw, attn_out_raw, pos_buf,
+            n_heads as i32, 0,
+            head_dim as i32,
+            cfg.qk_rope_head_dim as i32,
+            freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+            /*inverse=*/1,
+        ).map_err(|e| format!("rope_tail_yarn_interleaved (inverse) l{layer_idx}: {e:?}"))?;
     }
 
     // O-LoRA projection: wo_a per-group + wo_b.
@@ -3287,21 +3087,6 @@ fn apply_tail_rope(
     //   compress_ratio == 0 (layers 0, 1, MTP): rope_theta = 10000, no YaRN
     //   compress_ratio  > 0 (layers 2..42):      compress_rope_theta = 160000,
     //                                            YaRN with scale_factor = 16
-    // Pre-YaRN escape hatch: HIPFIRE_V4F_NO_YARN=1 reverts to the old
-    // single-theta path (rope_theta=10000 everywhere) for direct A/B
-    // comparison with prior tuning data.
-    if env_cache::no_yarn() {
-        gpu.rope_tail_interleaved(
-            q, kv, pos_buf,
-            cfg.num_attention_heads as i32,
-            cfg.num_key_value_heads as i32,
-            cfg.head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            cfg.rope_theta,
-        ).map_err(|e| format!("rope_tail_interleaved (no-yarn): {e:?}"))?;
-        return Ok(());
-    }
-
     let layer = weights.resolve_layer(layer_idx);
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
@@ -3482,11 +3267,8 @@ fn q_lora(
 
     // 4.5. Per-head RMSNorm of Q (upstream V4F:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
-    //     Skip via HIPFIRE_V4F_SKIP_QHN=1 for bisecting.
-    if std::env::var("HIPFIRE_V4F_SKIP_QHN").ok().as_deref() != Some("1") {
-        gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
-            .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
-    }
+    gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
+        .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
 
     Ok(())
 }
@@ -3979,9 +3761,7 @@ pub struct PrefillBatchScratch {
 impl PrefillBatchScratch {
     /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
     /// Sizes track the V4F config's hidden_size / q_lora_rank /
-    /// num_attention_heads × head_dim. Prints per-field VRAM cost +
-    /// running total to stderr — gated on `HIPFIRE_V4F_PBS_VRAM=1`
-    /// (default off; on by default for the bench example).
+    /// num_attention_heads × head_dim.
     pub fn new(gpu: &mut Gpu, cfg: &DeepseekV4Config, max_batch: usize) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_rank = cfg.q_lora_rank;
@@ -3989,33 +3769,11 @@ impl PrefillBatchScratch {
         let head_dim = cfg.head_dim;
         let hc_mult = cfg.hc_mult;
 
-        let log_vram = std::env::var("HIPFIRE_V4F_PBS_VRAM").ok().as_deref() == Some("1");
-        let mut running_bytes: u64 = 0;
-        if log_vram {
-            eprintln!("PrefillBatchScratch::new max_batch={max_batch}");
-            eprintln!("  V4F shape: hidden={hidden}, head_dim={head_dim}, n_heads={n_heads}, q_rank={q_rank}, hc_mult={hc_mult}, n_kv={}, swa={}, idx_topk={}, n_exp={}, k_top={}, IM={}",
-                cfg.num_key_value_heads, cfg.sliding_window, cfg.index_topk,
-                cfg.n_routed_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size);
-        }
-        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str, running: &mut u64, log: bool| -> Result<GpuTensor, String> {
-            let nelem: usize = shape.iter().product();
-            let bytes = (nelem * 4) as u64;
-            *running += bytes;
-            if log {
-                eprintln!("  + {label:<28} {shape:?} = {} MB (cum {} MB)",
-                    bytes / (1024 * 1024), *running / (1024 * 1024));
-            }
+        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
             gpu.alloc_tensor(shape, DType::F32)
                 .map_err(|e| format!("PrefillBatchScratch alloc {label}: {e:?}"))
         };
-        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str, running: &mut u64, log: bool| -> Result<GpuTensor, String> {
-            let nelem: usize = shape.iter().product();
-            let bytes = (nelem * 4) as u64;
-            *running += bytes;
-            if log {
-                eprintln!("  + {label:<28} {shape:?} = {} MB (cum {} MB)",
-                    bytes / (1024 * 1024), *running / (1024 * 1024));
-            }
+        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
             gpu.zeros(shape, DType::F32)
                 .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))
         };
@@ -4026,72 +3784,65 @@ impl PrefillBatchScratch {
 
         let kv_dim = cfg.num_key_value_heads * head_dim;
 
-        let r = &mut running_bytes;
-        let out = Ok(Self {
+        Ok(Self {
             max_batch,
-            embed_batch:     alloc(gpu, &[max_batch, hidden], "embed_batch", r, log_vram)?,
-            streams_batch:   zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch", r, log_vram)?,
-            tokens:          alloc(gpu, &[max_batch], "tokens", r, log_vram)?,
-            tmp_batch:       alloc(gpu, &[max_batch, hidden], "tmp_batch", r, log_vram)?,
-            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch", r, log_vram)?,
-            q_lat_batch:     alloc(gpu, &[max_batch, q_rank], "q_lat_batch", r, log_vram)?,
-            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch", r, log_vram)?,
-            q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch", r, log_vram)?,
+            embed_batch:     alloc(gpu, &[max_batch, hidden], "embed_batch")?,
+            streams_batch:   zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch")?,
+            tokens:          alloc(gpu, &[max_batch], "tokens")?,
+            tmp_batch:       alloc(gpu, &[max_batch, hidden], "tmp_batch")?,
+            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch")?,
+            q_lat_batch:     alloc(gpu, &[max_batch, q_rank], "q_lat_batch")?,
+            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch")?,
+            q_batch:         alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch")?,
             q_head_ones,
-            kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch", r, log_vram)?,
-            positions:       alloc(gpu, &[max_batch], "positions", r, log_vram)?,
-            hc_c_batch:      alloc(gpu, &[max_batch, 24], "hc_c_batch", r, log_vram)?,
-            hc_pre_batch:    alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch", r, log_vram)?,
-            hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch", r, log_vram)?,
-            hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch", r, log_vram)?,
-            hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch", r, log_vram)?,
-            attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch", r, log_vram)?,
-            ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch", r, log_vram)?,
-            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch", r, log_vram)?,
-            swa_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.sliding_window], "swa_staged_batch", r, log_vram)?,
-            topk_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.index_topk], "topk_staged_batch", r, log_vram)?,
-            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr", r, log_vram)?,
-            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr", r, log_vram)?,
-            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch", r, log_vram)?,
-            attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch", r, log_vram)?,
-            wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch", r, log_vram)?,
-            wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch", r, log_vram)?,
-            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch", r, log_vram)?,
-            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch", r, log_vram)?,
-            ffn_shared_gate_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_gate_batch", r, log_vram)?,
-            ffn_shared_up_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_up_batch", r, log_vram)?,
-            ffn_shared_rot_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_rot_batch", r, log_vram)?,
-            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch", r, log_vram)?,
-            moe_topk_indices_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_indices_batch", r, log_vram)?,
-            moe_topk_weights_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_weights_batch", r, log_vram)?,
-            moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch", r, log_vram)?,
-            moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch", r, log_vram)?,
-            moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch", r, log_vram)?,
+            kv_batch:        alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
+            positions:       alloc(gpu, &[max_batch], "positions")?,
+            hc_c_batch:      alloc(gpu, &[max_batch, 24], "hc_c_batch")?,
+            hc_pre_batch:    alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch")?,
+            hc_post_batch:   alloc(gpu, &[max_batch, hc_mult], "hc_post_batch")?,
+            hc_comb_batch:   alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch")?,
+            hc_x_in_batch:   alloc(gpu, &[max_batch, hidden], "hc_x_in_batch")?,
+            attn_out_batch:  alloc(gpu, &[max_batch, hidden], "attn_out_batch")?,
+            ffn_out_batch:   alloc(gpu, &[max_batch, hidden], "ffn_out_batch")?,
+            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch")?,
+            swa_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.sliding_window], "swa_staged_batch")?,
+            topk_staged_batch: alloc(gpu, &[max_batch, head_dim, cfg.index_topk], "topk_staged_batch")?,
+            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr")?,
+            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr")?,
+            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch")?,
+            attn_out_raw_rot_batch: alloc(gpu, &[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch")?,
+            wo_a_out_batch: alloc(gpu, &[max_batch, cfg.o_groups, cfg.o_lora_rank], "wo_a_out_batch")?,
+            wo_a_out_rot_batch: alloc(gpu, &[max_batch, cfg.o_groups * cfg.o_lora_rank], "wo_a_out_rot_batch")?,
+            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch")?,
+            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch")?,
+            ffn_shared_gate_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_gate_batch")?,
+            ffn_shared_up_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_up_batch")?,
+            ffn_shared_rot_batch: alloc(gpu, &[max_batch, cfg.moe_intermediate_size], "ffn_shared_rot_batch")?,
+            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch")?,
+            moe_topk_indices_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_indices_batch")?,
+            moe_topk_weights_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok], "moe_topk_weights_batch")?,
+            moe_gate_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_gate_batch")?,
+            moe_up_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_up_batch")?,
+            moe_rot_batch: alloc(gpu, &[max_batch, cfg.num_experts_per_tok, cfg.moe_intermediate_size], "moe_rot_batch")?,
             // Indexer-chain scratch. max_compressed default 2048 unless overridden via env.
-            idx_q_batch: alloc(gpu, &[max_batch, cfg.index_n_heads, cfg.index_head_dim], "idx_q_batch", r, log_vram)?,
-            idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch", r, log_vram)?,
-            idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch", r, log_vram)?,
-            idx_topk_indices_batch: alloc(gpu, &[max_batch, cfg.index_topk], "idx_topk_indices_batch", r, log_vram)?,
+            idx_q_batch: alloc(gpu, &[max_batch, cfg.index_n_heads, cfg.index_head_dim], "idx_q_batch")?,
+            idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch")?,
+            idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch")?,
+            idx_topk_indices_batch: alloc(gpu, &[max_batch, cfg.index_topk], "idx_topk_indices_batch")?,
             // Compressor batched-GEMV scratch — main coff=2, idx coff=2.
-            comp_main_kv_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_kv_batch", r, log_vram)?,
-            comp_main_score_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_score_batch", r, log_vram)?,
-            comp_idx_kv_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch", r, log_vram)?,
-            comp_idx_score_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch", r, log_vram)?,
+            comp_main_kv_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_kv_batch")?,
+            comp_main_score_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_score_batch")?,
+            comp_idx_kv_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch")?,
+            comp_idx_score_batch: alloc(gpu, &[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch")?,
             // Scatter-by-expert MoE sort scratch.
-            moe_sorted_b: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_b", r, log_vram)?,
-            moe_sorted_krank: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank", r, log_vram)?,
-            moe_sorted_expert: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_expert", r, log_vram)?,
-            moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts", r, log_vram)?,
+            moe_sorted_b: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_b")?,
+            moe_sorted_krank: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank")?,
+            moe_sorted_expert: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_expert")?,
+            moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts")?,
             // F16 staging buffers: 2 bytes per element. Allocate as Raw
             // with byte-count shape so DType::size() == 1 stays consistent.
             tmp_batch_f16: {
                 let nbytes = max_batch * hidden * 2;
-                *r += nbytes as u64;
-                if log_vram {
-                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
-                        "tmp_batch_f16", nbytes,
-                        nbytes / (1024 * 1024), *r / (1024 * 1024));
-                }
                 let mut t = gpu.zeros(&[nbytes], DType::Raw)
                     .map_err(|e| format!("PBS alloc tmp_batch_f16: {e:?}"))?;
                 t.dtype = DType::F16;
@@ -4100,29 +3851,23 @@ impl PrefillBatchScratch {
             },
             tmp_plain_batch_f16: {
                 let nbytes = max_batch * hidden * 2;
-                *r += nbytes as u64;
-                if log_vram {
-                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
-                        "tmp_plain_batch_f16", nbytes,
-                        nbytes / (1024 * 1024), *r / (1024 * 1024));
-                }
                 let mut t = gpu.zeros(&[nbytes], DType::Raw)
                     .map_err(|e| format!("PBS alloc tmp_plain_batch_f16: {e:?}"))?;
                 t.dtype = DType::F16;
                 t.shape = vec![max_batch, hidden];
                 t
             },
-            comp_positions: alloc(gpu, &[max_batch], "comp_positions", r, log_vram)?,
+            comp_positions: alloc(gpu, &[max_batch], "comp_positions")?,
             // Per-batch device-side state mirrors of state.pos_array_device
             // and state.attn_state_buf. Sized to cover B = max_batch rows.
             // POS_SLOTS_PER_LAYER = 3 per layer, ATTN_STATE_SLOTS = 10 total.
             pos_array_device_batch: alloc(
                 gpu,
                 &[max_batch * (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER],
-                "pos_array_device_batch", r, log_vram,
+                "pos_array_device_batch",
             )?,
             attn_state_buf_batch: alloc(
-                gpu, &[max_batch * 10], "attn_state_buf_batch", r, log_vram,
+                gpu, &[max_batch * 10], "attn_state_buf_batch",
             )?,
             wmma_x_scratch_f16: {
                 // Cover the largest x-tensor size across all batched
@@ -4137,25 +3882,13 @@ impl PrefillBatchScratch {
                     .max(cfg.q_lora_rank)
                     .max(cfg.o_groups * per_group_in);
                 let nbytes = max_batch * max_dim * 2;
-                *r += nbytes as u64;
-                if log_vram {
-                    eprintln!("  + {:<28} [{}] = {} MB (cum {} MB) (F16 raw)",
-                        "wmma_x_scratch_f16", nbytes,
-                        nbytes / (1024 * 1024), *r / (1024 * 1024));
-                }
                 let mut t = gpu.zeros(&[nbytes], DType::Raw)
                     .map_err(|e| format!("PBS alloc wmma_x_scratch_f16: {e:?}"))?;
                 t.dtype = DType::F16;
                 t.shape = vec![max_batch, max_dim];
                 t
             },
-        });
-        if log_vram {
-            eprintln!("PrefillBatchScratch total: {} MB ({:.2} GB)",
-                running_bytes / (1024 * 1024),
-                (running_bytes as f64) / (1024.0 * 1024.0 * 1024.0));
-        }
-        out
+        })
     }
 }
 
@@ -4194,7 +3927,7 @@ fn hc_attn_mix_batched(
 ///   3. Upload per-batch n_valid_swa_arr
 ///   4. v4f_attn_swa_batched (K=V tied: pass swa_staged for both args)
 ///      → pbs.attn_out_raw_batch
-///   5. Inverse tail RoPE (plain or YaRN per HIPFIRE_V4F_NO_YARN)
+///   5. Inverse tail RoPE (per-layer YaRN params)
 ///   6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch
 ///   7. wo_per_group_batched_f32 → pbs.wo_a_out_batch (F32 wo_a only)
 ///   8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch
@@ -4271,28 +4004,19 @@ fn attention_block_batched_swa_only(
     ).map_err(|e| format!("v4f_attn_swa_batched l{layer_idx}: {e:?}"))?;
 
     // 5. Inverse tail RoPE on attn_out_raw_batch.
-    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if env_cache::no_yarn() {
-            gpu.rope_tail_inverse_batched(
-                &pbs.attn_out_raw_batch, &pbs.positions,
-                n_heads as i32, head_dim as i32,
-                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-                batch_size as i32,
-            ).map_err(|e| format!("rope_tail_inverse_batched l{layer_idx}: {e:?}"))?;
-        } else {
-            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-                layer_rope_params(cfg, layer.compress_ratio);
-            // n_heads_k=0: K already written + tail-rope'd at kv_joint
-            // time; only un-rotate Q-tail-equivalents in attn_out.
-            gpu.rope_tail_yarn_interleaved_batched(
-                &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
-                n_heads as i32, 0,
-                head_dim as i32, cfg.qk_rope_head_dim as i32,
-                freq_base, freq_scale, ext_factor, attn_factor,
-                corr_low, corr_high,
-                /*inverse=*/1, batch_size as i32,
-            ).map_err(|e| format!("rope_tail_yarn_interleaved_batched (inv) l{layer_idx}: {e:?}"))?;
-        }
+    {
+        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+            layer_rope_params(cfg, layer.compress_ratio);
+        // n_heads_k=0: K already written + tail-rope'd at kv_joint
+        // time; only un-rotate Q-tail-equivalents in attn_out.
+        gpu.rope_tail_yarn_interleaved_batched(
+            &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
+            n_heads as i32, 0,
+            head_dim as i32, cfg.qk_rope_head_dim as i32,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            corr_low, corr_high,
+            /*inverse=*/1, batch_size as i32,
+        ).map_err(|e| format!("rope_tail_yarn_interleaved_batched (inv) l{layer_idx}: {e:?}"))?;
     }
 
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
@@ -4310,8 +4034,6 @@ fn attention_block_batched_swa_only(
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
     // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
-    let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
-        .map(|s| s != "0").unwrap_or(true);
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -4320,7 +4042,7 @@ fn attention_block_batched_swa_only(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
         }
-        DType::Q8_0 if wo_a_batched => {
+        DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
             // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
             gpu.wo_per_group_batched_q8_0(
@@ -4329,66 +4051,18 @@ fn attention_block_batched_swa_only(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
         }
-        DType::Raw if wo_a_batched => {
+        DType::Raw => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
-            // WMMA route was measured slightly SLOWER (44.7 vs 45.6 tok/s
-            // on Radeon 8060S) because the 16×16 WMMA tile shrinks the
-            // workgroup count to (M/16, B/16, G) = ~2k workgroups, well
-            // under the wave-saturation budget that the scalar per-output
-            // grid hits. Keep WMMA wired as opt-in for other arches.
-            let wo_a_wmma = std::env::var("HIPFIRE_V4F_WO_A_WMMA")
-                .map(|s| s == "1").unwrap_or(false);
-            if wo_a_wmma {
-                let n_inputs = (batch_size * n_groups * per_group_in) as i64;
-                gpu.convert_f32_to_f16(
-                    &pbs.attn_out_raw_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs,
-                ).map_err(|e| format!("convert_f32_to_f16 wo_a l{layer_idx}: {e:?}"))?;
-                gpu.wo_per_group_batched_hfq4g256_wmma(
-                    wo_a, &pbs.wmma_x_scratch_f16, &pbs.wo_a_out_batch,
-                    n_groups as i32, o_lora_rank as i32, per_group_in as i32,
-                    batch_size as i32,
-                ).map_err(|e| format!("wo_per_group_batched_hfq4g256_wmma l{layer_idx}: {e:?}"))?;
-            } else {
-                gpu.wo_per_group_batched_hfq4g256(
-                    wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
-                    n_groups as i32, o_lora_rank as i32, per_group_in as i32,
-                    batch_size as i32,
-                ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
-            }
+            gpu.wo_per_group_batched_hfq4g256(
+                wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
+                n_groups as i32, o_lora_rank as i32, per_group_in as i32,
+                batch_size as i32,
+            ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
         }
-        _ => {
-            // Per-(batch, group) sequential fallback for Q8 and the
-            // opt-out path. attn_out_raw_batch and attn_out_raw_rot_batch
-            // are both [B, n_heads * head_dim] viewable as
-            // [B, G, per_group_in]. wo_a is [G * o_lora_rank, per_group_in]
-            // — per-group slice rows [g*o_lora_rank..].
-            for b in 0..batch_size {
-                for g in 0..n_groups {
-                    let in_off = b * n_heads * head_dim + g * per_group_in;
-                    let rot_view = pbs.attn_out_raw_rot_batch.sub_offset(in_off, per_group_in);
-                    let raw_view = pbs.attn_out_raw_batch.sub_offset(in_off, per_group_in);
-                    let out_off = b * n_groups * o_lora_rank + g * o_lora_rank;
-                    let out_view = pbs.wo_a_out_batch.sub_offset(out_off, o_lora_rank);
-                    let wo_a_view = match wo_a.dtype {
-                        DType::Q8_0 => {
-                            let per_g_bytes = (o_lora_rank * per_group_in / 32) * 34;
-                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
-                            v.dtype = DType::Q8_0;
-                            v.shape = vec![o_lora_rank, per_group_in];
-                            v
-                        }
-                        _ => {
-                            // Treat as MQ4G256 (Raw). 136 bytes per 256 elements.
-                            let per_g_bytes = (o_lora_rank * per_group_in / 256) * 136;
-                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
-                            v.shape = vec![o_lora_rank, per_group_in];
-                            v
-                        }
-                    };
-                    gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
-                        o_lora_rank, per_group_in)?;
-                }
-            }
+        other => {
+            return Err(format!(
+                "attention_block_batched_mixed l{layer_idx}: unsupported wo_a dtype {other:?}"
+            ));
         }
     }
 
@@ -4538,22 +4212,19 @@ fn attention_block_batched_mixed(
     // 2 × batch_size sequential gemv_auto calls into ONE batched GEMM
     // per (wkv|wgate) × (main|indexer). Wires through to
     // compressor_forward_prebatched in the per-position loop below.
-    // Opt out via HIPFIRE_V4F_COMP_BATCHED_GEMV=0.
     //
     // WMMA fast path: when all four compressor weights have F16-native
     // copies (`compressor_w{kv,gate}_f16` etc.), convert the F32 inputs
     // to F16 once and run gemm_f16_x_f16_wmma — measured 26× faster
     // than the F32 register-tiled path on V4F shapes (microbench).
     // Opt out via HIPFIRE_V4F_COMP_F16_WMMA=0.
-    let comp_batched = std::env::var("HIPFIRE_V4F_COMP_BATCHED_GEMV")
-        .map(|s| s != "0").unwrap_or(true);
     let comp_f16_wmma = std::env::var("HIPFIRE_V4F_COMP_F16_WMMA")
         .map(|s| s != "0").unwrap_or(true);
     let main_coff = 2; // ratio=4 has overlap=true; ratio=128 has coff=1 → wastes half the buf.
     let main_proj_dim = main_coff * head_dim;
     let idx_coff = 2;
     let idx_proj_dim = idx_coff * cfg.index_head_dim;
-    if comp_batched {
+    {
         let comp_wkv = layer.compressor_wkv.as_ref()
             .ok_or_else(|| format!("comp_wkv l{layer_idx}"))?;
         let comp_wgate = layer.compressor_wgate.as_ref()
@@ -4625,12 +4296,8 @@ fn attention_block_batched_mixed(
 
     // PHASE A: batched commit/compress for the whole chunk in one call
     // per (main, indexer) per layer. Replaces the per-batch loop when
-    // start_pos % ratio == 0 (aligned chunk). Opt out via
-    // HIPFIRE_V4F_COMP_FULLY_BATCHED=0.
-    let comp_fully_batched = comp_batched
-        && (start_pos as usize) % ratio == 0
-        && std::env::var("HIPFIRE_V4F_COMP_FULLY_BATCHED")
-            .map(|s| s != "0").unwrap_or(true);
+    // start_pos % ratio == 0 (aligned chunk).
+    let comp_fully_batched = (start_pos as usize) % ratio == 0;
 
     if comp_fully_batched {
         if let Err(e) = compressor_forward_batched(
@@ -4697,38 +4364,22 @@ fn attention_block_batched_mixed(
                     )
                 );
 
-                let cf_res = if comp_batched {
-                    let _ = main_proj_dim;
-                    compressor_forward_prebatched(
-                        cfg, weights, state, gpu, layer_idx, pos,
-                        /*is_indexer=*/false,
-                        &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
-                    )
-                } else {
-                    let tmp_view = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-                    compressor_forward(
-                        cfg, weights, state, gpu, layer_idx,
-                        &tmp_view, pos, /*is_indexer=*/false,
-                    )
-                };
+                let _ = main_proj_dim;
+                let cf_res = compressor_forward_prebatched(
+                    cfg, weights, state, gpu, layer_idx, pos,
+                    /*is_indexer=*/false,
+                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch, b,
+                );
                 if let Err(e) = cf_res {
                     loop_err = Some(format!("compressor_forward(main) b={b} l{layer_idx}: {e}"));
                     break;
                 }
                 if ratio == 4 {
-                    let cf_res2 = if comp_batched {
-                        compressor_forward_prebatched(
-                            cfg, weights, state, gpu, layer_idx, pos,
-                            /*is_indexer=*/true,
-                            &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
-                        )
-                    } else {
-                        let tmp_view2 = state.tmp.as_ref().unwrap().sub_offset(0, hidden);
-                        compressor_forward(
-                            cfg, weights, state, gpu, layer_idx,
-                            &tmp_view2, pos, /*is_indexer=*/true,
-                        )
-                    };
+                    let cf_res2 = compressor_forward_prebatched(
+                        cfg, weights, state, gpu, layer_idx, pos,
+                        /*is_indexer=*/true,
+                        &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch, b,
+                    );
                     if let Err(e) = cf_res2 {
                         loop_err = Some(format!("compressor_forward(idx) b={b} l{layer_idx}: {e}"));
                         break;
@@ -4894,26 +4545,17 @@ fn attention_block_batched_mixed(
     ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
 
     // 5. Inverse RoPE.
-    if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
-        if env_cache::no_yarn() {
-            gpu.rope_tail_inverse_batched(
-                &pbs.attn_out_raw_batch, &pbs.positions,
-                n_heads as i32, head_dim as i32,
-                cfg.qk_rope_head_dim as i32, cfg.rope_theta,
-                batch_size as i32,
-            ).map_err(|e| format!("rope_tail_inverse_batched l{layer_idx}: {e:?}"))?;
-        } else {
-            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-                layer_rope_params(cfg, layer.compress_ratio);
-            gpu.rope_tail_yarn_interleaved_batched(
-                &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
-                n_heads as i32, 0,
-                head_dim as i32, cfg.qk_rope_head_dim as i32,
-                freq_base, freq_scale, ext_factor, attn_factor,
-                corr_low, corr_high,
-                /*inverse=*/1, batch_size as i32,
-            ).map_err(|e| format!("rope_tail_yarn_inv_batched l{layer_idx}: {e:?}"))?;
-        }
+    {
+        let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+            layer_rope_params(cfg, layer.compress_ratio);
+        gpu.rope_tail_yarn_interleaved_batched(
+            &pbs.attn_out_raw_batch, &pbs.attn_out_raw_batch, &pbs.positions,
+            n_heads as i32, 0,
+            head_dim as i32, cfg.qk_rope_head_dim as i32,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            corr_low, corr_high,
+            /*inverse=*/1, batch_size as i32,
+        ).map_err(|e| format!("rope_tail_yarn_inv_batched l{layer_idx}: {e:?}"))?;
     }
 
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
@@ -4926,10 +4568,7 @@ fn attention_block_batched_mixed(
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
-    // Opt out via HIPFIRE_V4F_WO_A_BATCHED=0.
     let per_group_in = (n_heads / n_groups) * head_dim;
-    let wo_a_batched = std::env::var("HIPFIRE_V4F_WO_A_BATCHED")
-        .map(|s| s != "0").unwrap_or(true);
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -4938,7 +4577,7 @@ fn attention_block_batched_mixed(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_f32 l{layer_idx}: {e:?}"))?;
         }
-        DType::Q8_0 if wo_a_batched => {
+        DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. Same layout
             // assumption as the swa-only sibling.
             gpu.wo_per_group_batched_q8_0(
@@ -4947,40 +4586,17 @@ fn attention_block_batched_mixed(
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
         }
-        DType::Raw if wo_a_batched => {
+        DType::Raw => {
             gpu.wo_per_group_batched_hfq4g256(
                 wo_a, &pbs.attn_out_raw_rot_batch, &pbs.wo_a_out_batch,
                 n_groups as i32, o_lora_rank as i32, per_group_in as i32,
                 batch_size as i32,
             ).map_err(|e| format!("wo_per_group_batched_hfq4g256 l{layer_idx}: {e:?}"))?;
         }
-        _ => {
-            for b in 0..batch_size {
-                for g in 0..n_groups {
-                    let in_off = b * n_heads * head_dim + g * per_group_in;
-                    let rot_view = pbs.attn_out_raw_rot_batch.sub_offset(in_off, per_group_in);
-                    let raw_view = pbs.attn_out_raw_batch.sub_offset(in_off, per_group_in);
-                    let out_off = b * n_groups * o_lora_rank + g * o_lora_rank;
-                    let out_view = pbs.wo_a_out_batch.sub_offset(out_off, o_lora_rank);
-                    let wo_a_view = match wo_a.dtype {
-                        DType::Q8_0 => {
-                            let per_g_bytes = (o_lora_rank * per_group_in / 32) * 34;
-                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
-                            v.dtype = DType::Q8_0;
-                            v.shape = vec![o_lora_rank, per_group_in];
-                            v
-                        }
-                        _ => {
-                            let per_g_bytes = (o_lora_rank * per_group_in / 256) * 136;
-                            let mut v = wo_a.sub_offset(g * per_g_bytes, per_g_bytes);
-                            v.shape = vec![o_lora_rank, per_group_in];
-                            v
-                        }
-                    };
-                    gemv_auto(gpu, &wo_a_view, &rot_view, &raw_view, &out_view,
-                        o_lora_rank, per_group_in)?;
-                }
-            }
+        other => {
+            return Err(format!(
+                "attention_block_batched_swa_only l{layer_idx}: unsupported wo_a dtype {other:?}"
+            ));
         }
     }
 
@@ -5115,13 +4731,9 @@ fn ffn_batched(
     if !do_routed {
         return Ok(());
     }
-    // Layers 0..num_hash_layers use STATIC tid2eid routing per upstream
-    // V4F. Disabled via HIPFIRE_V4F_NO_HASH=1 (mirrors ffn_hash_routed).
+    // Layers 0..num_hash_layers use STATIC tid2eid routing per upstream V4F.
     let hash_routing = layer_idx < cfg.num_hash_layers;
-    if hash_routing
-        && (std::env::var("HIPFIRE_V4F_NO_HASH").ok().as_deref() == Some("1")
-            || layer.tid2eid_host.is_empty())
-    {
+    if hash_routing && layer.tid2eid_host.is_empty() {
         return Ok(());
     }
 
@@ -5410,8 +5022,7 @@ fn mhc_pre_batched(
 /// pre-uploading `start_pos + b` per batch row at chunk start).
 ///
 /// Per-layer YaRN parameters resolved via `layer_rope_params` exactly as
-/// in the sequential path. Honours `HIPFIRE_V4F_NO_YARN=1` (single-theta
-/// path via `rope_tail_interleaved_batched`).
+/// in the sequential path.
 #[allow(dead_code)]
 fn apply_tail_rope_batched(
     cfg: &DeepseekV4Config,
@@ -5421,19 +5032,6 @@ fn apply_tail_rope_batched(
     layer_idx: usize,
     batch_size: usize,
 ) -> Result<(), String> {
-    if env_cache::no_yarn() {
-        gpu.rope_tail_interleaved_batched(
-            &pbs.q_batch, &pbs.kv_batch, &pbs.positions,
-            cfg.num_attention_heads as i32,
-            cfg.num_key_value_heads as i32,
-            cfg.head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            cfg.rope_theta,
-            batch_size as i32,
-        ).map_err(|e| format!("rope_tail_interleaved_batched (no-yarn): {e:?}"))?;
-        return Ok(());
-    }
-
     let layer = weights.resolve_layer(layer_idx);
     let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
         layer_rope_params(cfg, layer.compress_ratio);
@@ -5505,9 +5103,6 @@ fn kv_joint_batched(
 /// existing `*_batched` kernels. The per-head Q normalisation at the end
 /// flattens `[B, n_heads, head_dim]` into `B * n_heads` rows of head_dim
 /// elements before calling `rmsnorm_batched`.
-///
-/// Honours `HIPFIRE_V4F_SKIP_QHN=1` for the per-head Q rmsnorm (matches
-/// the sequential bisect-escape hatch).
 #[allow(dead_code, clippy::too_many_arguments)]
 fn q_lora_batched(
     cfg: &DeepseekV4Config,
@@ -5583,12 +5178,10 @@ fn q_lora_batched(
 
     // 6. Per-(batch, head) RMSNorm of Q using q_head_ones as weight.
     //    [B, n_heads, head_dim] viewed as [B*n_heads, head_dim].
-    if std::env::var("HIPFIRE_V4F_SKIP_QHN").ok().as_deref() != Some("1") {
-        gpu.rmsnorm_batched(
-            &pbs.q_batch, &pbs.q_head_ones, &pbs.q_batch,
-            batch_size * n_heads, head_dim, cfg.rms_norm_eps,
-        ).map_err(|e| format!("q per-head rmsnorm_batched l{layer_idx}: {e:?}"))?;
-    }
+    gpu.rmsnorm_batched(
+        &pbs.q_batch, &pbs.q_head_ones, &pbs.q_batch,
+        batch_size * n_heads, head_dim, cfg.rms_norm_eps,
+    ).map_err(|e| format!("q per-head rmsnorm_batched l{layer_idx}: {e:?}"))?;
 
     Ok(())
 }
@@ -5689,10 +5282,7 @@ pub fn forward_prefill_batch_chunk(
     // uploads in this chunk forward go async-on-stream via
     // `memcpy_htod_auto`. Subsequent kernels submitted to the same
     // stream order naturally — no host blocking on each tiny upload.
-    // Opt out via HIPFIRE_V4F_ASYNC_HTOD=0.
-    let async_htod = std::env::var("HIPFIRE_V4F_ASYNC_HTOD")
-        .map(|s| s != "0").unwrap_or(true);
-    if async_htod && gpu.active_stream.is_none() {
+    if gpu.active_stream.is_none() {
         let new_stream = gpu.hip.stream_create()
             .map_err(|e| format!("stream_create for async htod: {e:?}"))?;
         gpu.active_stream = Some(new_stream);
@@ -5749,12 +5339,8 @@ pub fn forward_prefill_batch_chunk(
     //   ✓ apply_tail_rope_batched         (in-place on q_batch & kv_batch)
     //
     // Then we hit the attention stage which still needs per-batch SWA
-    // staging + indexer top-K gather + wo_a/wo_b O-LoRA projection. Bail
-    // out cleanly so callers know the integration path is partial.
-    // Bisection-aid env: HIPFIRE_V4F_FORWARD_LAYER_END=N stops after N layers.
-    let layer_end: usize = std::env::var("HIPFIRE_V4F_FORWARD_LAYER_END")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(cfg.num_hidden_layers);
-    for layer_idx in 0..cfg.num_hidden_layers.min(layer_end) {
+    // staging + indexer top-K gather + wo_a/wo_b O-LoRA projection.
+    for layer_idx in 0..cfg.num_hidden_layers {
         // Attention-side HC pre + per-stream input mapping.
         mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/true, n)?;
 
@@ -5783,23 +5369,9 @@ pub fn forward_prefill_batch_chunk(
         // hc_attn_mix: integrate attn_out_batch into streams_batch.
         hc_attn_mix_batched(cfg, pbs, gpu, n)?;
 
-        // Bisection break (mirror decode_step's env-gated stop).
-        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
-                == Some("after_attn_mix")
-        {
-            return Ok(());
-        }
-
         // FFN side: mhc_pre(is_attn=false) → ffn_batched (shared + routed)
         // → hc_ffn_mix_batched.
         mhc_pre_batched(cfg, weights, pbs, gpu, layer_idx, /*is_attn=*/false, n)?;
-        if layer_idx + 1 == cfg.num_hidden_layers.min(layer_end)
-            && std::env::var("HIPFIRE_V4F_BISECT_BREAK").ok().as_deref()
-                == Some("after_mhc_pre_ffn")
-        {
-            return Ok(());
-        }
         ffn_batched(cfg, weights, pbs, gpu, layer_idx, n, tokens)?;
         hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
     }
