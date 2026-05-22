@@ -1865,35 +1865,6 @@ pub const GEMM_F32_PER_OUTPUT_V4_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
-/// V4F ZA-fused F16-WMMA — 4-way M-axis fan-out variant of
-/// gemm_f16_x_f16_wmma. Single launch replaces 4 separate F16-WMMA
-/// matmuls in V4F's compressor batched path (comp_wkv, comp_wgate,
-/// idx_wkv, idx_wgate). All four weights are F16-native and share the
-/// same input.
-pub const GEMM_F16_X_F16_WMMA_ZA4_SRC: &str =
-    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_za4.hip");
-
-/// WMMA MQ2-Lloyd-G256 weight × F16 input → F32 output GEMM with (B, M)
-/// output layout. Smoke / proof-of-concept for the MQ2 WMMA path —
-/// MoE-routed MQ2-Lloyd is the dominant V4F prefill kernel (54.1% of GPU
-/// time post-Option-B) and currently has no WMMA variant. Targets
-/// gfx1100+ wave32 WMMA.
-pub const GEMM_MQ2G256_LLOYD_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_wmma.hip");
-
-/// MoE gate_up — single-col WMMA over MQ2-Lloyd weights. Each block
-/// handles 16 M-rows × 1 batch position; WMMA still issues full-rate
-/// mma per K=16 step but only col-0 of the 16×16 output is useful.
-/// ~2× faster than the scalar K4 path; tile-homogeneity safe across
-/// MoE expert routing.
-pub const GEMM_MQ2G256_LLOYD_MOE_GATE_UP_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_gate_up_wmma.hip");
-
-/// MoE down — single-col WMMA over MQ2-Lloyd weights with scaled
-/// residual atomicAdd. Counterpart of the gate_up kernel above.
-pub const GEMM_MQ2G256_LLOYD_MOE_DOWN_RESIDUAL_SCALED_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma.hip");
-
 /// Bulk F32→F16 conversion for staging WMMA activations.
 pub const CONVERT_F32_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/convert_f32_to_f16.hip");
@@ -2011,14 +1982,6 @@ pub const V4F_ATTN_SWA_TOPK_SRC: &str =
 /// At batch=1, byte-identical to V4F_ATTN_SWA_TOPK_SRC.
 pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/v4f_attn_swa_topk_batched.hip");
-
-/// WMMA Q·K^T variant of v4f_attn_swa_topk_batched. Same shape and
-/// semantics, but Phase 2 (scoring) uses WMMA mma_f32_16x16x16_f16
-/// instead of scalar FMAs. PMC data shows the original is L2-BW-bound
-/// (91% L2 hit, 95% MemUnitBusy); WMMA increases compute per L2 byte.
-/// P·V (Phase 6) stays in the scalar path.
-pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC: &str =
-    include_str!("../../../kernels/src/v4f_attn_swa_topk_batched_wmma.hip");
 
 /// V4F batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K

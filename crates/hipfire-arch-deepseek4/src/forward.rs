@@ -4578,64 +4578,23 @@ fn attention_block_batched_mixed(
             // V4F compressor uses FWHT-rotated input (tmp_batch) when the
             // weight is MQ4-style, and plain input (tmp_plain_batch) when
             // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
-            //
-            // Phase D (2026-05-21): ZA-fused 4-way M-axis dispatch when
-            // all 4 compressor weights are F16-native. Default OFF —
-            // bench on v4f.mq2lloyd-q8 prompt=128 B=64 measured 19.3
-            // tok/s (ON) vs 19.6 tok/s (OFF), a −1.5% drift within
-            // session noise. Hypothesis: at B=64 the 4 separate WMMA
-            // matmuls already saturate the wave budget; the fused
-            // kernel's per-thread routing branches add overhead without
-            // extra parallelism (same block count: total_m/16 × B/16 =
-            // 256 either way). Kept opt-in for future shape investigations
-            // (different B / different M sizes / Q8-stacked extension).
-            // Enable with HIPFIRE_V4F_COMP_F16_WMMA_FUSED=1.
-            let za_fused = std::env::var("HIPFIRE_V4F_COMP_F16_WMMA_FUSED")
-                .map(|s| s == "1").unwrap_or(false);
-            if za_fused && ratio == 4 {
-                gpu.gemm_f16_x_f16_wmma_za4(
-                    wkv_f16.unwrap(), wgate_f16.unwrap(),
-                    idx_wkv_f16.unwrap(), idx_wgate_f16.unwrap(),
-                    &pbs.tmp_plain_batch_f16,
-                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch,
-                    &pbs.comp_idx_kv_batch, &pbs.comp_idx_score_batch,
-                    real_main_proj, real_main_proj, idx_proj_dim, idx_proj_dim,
-                    hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma_za4 comp l{layer_idx}: {e:?}"))?;
-            } else if za_fused && ratio == 128 {
-                // ratio==128 has no indexer compressor — only main wkv+wgate.
-                // Pass the two zero-sized M params to skip the idx fan-out.
-                gpu.gemm_f16_x_f16_wmma_za4(
-                    wkv_f16.unwrap(), wgate_f16.unwrap(),
-                    wkv_f16.unwrap(),  // dummy (m2=0 → no reads)
-                    wkv_f16.unwrap(),  // dummy (m3=0 → no reads)
-                    &pbs.tmp_plain_batch_f16,
-                    &pbs.comp_main_kv_batch, &pbs.comp_main_score_batch,
-                    &pbs.comp_main_kv_batch,  // dummy (m2=0 → no writes)
-                    &pbs.comp_main_kv_batch,  // dummy (m3=0 → no writes)
-                    real_main_proj, real_main_proj, 0, 0,
-                    hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma_za4 comp ratio=128 l{layer_idx}: {e:?}"))?;
-            } else {
-                // Legacy 4-call (or 2-call) sequential dispatch.
+            gpu.gemm_f16_x_f16_wmma(
+                wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_kv_batch,
+                real_main_proj, hidden, batch_size,
+            ).map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
+            gpu.gemm_f16_x_f16_wmma(
+                wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_score_batch,
+                real_main_proj, hidden, batch_size,
+            ).map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
+            if ratio == 4 {
                 gpu.gemm_f16_x_f16_wmma(
-                    wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_kv_batch,
-                    real_main_proj, hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
+                    idx_wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_kv_batch,
+                    idx_proj_dim, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
                 gpu.gemm_f16_x_f16_wmma(
-                    wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_main_score_batch,
-                    real_main_proj, hidden, batch_size,
-                ).map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
-                if ratio == 4 {
-                    gpu.gemm_f16_x_f16_wmma(
-                        idx_wkv_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_kv_batch,
-                        idx_proj_dim, hidden, batch_size,
-                    ).map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
-                    gpu.gemm_f16_x_f16_wmma(
-                        idx_wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_score_batch,
-                        idx_proj_dim, hidden, batch_size,
-                    ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
-                }
+                    idx_wgate_f16.unwrap(), &pbs.tmp_plain_batch_f16, &pbs.comp_idx_score_batch,
+                    idx_proj_dim, hidden, batch_size,
+                ).map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
             }
         } else {
             gemv_auto_batched_wmma(
@@ -4922,37 +4881,17 @@ fn attention_block_batched_mixed(
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
-    // HIPFIRE_V4F_ATTN_WMMA=1 routes through the WMMA Q·K^T variant.
-    // Per-PMC measurement, the F32 path is L2-BW-bound (91% L2 hit,
-    // 95% MemUnit busy); WMMA increases compute per L2 byte. Default
-    // OFF until PPL-validated.
-    let attn_wmma = std::env::var("HIPFIRE_V4F_ATTN_WMMA")
-        .map(|s| s == "1").unwrap_or(false);
-    if attn_wmma {
-        gpu.v4f_attn_swa_topk_batched_wmma_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch, &pbs.swa_staged_batch,
-            &pbs.topk_staged_batch, &pbs.topk_staged_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32, head_dim as i32,
-            win as i32, topk_max as i32,
-            batch_size as i32,
-        ).map_err(|e| format!("v4f_attn_swa_topk_batched_wmma l{layer_idx}: {e:?}"))?;
-    } else {
-        gpu.v4f_attn_swa_topk_batched_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch, &pbs.swa_staged_batch,    // K=V tied
-            &pbs.topk_staged_batch, &pbs.topk_staged_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32, head_dim as i32,
-            win as i32, topk_max as i32,
-            batch_size as i32,
-        ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
-    }
+    gpu.v4f_attn_swa_topk_batched_f32(
+        &pbs.q_batch,
+        &pbs.swa_staged_batch, &pbs.swa_staged_batch,    // K=V tied
+        &pbs.topk_staged_batch, &pbs.topk_staged_batch,
+        attn_sink,
+        &pbs.n_valid_swa_arr, &pbs.n_active_topk_arr,
+        &pbs.attn_out_raw_batch,
+        n_heads as i32, head_dim as i32,
+        win as i32, topk_max as i32,
+        batch_size as i32,
+    ).map_err(|e| format!("v4f_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
 
     // 5. Inverse RoPE.
     if std::env::var("HIPFIRE_V4F_SKIP_INV_ROPE").ok().as_deref() != Some("1") {
@@ -5239,70 +5178,12 @@ fn ffn_batched(
         ).map_err(|e| format!("v4f_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
     }
 
-    // 10.5. Scatter-by-expert routing sort + grouped GEMV. Opt-in via
-    //       HIPFIRE_V4F_MOE_GROUPED=1. Default OFF: measured 18 % SLOWER
-    //       than the indexed-batched K4 path on V4F+gfx1151 because the
-    //       grouped layout trades x-row cache reuse (M=4096 blocks share
-    //       x[b] in the indexed grid) for expert-slab reuse — and the
-    //       indexed kernel was already at ~62 % of peak DRAM bandwidth.
-    //       Keep wired for larger batches / archs where the trade flips.
-    let moe_grouped = std::env::var("HIPFIRE_V4F_MOE_GROUPED")
-        .map(|s| s == "1").unwrap_or(false);
-    if moe_grouped {
-        gpu.moe_routing_sort_by_expert(
-            &pbs.moe_topk_indices_batch,
-            &pbs.moe_sorted_b, &pbs.moe_sorted_krank,
-            &pbs.moe_sorted_expert, &pbs.moe_expert_starts,
-            batch_size as i32, k_top as i32, cfg.n_routed_experts as i32,
-        ).map_err(|e| format!("moe_routing_sort_by_expert l{layer_idx}: {e:?}"))?;
-    }
-
-    // 11. Routed expert gate_up (MQ2-Lloyd, scatter-by-expert grouped K4).
-    // K4-unrolled variant (4 independent accumulators per thread for ILP).
-    // Opt out via HIPFIRE_V4F_GATEUP_K4=0 (default: on).
-    //
-    // MQ2-WMMA opt-in (FALSIFIED at B=64, 2026-05-21): kernels
-    // `gemm_mq2g256_lloyd_moe_gate_up_wmma` and `gemm_mq2g256_lloyd_moe
-    // _down_residual_scaled_wmma` exist as foundation but measured 3×
-    // SLOWER than K4 in production. Reason: single-col WMMA wastes
-    // 15/16 of WMMA hardware (MoE batches don't fill 16x16 tiles
-    // homogeneously at V4F's B=64 / n_exp=256 / k_top=6 — avg 1.5
-    // tuples per expert). Wiring retained as `HIPFIRE_V4F_MQ2_WMMA=1`
-    // opt-in for future investigation at larger B; default off.
-    let mq2_wmma = std::env::var("HIPFIRE_V4F_MQ2_WMMA")
-        .map(|s| s == "1").unwrap_or(false);
-    let gate_up_k4 = std::env::var("HIPFIRE_V4F_GATEUP_K4")
-        .map(|s| s != "0").unwrap_or(true);
-    if mq2_wmma {
-        let n_inputs = (batch_size * hidden) as i64;
-        gpu.convert_f32_to_f16(&pbs.ffn_x_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs)
-            .map_err(|e| format!("convert_f32_to_f16 ffn_x_rot l{layer_idx}: {e:?}"))?;
-        gpu.gemm_mq2g256_lloyd_moe_gate_up_wmma(
-            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.wmma_x_scratch_f16,
-            &pbs.moe_gate_batch, &pbs.moe_up_batch,
-            2 * im, hidden, k_top, batch_size,
-        ).map_err(|e| format!("gemm_mq2g256_moe_gate_up_wmma l{layer_idx}: {e:?}"))?;
-    } else if moe_grouped && gate_up_k4 {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_grouped_k4(
-            gate_up_ptrs,
-            &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,
-            &pbs.ffn_x_rot_batch,
-            &pbs.moe_gate_batch, &pbs.moe_up_batch,
-            2 * im, hidden, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_gate_up_grouped_k4 l{layer_idx}: {e:?}"))?;
-    } else if gate_up_k4 {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
-            &pbs.moe_gate_batch, &pbs.moe_up_batch,
-            2 * im, hidden, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_gate_up_batched_k4 l{layer_idx}: {e:?}"))?;
-    } else {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched(
-            gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
-            &pbs.moe_gate_batch, &pbs.moe_up_batch,
-            2 * im, hidden, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_gate_up_batched l{layer_idx}: {e:?}"))?;
-    }
+    // 11. Routed expert gate_up (MQ2-Lloyd K4-unrolled indexed batched).
+    gpu.v4f_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+        gate_up_ptrs, &pbs.moe_topk_indices_batch, &pbs.ffn_x_rot_batch,
+        &pbs.moe_gate_batch, &pbs.moe_up_batch,
+        2 * im, hidden, k_top, batch_size,
+    ).map_err(|e| format!("v4f_gemv_gate_up_batched_k4 l{layer_idx}: {e:?}"))?;
 
     // 12. SwiGLU + clamp over B * k_top streams of length IM.
     gpu.v4f_silu_mul_clamp_f32_batched(
@@ -5315,44 +5196,12 @@ fn ffn_batched(
         &pbs.moe_gate_batch, &pbs.moe_rot_batch, im, batch_size * k_top,
     ).map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
 
-    // 14. Routed expert down with scaled atomicAdd into ffn_out_batch.
-    // K4-unrolled scatter-by-expert grouped variant (or fallbacks).
-    // Opt out via HIPFIRE_V4F_DOWN_K4=0 (default: on).
-    let down_k4 = std::env::var("HIPFIRE_V4F_DOWN_K4")
-        .map(|s| s != "0").unwrap_or(true);
-    if mq2_wmma {
-        // Same WMMA opt-in: F16-stage the moe_rot_batch and dispatch the
-        // single-col WMMA down kernel. moe_rot_batch is laid out as
-        // [B, K_TOP, IM] contiguous = batch_size * k_top * im floats.
-        let n_inputs = (batch_size * k_top * im) as i64;
-        gpu.convert_f32_to_f16(&pbs.moe_rot_batch, &pbs.wmma_x_scratch_f16, n_inputs)
-            .map_err(|e| format!("convert_f32_to_f16 moe_rot l{layer_idx}: {e:?}"))?;
-        gpu.gemm_mq2g256_lloyd_moe_down_residual_scaled_wmma(
-            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
-            &pbs.wmma_x_scratch_f16, &pbs.ffn_out_batch,
-            hidden, im, k_top, batch_size,
-        ).map_err(|e| format!("gemm_mq2g256_moe_down_wmma l{layer_idx}: {e:?}"))?;
-    } else if moe_grouped && down_k4 {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_grouped_k4(
-            w2_ptrs,
-            &pbs.moe_sorted_b, &pbs.moe_sorted_krank, &pbs.moe_sorted_expert,
-            &pbs.moe_topk_weights_batch,
-            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
-            hidden, im, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_down_grouped_k4 l{layer_idx}: {e:?}"))?;
-    } else if down_k4 {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
-            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
-            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
-            hidden, im, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
-    } else {
-        gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched(
-            w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
-            &pbs.moe_rot_batch, &pbs.ffn_out_batch,
-            hidden, im, k_top, batch_size,
-        ).map_err(|e| format!("v4f_gemv_down_batched l{layer_idx}: {e:?}"))?;
-    }
+    // 14. Routed expert down — K4-unrolled scaled atomicAdd into ffn_out_batch.
+    gpu.v4f_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+        w2_ptrs, &pbs.moe_topk_indices_batch, &pbs.moe_topk_weights_batch,
+        &pbs.moe_rot_batch, &pbs.ffn_out_batch,
+        hidden, im, k_top, batch_size,
+    ).map_err(|e| format!("v4f_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
 
     Ok(())
 }
