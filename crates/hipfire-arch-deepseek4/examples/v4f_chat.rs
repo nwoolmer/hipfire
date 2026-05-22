@@ -202,6 +202,14 @@ fn main() -> Result<(), String> {
         // The batched path uses start_pos directly and does NOT touch
         // state.n_tokens. We update it manually below so the subsequent
         // TG decode_step calls write SWA at the right ring slots.
+        // Sync before timer so any leftover async work from a prior turn
+        // (e.g. cache compacts, MTP fill from spec mode) doesn't bleed in.
+        // This catches a real source of inflated PP numbers — the
+        // mtp_forward_batched outputs aren't observed by the host until
+        // the next sync, and without this they'd land inside the next
+        // turn's PP timer.
+        gpu.hip.device_synchronize()
+            .map_err(|e| format!("pp pre-sync: {e:?}"))?;
         let pp_start = Instant::now();
         let start_pp_pos = pos;
         let last_logits = if spec_mode {
@@ -216,6 +224,10 @@ fn main() -> Result<(), String> {
         };
         pos = start_pp_pos + prompt_tokens.len() as u32;
         state.n_tokens = pos as u64;
+        // Sync to ensure all prefill kernels have completed before stopping
+        // the timer (the head's download_f32 already syncs but defensive).
+        gpu.hip.device_synchronize()
+            .map_err(|e| format!("pp post-sync: {e:?}"))?;
         let pp_elapsed = pp_start.elapsed();
 
         // TG: sample + decode loop.
