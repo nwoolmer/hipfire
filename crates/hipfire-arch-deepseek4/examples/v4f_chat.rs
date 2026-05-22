@@ -108,6 +108,20 @@ fn main() -> Result<(), String> {
     let spec_mode = std::env::var("HIPFIRE_V4F_SPEC_DECODE").ok().as_deref() == Some("1");
     let spec_k: usize = std::env::var("HIPFIRE_V4F_SPEC_K")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    // V4F MoE requires BOTH HIPFIRE_V4F_MOE=1 (enables the code path)
+    // AND HIPFIRE_V4F_UPLOAD_EXPERTS=1 (actually uploads the ~40 GB of
+    // expert weights). Without the upload, `do_routed` silently
+    // skips routed-MoE → prefill looks ~2× faster but is missing 80%
+    // of the per-token weight bytes. Auto-enable UPLOAD_EXPERTS when
+    // MoE is requested so users don't get misleading numbers.
+    // (See memory `feedback_v4f_chat_experts_silent_skip`.)
+    if std::env::var("HIPFIRE_V4F_MOE").ok().as_deref() == Some("1")
+        && std::env::var("HIPFIRE_V4F_UPLOAD_EXPERTS").ok().is_none()
+    {
+        std::env::set_var("HIPFIRE_V4F_UPLOAD_EXPERTS", "1");
+        eprintln!("[v4f_chat] HIPFIRE_V4F_MOE=1 set → auto-enabling \
+                   HIPFIRE_V4F_UPLOAD_EXPERTS=1 so routed experts actually load.");
+    }
 
     eprintln!("Loading V4F from {path}...");
     let mut hfq = HfqFile::open(std::path::Path::new(&path))

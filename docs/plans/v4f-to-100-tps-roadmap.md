@@ -1,22 +1,19 @@
 # V4F to 100 tok/s — proof-based roadmap
 
-**Current state (REVISED 2026-05-22, after measurement correction):**
-- **~90 tok/s** batched prefill on v4f.mq2lloyd-q8 (prompt=708, B=16)
-  measured via v4f_chat = **2.43 TFLOPs sustained** of an ~10 TFLOPs F16
-  peak (24%).
-- PPL baseline: 12.66 @ ctx=256, 9.82 @ ctx=512 (wikitext2-test).
-
-**IMPORTANT (memory `feedback_v4f_mtp_smoke_overcounts_prefill`):** the
-prior "41 tok/s" headline was a v4f_mtp_smoke harness artifact — smoke
-reports ~2× the real GPU time. The production v4f_chat binary on the
-SAME `forward_prefill_batch_chunked` call gives ~90 tok/s long-prompt.
-The 41 baseline that gated the original "need 2.45× improvement" math
-was wrong. Re-derive any pre-2026-05-22 cite against fresh v4f_chat
-measurements.
+**Current state (2026-05-21, post-Option-B + SKIP_HEAD):**
+- 41-44 tok/s batched prefill on v4f.mq2lloyd-q8 (prompt=128-706, B=16-64) =
+  **1.10 TFLOPs sustained** of an ~10 TFLOPs F16 peak (11%).
+- PPL baseline: 10.83 @ ctx=256, 9.21 @ ctx=512.
 
 **Target: 100 tok/s = 2.7 TFLOPs sustained** (matches Qwen3.6-35B-A3B
-parity-per-byte on the same hardware). At the revised 90 tok/s
-baseline this is now a **~1.11× improvement**, well within Phase 1.
+parity-per-byte on the same hardware).
+
+**Note on numbers WITHOUT MoE:** if you see v4f_chat reporting ~80-90
+tok/s prefill, MoE is silently skipping (HIPFIRE_V4F_UPLOAD_EXPERTS=1
+is required to upload the expert blobs). Per
+`feedback_v4f_chat_experts_silent_skip`, always verify rocprof shows
+`gemv_mq2g256_lloyd_moe_*` kernels — otherwise the bench is dropping
+the dominant 1.83 GB/token weight read.
 
 ## What we know (proven, not assumed)
 
