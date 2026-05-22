@@ -443,6 +443,41 @@ pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str = include_str!("../../../kernels/src/
 /// to need — required for hipGraph capture of MoE decode.
 pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
 
+// ─── Scatter-grouped MoE pipeline (cherry-picked from origin/master 2026-05-22)
+//
+// The qwen35 "Path 2" pattern: re-order (token, krank) routing slots so
+// adjacent grouped slots share the same expert, run a grouped GEMM with
+// 16×16 WMMA tiles (each tile homogeneous in expert), then unscatter
+// back to per-token outputs. Empirically lifted qwen35-A3B prefill by
+// +114% on gfx1100 / +192% on gfx1201.
+//
+// Validation path for V4F (per docs/plans/v4f-grouped-wmma-validation.md):
+//   1. Use the existing HFQ4 grouped WMMA kernel as the apples-to-apples
+//      Gate 2 measurement (V4F shape, B=512 where Gate 1 passes).
+//   2. If Gate 2 passes, port to MQ2-Lloyd codebook decode.
+pub const MOE_SCATTER_FUSED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
+pub const MOE_SCATTER_HISTOGRAM_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_histogram_k8.hip");
+pub const MOE_SCATTER_OFFSETS_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_offsets_k8.hip");
+pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_permute_k8.hip");
+pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
+pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_grouped_k8.hip");
+/// HFQ4 grouped GEMM with F16 WMMA — reference implementation for the
+/// scatter-grouped MoE pattern. Used by the Gate 2 validation harness.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
+/// HFQ4 grouped GEMM with i8 WMMA (MMQ) — gfx1151-specific. Uses
+/// Q8_1-quantized activations + iu8 WMMA for ~2× FLOP rate vs F16.
+/// Not used by V4F's MQ2-Lloyd path yet; cherry-picked for the Gate 2
+/// validation harness and as a reference for the eventual MQ2-Lloyd port.
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx1151.hip");
+
 /// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
 /// the regular softmax_f32 kernel; the dispatch site runs softmax_f32
 /// first, then this kernel for top-K + renorm. Avoids the 1-ULP
