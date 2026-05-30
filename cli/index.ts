@@ -2756,6 +2756,7 @@ async function serve(port: number, host: string) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        timings: { tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens, prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s, decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms, tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash },
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
@@ -2789,6 +2790,7 @@ async function serve(port: number, host: string) {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                          timings: { tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens, prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s, decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms, tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash },
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2806,15 +2808,27 @@ async function serve(port: number, host: string) {
                         };
                         if (includeUsage) finalChunk.usage = buildUsage(msg, completionTokens);
                         if (truncation) finalChunk.truncation = truncation;
+                        // Surface perf/spec-decode metrics on the tool-call final chunk too
+                        // (matches the plain-text branch) so benchmarks see timings on
+                        // tool-calling turns.
+                        finalChunk.timings = {
+                          tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens,
+                          prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s,
+                          decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms,
+                          tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash,
+                        };
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                       }
                     } else {
-                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
+                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms, tau, cycles, dflash } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
+                        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness
+                        // (mean accepted tokens per verify cycle) for benchmarking/observability;
+                        // absent on the AR path.
+                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms, tau, cycles, dflash }
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
