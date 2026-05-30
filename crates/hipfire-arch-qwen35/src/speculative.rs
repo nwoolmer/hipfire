@@ -5028,6 +5028,59 @@ pub fn seed_target_hidden_from_prompt_abortable(
     Ok(false)
 }
 
+/// Incremental prompt seed for the DFlash prompt cache: prefill ONLY the
+/// `suffix` tokens starting at absolute position `start_pos`, WITHOUT resetting
+/// target KV / DeltaNet state. Used when a turn is a pure extension of the
+/// cached conversation (LCP == prior length) — the target KV[0..start_pos] and
+/// the recurrent DeltaNet state are already correct from the prior turn, so we
+/// only advance them through the new suffix. `hidden_rb` is left holding the
+/// suffix's extracted hidden rows so the caller can scatter them into the
+/// draft's cumulative `target_hidden` at row offset `start_pos` (the draft's
+/// projection cache, keyed on `draft_ctx_cached_rows`, then projects only the
+/// new rows — same delta path decode already uses).
+///
+/// Correctness rests on the same invariant the AR `generate` cache relies on:
+/// `forward_prefill_batch` at a nonzero `seq_pos` continues the hybrid
+/// (FullAttention KV + DeltaNet recurrent) forward exactly as if the prefix had
+/// just been prefilled, because the recurrent state is naturally at the end of
+/// the prior conversation (pure extension — no rewind). Returns `Ok(true)` if
+/// aborted mid-prefill (state left as-is; caller must full-reset & retry),
+/// `Ok(false)` on completion.
+pub fn seed_target_hidden_suffix_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    suffix: &[u32],
+    start_pos: usize,
+    abort_check: &dyn Fn() -> bool,
+) -> HipResult<bool> {
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut off: usize = 0;
+    let mut pos = start_pos;
+    while off < suffix.len() {
+        if abort_check() {
+            return Ok(true);
+        }
+        let end = (off + chunk_max).min(suffix.len());
+        let chunk = &suffix[off..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None, None, None,
+        )?;
+        pos += chunk.len();
+        off = end;
+    }
+    Ok(false)
+}
+
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
 /// `target_hidden` and `target_hidden_abs_positions`, so the draft's cross-
 /// attention sees the same subset of context target now has.

@@ -225,6 +225,33 @@ impl Matcher {
         self.current_tool
     }
 
+    /// Diagnostic snapshot for the DFlash close-marker rejection path.
+    pub fn debug_close_reject(&self) -> String {
+        let req = self
+            .current_tool
+            .and_then(|i| self.tools.get(i))
+            .map(|s| s.required.join(","))
+            .unwrap_or_default();
+        let hist_tail: String = self
+            .ngram_history
+            .chars()
+            .rev()
+            .take(80)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!(
+            "current_tool={:?} required=[{}] req_satisfied={} args_brace_depth={} ngram_hist_len={} hist_tail={:?}",
+            self.current_tool,
+            req,
+            self.required_fields_satisfied(),
+            self.args_brace_depth,
+            self.ngram_history.len(),
+            hist_tail,
+        )
+    }
+
     /// Check whether the args body bytes seen so far satisfy every
     /// required field for the current tool. A field is considered
     /// "seen" if `"<name>"` appears anywhere in the args body bytes
@@ -774,12 +801,29 @@ impl Matcher {
                     let cont = format!("\n{{\"name\": \"{}\", \"arguments\": ", schema.name);
                     if let Some(rest) = self.partial_buf.strip_prefix(cont.as_str()) {
                         let rest_owned = rest.to_string();
-                        self.partial_buf = rest_owned;
+                        self.partial_buf = rest_owned.clone();
                         self.state = State::InArgs;
                         self.current_tool = Some(idx);
                         self.args_brace_depth = 0;
                         self.args_in_string = false;
                         self.args_string_escape = false;
+                        // `rest` is the START of the args body (e.g. `{"command`)
+                        // that arrived in the SAME chunk as the `"arguments": `
+                        // marker. `advance` only feeds `ngram_history` /
+                        // brace-state when ALREADY in InArgs, so without this
+                        // the opening fragment is dropped — losing the leading
+                        // `"` of the first field name, which made
+                        // `required_fields_satisfied` perpetually false and
+                        // rejected the valid `</tool_call>` close (a spurious
+                        // DFlash grammar violation + full KV/DN reset on every
+                        // tool turn, which defeated prompt-cache reuse). Feed it
+                        // exactly once here; subsequent `advance` calls feed only
+                        // their own new text, so there's no double-count of the
+                        // brace depth.
+                        if !rest_owned.is_empty() {
+                            self.update_ngram_history(&rest_owned);
+                            self.update_args_brace_state(&rest_owned);
+                        }
                         return Transition::Advanced;
                     }
                 }

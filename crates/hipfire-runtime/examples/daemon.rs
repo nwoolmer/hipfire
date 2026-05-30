@@ -3570,16 +3570,113 @@ fn load_dflash_state(
     })
 }
 
+/// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
+struct PromptCachePlan {
+    /// Full canonical conversation tokens (system + history + live user +
+    /// assistant prefix). Stored as `conversation_tokens` after generation so
+    /// the next turn can LCP against it.
+    rendered: Vec<u32>,
+    /// Tokens to actually prefill: the suffix `rendered[start_pos..]` on a hit,
+    /// the whole `rendered` on a miss.
+    new_tokens: Vec<u32>,
+    /// Absolute position the prefill starts at (the reused-prefix length on a
+    /// hit, 0 on a miss).
+    start_pos: usize,
+    /// `cached_tokens` for OpenAI usage reporting (== start_pos).
+    cached_tokens: usize,
+    /// True ⇒ reuse existing KV/DeltaNet[0..start_pos]; prefill only the suffix.
+    /// False ⇒ caller must full-reset and prefill the whole conversation.
+    cache_hit: bool,
+}
+
+/// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
+/// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
+/// so the DFlash path can use it too. Renders the canonical conversation via
+/// `build_cached_history` (verbatim assistant-turn replay through
+/// `asst_turn_cache`, which is what makes the LCP byte-exact across turns), then
+/// compares against `m.conversation_tokens`. Reports a HIT only on a strict
+/// forward extension (`lcp == prior_len && lcp < rendered.len()`), which keeps
+/// the recurrent DeltaNet state valid by construction (the prior turn left it at
+/// exactly `prior_len`, so prefilling the suffix advances it correctly with no
+/// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
+/// avoid a 1-token DeltaNet over-advance. Caller must be in the
+/// `messages_history.is_some()` case.
+#[allow(clippy::too_many_arguments)]
+fn plan_prompt_cache(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    asst_turn_cache: &mut AsstTurnCache,
+    conversation_tokens: &[u32],
+    eviction_is_none: bool,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    messages_history: &[hipfire_runtime::prompt_frame::Message],
+    cache_disabled: bool,
+) -> PromptCachePlan {
+    let q_tokens = tokenizer.encode(prompt);
+    let rendered = hipfire_runtime::prompt_frame::build_cached_history(
+        tokenizer,
+        system_prompt,
+        messages_history,
+        &q_tokens,
+        assistant_prefix,
+        |msg| {
+            let stripped = strip_think_for_fingerprint(&msg.content);
+            let normalized =
+                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+            let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+            asst_turn_cache.get(&fp).cloned()
+        },
+    );
+    let cache_eligible =
+        !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
+    if cache_eligible {
+        let prior_len = conversation_tokens.len();
+        let max_match = prior_len.min(rendered.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
+            lcp += 1;
+        }
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache lcp dflash] prior_len={} rendered_len={} lcp={}",
+                prior_len,
+                rendered.len(),
+                lcp
+            );
+        }
+        if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
+            return PromptCachePlan {
+                new_tokens: rendered[lcp..].to_vec(),
+                start_pos: lcp,
+                cached_tokens: lcp,
+                cache_hit: true,
+                rendered,
+            };
+        }
+    }
+    PromptCachePlan {
+        new_tokens: rendered.clone(),
+        start_pos: 0,
+        cached_tokens: 0,
+        cache_hit: false,
+        rendered,
+    }
+}
+
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
 /// token-streaming output but replaces the AR sample loop with
 /// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
 /// model and verifies them in one target forward, committing accept_len+1
 /// at a time.
 ///
-/// Single-turn: this path always resets target state at entry, matching the
-/// stateless OpenAI chat-completions contract. Multi-turn callers that
-/// persist KV across HTTP requests are out of scope for this integration —
-/// they can keep using the AR path.
+/// Prompt cache: for `messages_history`-bearing chat requests this path now
+/// reuses the target KV + DeltaNet prefix on a pure conversation extension
+/// (via [`plan_prompt_cache`] + `seed_target_hidden_suffix_abortable`), and the
+/// draft's cumulative `target_hidden` is extended by scattering only the suffix
+/// rows — so DFlash keeps its decode speedup AND skips re-prefilling the cached
+/// prefix. A divergent / first / raw-prompt turn full-resets and prefills the
+/// whole conversation as before.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn generate_dflash(
@@ -3682,19 +3779,70 @@ fn generate_dflash(
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
 
-    // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
-    // full prefill, so we reset first to avoid double-accounting.
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    {
-        let dn = m.dn_state.as_ref().unwrap();
-        for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+    // Prompt-cache plan (native DFlash reuse). For non-jinja chat with history,
+    // decide whether this turn is a pure extension of the cached conversation.
+    // On a HIT we reuse target KV + DeltaNet[0..start_pos] and the draft's
+    // cumulative target_hidden, prefilling only the suffix; on a MISS we
+    // full-reset and prefill the whole conversation (legacy behaviour).
+    let cache_disabled = try_jinja
+        || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_plan: Option<PromptCachePlan> = if !try_jinja {
+        messages_history.map(|hist| {
+            let tok = m.tokenizer.as_ref().unwrap();
+            plan_prompt_cache(
+                tok,
+                &mut m.asst_turn_cache,
+                &m.conversation_tokens,
+                m.eviction.is_none(),
+                system_prompt,
+                prompt,
+                assistant_prefix,
+                hist,
+                cache_disabled,
+            )
+        })
+    } else {
+        None
+    };
+    // `prompt_tokens` becomes the full canonical conversation when the cache
+    // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
+    // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
+    let prompt_tokens: Vec<u32> = match &cache_plan {
+        Some(p) => p.rendered.clone(),
+        None => prompt_tokens,
+    };
+    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash): (Vec<u32>, usize, bool, usize) =
+        match &cache_plan {
+            Some(p) => (p.new_tokens.clone(), p.start_pos, p.cache_hit, p.cached_tokens),
+            None => (prompt_tokens.clone(), 0, false, 0),
+        };
+
+    if !cache_hit {
+        // Fresh target state — full prefill from position 0.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        {
+            let dn = m.dn_state.as_ref().unwrap();
+            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
+    } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
+            prefill_start,
+            prefill_tokens.len()
+        );
     }
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
-    df.draft_scratch.reset_upload_tracking();
+    if !cache_hit {
+        // Reset the draft's upload/projection tracking only on a full prefill.
+        // On a hit we PRESERVE uploaded_target_hidden_rows / draft_ctx_cached_rows
+        // / target_hidden_abs_positions from the prior turn so the draft reuses
+        // the cached [0..start_pos] projections and only projects the suffix.
+        df.draft_scratch.reset_upload_tracking();
+    }
 
     // Assemble a transient ModelSlot for the spec helpers — they both take
     // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
@@ -3776,10 +3924,20 @@ fn generate_dflash(
     // cancellation, state is fully reset (DeltaNet non-reversible) and
     // we return early — no decode, no tokens emitted to the wire.
     let id_for_abort = id.to_string();
-    let aborted = match speculative::seed_target_hidden_from_prompt_abortable(
-        gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
-        &|| check_abort(&id_for_abort),
-    ) {
+    let seed_result = if cache_hit {
+        // Incremental: prefill only the suffix, continuing from start_pos with
+        // the reused target KV + DeltaNet state (no reset).
+        speculative::seed_target_hidden_suffix_abortable(
+            gpu, &mut target, &mut df.hidden_rb, &prefill_tokens, prefill_start,
+            &|| check_abort(&id_for_abort),
+        )
+    } else {
+        speculative::seed_target_hidden_from_prompt_abortable(
+            gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
+            &|| check_abort(&id_for_abort),
+        )
+    };
+    let aborted = match seed_result {
         Ok(b) => b,
         Err(e) => {
             let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
@@ -3805,13 +3963,28 @@ fn generate_dflash(
         let _ = stdout.flush();
         return;
     }
-    // Prime the draft's GPU target_hidden buffer from the prompt rows so the
-    // first spec step can skip the CPU→GPU upload of the whole context.
-    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-        gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
-        0, prompt_tokens.len(), prompt_tokens.len(),
-    ) {
-        eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+    // Prime/extend the draft's GPU target_hidden buffer.
+    if cache_hit {
+        // Scatter ONLY the suffix rows at offset start_pos; the [0..start_pos]
+        // rows are preserved from the prior turn. The cumulative abs-positions
+        // extend to the full conversation length. `draft_ctx_cached_rows` is
+        // left untouched (still == start_pos), so the first spec step projects
+        // only [start_pos..position) — the same delta path decode uses.
+        let suffix_len = prefill_tokens.len();
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+            prefill_start, suffix_len, suffix_len,
+        ) {
+            eprintln!("[dflash] suffix scatter failed: {e}");
+        }
+    } else {
+        // Full prefill: scatter all prompt rows from offset 0.
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+            0, prompt_tokens.len(), prompt_tokens.len(),
+        ) {
+            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        }
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     df.draft_scratch.target_hidden_abs_positions =
@@ -4093,8 +4266,8 @@ fn generate_dflash(
                 let text = tokenizer.decode(&[tok]);
                 if !grammar_matcher.is_token_allowed(&text) {
                     eprintln!(
-                        "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS",
-                        tok, text, grammar_matcher.state(),
+                        "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS | {}",
+                        tok, text, grammar_matcher.state(), grammar_matcher.debug_close_reject(),
                     );
                     grammar_violated = true;
                     hit_eos = true;
@@ -4309,10 +4482,10 @@ fn generate_dflash(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"finish_reason":"{}"{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
         id, generated, tok_s, prompt_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles, finish_reason, pflash_done_field,
+        tau, stats.cycles, cached_tokens_dflash, finish_reason, pflash_done_field,
     );
     let _ = stdout.flush();
 }
@@ -4879,27 +5052,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // thinking requests there until DFlash continuation is implemented.
     let budgeted_thinking_needs_ar = max_think_tokens > 0
         && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
-    // Prompt-cache routing (2026-05-30). The DFlash decode path
-    // (`generate_dflash`) re-prefills the entire prompt from scratch on every
-    // request — it has no LCP prefix-cache reuse — so multi-turn agentic
-    // workloads pay a full cold prefill of the whole growing conversation each
-    // turn (measured: 197s to re-prefill a 22.5k-token agent context on
-    // gfx1151, `cached_tokens=0` every turn). The AR `generate` path below has
-    // a working LCP prefix cache. For chat-completions requests (which carry a
-    // `messages_history`), prefer the cache-capable AR path so every turn after
-    // the first reuses the prior KV — the dominant cost in agentic loops is
-    // prefill, not decode, so trading DFlash's ~2× decode for a warm prefill is
-    // a large net win. DFlash still serves the raw/no-history path. Force the
-    // DFlash decode path for chat with `HIPFIRE_DFLASH_CHAT=1` (accepts the
-    // no-cache cost; useful for native DFlash+cache-reuse work).
-    let prefer_cache_path = messages_history.is_some()
-        && std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() != Some("1");
-    if prefer_cache_path && m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
-        eprintln!(
-            "[dflash-route] chat request → AR cache path (DFlash has no prefix cache; set HIPFIRE_DFLASH_CHAT=1 to force DFlash decode)"
-        );
-    }
-    if !prefer_cache_path && m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
+    // Prompt-cache routing (2026-05-30, native-reuse update). `generate_dflash`
+    // now implements LCP prompt-cache reuse natively: on a pure conversation
+    // extension it reuses the target KV + DeltaNet prefix and extends the
+    // draft's cumulative `target_hidden` by only the suffix — verified
+    // byte-identical to a full prefill. So the DFlash path now gives BOTH a warm
+    // prefill on agentic turns AND its ~2× decode speedup, strictly better than
+    // the AR cache path for greedy chat. (Earlier this same routing site sent
+    // chat to AR as a stopgap because DFlash re-prefilled cold every turn — that
+    // reason is gone.) DFlash is the default for greedy chat on qwen3.5/3.6;
+    // opt out to the simpler AR path (e.g. to avoid spec-decode) with
+    // `HIPFIRE_DFLASH_CHAT=0`.
+    let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
+    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar && !force_ar_chat {
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so

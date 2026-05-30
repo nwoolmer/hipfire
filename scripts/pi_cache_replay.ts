@@ -68,7 +68,7 @@ async function callModel(messages: any[]) {
 
 const messages: any[] = [{ role: "system", content: SYSTEM }, { role: "user", content: USER }];
 console.log(`Pi agentic cache loop → model=${MODEL} turns=${MAX_TURNS} gen=${GEN}`);
-console.log("turn  prompt_tok  cached_tok  reuse%   tool                    wall_s");
+console.log("turn  prompt_tok  cached_tok  reuse%   out_sig     tool                    wall_s");
 console.log("--------------------------------------------------------------------------");
 let prevPrompt = 0;
 for (let k = 0; k < MAX_TURNS; k++) {
@@ -86,7 +86,14 @@ for (let k = 0; k < MAX_TURNS; k++) {
     let a: any = {}; try { a = JSON.parse(tc.function.arguments || "{}"); } catch {}
     toolDesc = `${tc.function.name}:${(a.command || a.path || "").slice(0, 18)}`;
   }
-  console.log(`${String(k).padEnd(5)} ${String(prompt).padEnd(11)} ${String(cached).padEnd(11)} ${String(reusePct).padEnd(8)} ${toolDesc.padEnd(23)} ${wall.toFixed(1)}`);
+  // Deterministic per-turn output signature (content + tool_calls) for
+  // byte-identical comparison across cache-on vs forced-full runs.
+  const sig = (() => {
+    const h = require("node:crypto").createHash("sha1");
+    h.update(JSON.stringify({ c: msg.content ?? "", t: tcs.map((x: any) => ({ n: x.function?.name, a: x.function?.arguments })) }));
+    return h.digest("hex").slice(0, 10);
+  })();
+  console.log(`${String(k).padEnd(5)} ${String(prompt).padEnd(11)} ${String(cached).padEnd(11)} ${String(reusePct).padEnd(8)} ${String(sig).padEnd(11)} ${toolDesc.padEnd(23)} ${wall.toFixed(1)}`);
   prevPrompt = prompt;
   // Feed the model's VERBATIM assistant message back, then execute tools.
   messages.push({ role: "assistant", content: msg.content ?? "", ...(tcs.length ? { tool_calls: tcs } : {}) });
