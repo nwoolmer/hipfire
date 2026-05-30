@@ -6227,6 +6227,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // the cache itself keeps RoPE phase correct across evictions.
             qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
+            // Checkpoint during decode too, so a long generated turn (e.g. a
+            // big code emission) can be resumed mid-region if the NEXT turn's
+            // render diverges within it — without replaying the whole
+            // generation. No-op under eviction (compact_offset != 0).
+            checkpoint_dn(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, 0);
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
