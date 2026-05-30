@@ -499,9 +499,24 @@ fn extract_tool_calls_from_text(
             // Mirrors cli/index.ts:2287-2295.
             if parsed.is_none() {
                 if let Some(name) = extract_tool_call_name_fallback(body) {
-                    let arguments = extract_tool_call_arguments_fallback(body)
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    parsed = Some((name, arguments));
+                    if let Some(arguments) = extract_tool_call_arguments_fallback(body) {
+                        // Recovered a complete, strict-valid args object.
+                        parsed = Some((name, arguments));
+                    } else if tool_call_args_object_complete(body) {
+                        // The args object is present and brace-balanced but not
+                        // strict JSON (trailing comma, unquoted key, …) — a
+                        // model formatting glitch, not a truncation. Preserve
+                        // the call by name with empty args (legacy behavior).
+                        parsed = Some((name, serde_json::Value::Object(Default::default())));
+                    }
+                    // else: NO balanced args object — the call was cut off
+                    // mid-value by `max_tokens` or a grammar force-close.
+                    // Dropping it (rather than fabricating empty `{}`) keeps a
+                    // broken call from being delivered as executable: the
+                    // client would otherwise invoke e.g. `write({})` and fail
+                    // schema validation (the write-tool empty-args incident).
+                    // The truncated emission instead surfaces as content +
+                    // finish_reason so the client retries.
                 }
             }
             if let Some((name, arguments)) = parsed {
@@ -639,6 +654,54 @@ fn extract_tool_call_arguments_fallback(s: &str) -> Option<serde_json::Value> {
         k += 1;
     }
     None
+}
+
+/// True iff a brace-balanced `{...}` object exists after the `arguments`
+/// key — i.e. the args object is COMPLETE (not truncated), regardless of
+/// whether it is strict-valid JSON. Distinguishes a model formatting glitch
+/// (trailing comma / unquoted key — keep the call) from a generation cut off
+/// mid-args (drop the call). Mirrors the brace walk in
+/// [`extract_tool_call_arguments_fallback`] but stops at the matching close
+/// brace without requiring valid JSON.
+fn tool_call_args_object_complete(s: &str) -> bool {
+    let key_idx = match s.find("arguments") {
+        Some(i) => i,
+        None => return false,
+    };
+    let after_key = &s[key_idx + "arguments".len()..];
+    let brace_off = match after_key.find('{') {
+        Some(i) => i,
+        None => return false,
+    };
+    let abs_start = key_idx + "arguments".len() + brace_off;
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut k = abs_start;
+    while k < bytes.len() {
+        let ch = bytes[k];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == b'\\' {
+                escape = true;
+            } else if ch == b'"' {
+                in_str = false;
+            }
+        } else if ch == b'"' {
+            in_str = true;
+        } else if ch == b'{' {
+            depth += 1;
+        } else if ch == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    false
 }
 
 /// Walk a [`serde_json::Value`] and produce a canonical-key
@@ -8072,6 +8135,36 @@ mod tool_call_parser_tests {
         let calls = extract_tool_calls_from_text(s);
         assert_eq!(calls.len(), 1, "unclosed block dropped — should recover");
         assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn truncated_args_not_emitted_as_empty() {
+        // A `write` cut off mid-`content` (max_tokens / grammar force-close):
+        // the args object never closes, so no balanced object is recoverable.
+        // The OLD fallback fabricated empty `{}` args, presenting write({}) to
+        // the client as executable (the write-tool empty-args incident). NEW:
+        // drop the call entirely so the emission surfaces as content +
+        // finish_reason for the client to retry. Distinct from
+        // `handles_unclosed_tool_call`, where the args ARE complete and only
+        // the `</tool_call>` marker is missing.
+        let s = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"/tmp/big.zig\", \"content\": \"const std = @im";
+        let calls = extract_tool_calls_from_text(s);
+        assert!(
+            calls.is_empty(),
+            "truncated args must NOT emit a fabricated-empty call"
+        );
+    }
+
+    #[test]
+    fn loose_json_with_complete_args_still_recovered() {
+        // Broken outer JSON (leading `{` lost to special-token leakage) but a
+        // COMPLETE balanced args object — the fallback still recovers it,
+        // distinguishing real recovery from the truncation case above.
+        let s = "<tool_call>\nname\": \"read\", \"arguments\": {\"path\": \"/tmp/x\"}\n</tool_call>";
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["path"], "/tmp/x");
     }
 
     #[test]

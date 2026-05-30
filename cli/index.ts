@@ -2415,8 +2415,19 @@ async function serve(port: number, host: string) {
               args = extractFirstJsonObject(tail);
             }
             if (args === null) args = extractFirstJsonObject(raw);
-            // Empty-args zero-arg call is legal; don't drop it.
-            return { name: fname, arguments: args ?? {}, repaired: true };
+            if (args === null) {
+              // No strict-valid args object. If a brace-balanced object IS
+              // present, it's a model formatting glitch (trailing comma,
+              // unquoted key, …) — keep the call with empty args (legacy).
+              // Otherwise the call was truncated mid-args (max_tokens / grammar
+              // force-close): drop it so the emission surfaces as content +
+              // finish_reason rather than a phantom `write({})` that fails
+              // schema validation (the write-tool empty-args incident). Mirrors
+              // daemon.rs:extract_tool_calls_from_text.
+              if (jsonObjectIsComplete(raw)) return { name: fname, arguments: {}, repaired: true };
+              return null;
+            }
+            return { name: fname, arguments: args, repaired: true };
           }
           if (sanitized) {
             // Last-ditch: we stripped tokens but couldn't find a name.
@@ -2472,6 +2483,30 @@ async function serve(port: number, host: string) {
             }
           }
           return null;
+        }
+
+        // True iff a brace-balanced `{...}` exists in `s` — the object is
+        // COMPLETE (not truncated) even when it isn't strict JSON. Lets Form 4
+        // distinguish a model formatting glitch (trailing comma / unquoted key
+        // — keep the call) from a call cut off mid-args (drop it). Mirrors
+        // daemon.rs:tool_call_args_object_complete.
+        function jsonObjectIsComplete(s: string): boolean {
+          const start = s.indexOf("{");
+          if (start < 0) return false;
+          let depth = 0, inStr = false, escape = false;
+          for (let i = start; i < s.length; i++) {
+            const ch = s[i];
+            if (inStr) {
+              if (escape) { escape = false; continue; }
+              if (ch === "\\") { escape = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === "{") depth++;
+            else if (ch === "}") { depth--; if (depth === 0) return true; }
+          }
+          return false;
         }
 
         if (body.stream) {

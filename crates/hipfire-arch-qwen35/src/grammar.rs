@@ -153,11 +153,19 @@ pub struct Matcher {
     /// Bytes committed since the last firm state transition.
     partial_buf: String,
     tools: Vec<ToolSchema>,
-    /// Rolling window of the last `NGRAM_WINDOW` bytes seen while in
-    /// [`State::InArgs`]. Separate from `partial_buf` because that
-    /// only retains a close-marker-sized suffix — n-gram detection
-    /// needs longer history. Cleared on every firm transition.
+    /// Rolling window of the last `NGRAM_WINDOW` bytes of the FULL args
+    /// body (including string-value bytes) seen while in [`State::InArgs`].
+    /// Used ONLY for the required-field substring check (`"path"` etc. live
+    /// inside strings). Attractor detection runs on the separate
+    /// structural-only [`Self::attractor_buf`]. Cleared on every firm
+    /// transition.
     ngram_history: String,
+    /// Rolling window of the last `NGRAM_WINDOW` *structural* (out-of-string)
+    /// args bytes — fed to the n-gram attractor guard. String-value bytes
+    /// (e.g. a `write` tool's code `content`) are excluded so legitimate code
+    /// repetition doesn't false-trip the guard. Cleared on every firm
+    /// transition.
+    attractor_buf: String,
     /// Set when consecutive n-gram repetition is detected inside
     /// [`State::InArgs`]. While set, the matcher constrains InArgs
     /// to only `</tool_call>` continuations — the model gets a
@@ -202,6 +210,7 @@ impl Matcher {
             partial_buf: String::new(),
             tools,
             ngram_history: String::new(),
+            attractor_buf: String::new(),
             attractor_detected: false,
             current_tool: None,
             args_brace_depth: 0,
@@ -267,6 +276,10 @@ impl Matcher {
                 }
                 continue;
             }
+            // Structural position (outside any JSON string value): feed the
+            // n-gram attractor guard. String-value bytes (handled by the
+            // `continue` above) are deliberately excluded — see `advance`.
+            self.push_attractor_byte(byte);
             match byte {
                 b'"' => self.args_in_string = true,
                 b'{' => self.args_brace_depth += 1,
@@ -397,16 +410,12 @@ impl Matcher {
     /// it from here (clearing happens on the firm `</tool_call>`
     /// transition back to `Out`).
     fn update_ngram_history(&mut self, text: &str) {
-        if self.attractor_detected {
-            return; // already flagged; don't waste work
-        }
+        // Full args text → required-field substring buffer only. Attractor
+        // detection runs on structural bytes in `push_attractor_byte`.
         self.ngram_history.push_str(text);
         if self.ngram_history.len() > NGRAM_WINDOW {
-            // Drop only at UTF-8 char boundaries — keep the buffer safe
-            // for `&str` slicing in `detect_ngram_loop`. We're working
-            // on a byte-level repetition check, so dropping at any
-            // boundary doesn't change the detection semantics; the
-            // boundary rule just satisfies the `String` invariant.
+            // Drop at a UTF-8 char boundary — string values may hold multibyte
+            // content, so this buffer is not guaranteed ASCII.
             let drop = self.ngram_history.len() - NGRAM_WINDOW;
             let mut idx = drop;
             while idx < self.ngram_history.len()
@@ -416,7 +425,27 @@ impl Matcher {
             }
             self.ngram_history.drain(..idx);
         }
-        if Self::detect_ngram_loop(&self.ngram_history) {
+    }
+
+    /// Feed one *structural* (out-of-string) args byte into the attractor
+    /// guard. Called per-byte from [`Self::update_args_brace_state`]; bytes
+    /// inside JSON string values are excluded by that caller.
+    fn push_attractor_byte(&mut self, byte: u8) {
+        if self.attractor_detected {
+            return; // already flagged; don't waste work
+        }
+        // Structural JSON bytes are always ASCII. Skip any stray non-ASCII byte
+        // so `attractor_buf` stays valid UTF-8 for `&str` detection; every
+        // ASCII byte is its own char boundary, so trimming is unconditional.
+        if !byte.is_ascii() {
+            return;
+        }
+        self.attractor_buf.push(byte as char);
+        if self.attractor_buf.len() > NGRAM_WINDOW {
+            let drop = self.attractor_buf.len() - NGRAM_WINDOW;
+            self.attractor_buf.drain(..drop);
+        }
+        if Self::detect_ngram_loop(&self.attractor_buf) {
             self.attractor_detected = true;
         }
     }
@@ -672,16 +701,29 @@ impl Matcher {
     /// level — callers may pass single bytes, multi-byte chunks, or
     /// full decoded tokens; the same final state is reached either way.
     ///
-    /// While in [`State::InArgs`], `text` is also fed into the
-    /// n-gram loop guard so a model that drifts into a repeating
-    /// attractor inside the args body (e.g. `typetypetypetype`) is
-    /// detected — the next `is_token_allowed` calls then force the
-    /// close marker.
+    /// While in [`State::InArgs`], the *structural* (out-of-string) bytes
+    /// are fed into the n-gram loop guard so a model that drifts into a
+    /// repeating attractor over the JSON skeleton is detected — the next
+    /// `is_token_allowed` calls then force the close marker. Bytes inside a
+    /// JSON string value (e.g. a `write` tool's code `content`) are excluded
+    /// to avoid false-tripping on legitimate code repetition.
     pub fn advance(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         if matches!(self.state, State::InArgs) {
+            // `ngram_history` accumulates the FULL args text (field names live
+            // inside string values) for the required-field guard. The n-gram
+            // attractor guard must NOT see string-value bytes — a `write`/`edit`
+            // tool's code `content` legitimately repeats short n-grams
+            // (indentation, escaped newline+indent units `\n    `, `0, 0, 0, …`,
+            // `},\n},\n…`) that would false-trip the 3-byte×6 default and force
+            // a premature `</tool_call>`, truncating the argument and emitting
+            // `{}` to the client (the write-tool empty-args bug).
+            // `update_args_brace_state` walks byte-by-byte and feeds only the
+            // *structural* (out-of-string) bytes into `attractor_buf`, so
+            // structural loops (the JSON skeleton itself repeating) are still
+            // caught.
             self.update_ngram_history(text);
             self.update_args_brace_state(text);
         }
@@ -756,6 +798,7 @@ impl Matcher {
                     // body's first byte.) Also drop `current_tool` so
                     // the required-field check no longer applies.
                     self.ngram_history.clear();
+                    self.attractor_buf.clear();
                     self.attractor_detected = false;
                     self.current_tool = None;
                     self.args_brace_depth = 0;
@@ -1646,46 +1689,58 @@ mod tests {
     // n-gram loop guard catches both patterns + forces a close.
 
     #[test]
-    fn ngram_guard_catches_short_char_attractor() {
-        // The `typetypetypetype...` pattern at the bumped threshold
-        // (6 repeats). 4-byte gram × 6 = 24 bytes.
+    fn ngram_guard_catches_structural_skeleton_attractor() {
+        // A model that loops the JSON *skeleton* (repeating key/value pairs)
+        // is a real attractor we still break. The key/value text lives inside
+        // strings (excluded from the guard), but the structural punctuation
+        // emitted between repeats (`":1,`) is fed and trips at the 6× default.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         assert!(matches!(m.state(), State::InArgs));
         assert!(!m.attractor_detected(), "guard should be clean on entry");
-        m.advance("{\"content\": \"typetypetypetypetypetype");
-        assert!(m.attractor_detected(), "should detect 4-byte × 6 repetition");
-        // Once flagged, the matcher is no longer free — even prose
-        // tokens get rejected.
+        let mut payload = String::from("{");
+        for _ in 0..8 {
+            payload.push_str("\"k\":1,"); // structural stream: `":1,` × 8
+        }
+        m.advance(&payload);
+        assert!(
+            m.attractor_detected(),
+            "should detect the repeating JSON skeleton"
+        );
+        // Once flagged, the matcher is no longer free, and only the close
+        // marker passes.
         assert!(!m.is_free());
-        assert!(!m.is_token_allowed("more code"));
-        assert!(!m.is_token_allowed("\"}"));
-        // The forced exit: tokens that complete the close marker pass.
-        assert!(m.is_token_allowed("\"}}\n<"));
+        assert!(!m.is_token_allowed("more"));
         assert!(m.is_token_allowed("\"}}\n</tool_call>"));
     }
 
     #[test]
-    fn ngram_guard_catches_long_phrase_attractor() {
-        // The `pub fn BlinkHash(key_pub fn BlinkHash(key_...` pattern.
-        // 20-byte gram × 6 repeats; the guard scans up to 32-byte
-        // grams so this must trip.
+    fn ngram_guard_ignores_repetition_inside_string_value() {
+        // Regression for the write-tool empty-args bug: a `write` tool whose
+        // code `content` legitimately repeats short n-grams (indentation,
+        // `pub fn …`, `typetype…`) must NOT trip the guard. The old contract
+        // detected inside the string value and force-closed `</tool_call>`,
+        // truncating the argument to `{}`. Inside-string bytes are now excluded.
         let mut m = Matcher::new(schemas(&["write"]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
         assert!(matches!(m.state(), State::InArgs));
+        m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"");
+        // 20-byte phrase × 6 *inside* the content string.
         let phrase = "pub fn BlinkHash(key";
         assert_eq!(phrase.len(), 20);
-        // Emit some valid prefix, then the attractor.
-        m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"");
         let mut payload = String::new();
         for _ in 0..6 {
             payload.push_str(phrase);
         }
         m.advance(&payload);
+        // ...and a short-char run, the other classic false-positive shape.
+        m.advance("typetypetypetypetypetype");
         assert!(
-            m.attractor_detected(),
-            "should detect 20-byte phrase × 6 repetition"
+            !m.attractor_detected(),
+            "code repetition inside a string value must NOT trip the guard"
         );
+        // The args body is still free so the model keeps writing its file.
+        assert!(m.is_free());
     }
 
     #[test]
@@ -1763,11 +1818,16 @@ mod tests {
         // doesn't inherit it.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        m.advance("{\"x\": \"typetypetypetypetypetype");
+        // Structural skeleton loop (`":1,` × 8) trips the guard.
+        let mut payload = String::from("{");
+        for _ in 0..8 {
+            payload.push_str("\"k\":1,");
+        }
+        m.advance(&payload);
         assert!(m.attractor_detected());
         // Force-close (the daemon's sample mask would have driven the
         // model here).
-        m.advance("\"}}\n</tool_call>");
+        m.advance("}\n</tool_call>");
         assert!(matches!(m.state(), State::Out));
         assert!(!m.attractor_detected(), "flag must clear on close");
         // Next tool_call body starts clean.
@@ -2125,10 +2185,14 @@ mod tests {
         // this test just verifies no panic / unbounded growth.)
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        // Even after the guard trips, additional advance calls
-        // shouldn't keep growing the history (update_ngram_history
-        // short-circuits when the flag is set).
-        m.advance("{\"x\": \"typetypetypetypetypetype");
+        // Trip the guard structurally (`":1,` × 8), then flood with a huge
+        // in-string payload. Both buffers stay bounded: `attractor_buf`
+        // short-circuits once flagged, and `ngram_history` is window-capped.
+        let mut payload = String::from("{");
+        for _ in 0..8 {
+            payload.push_str("\"k\":1,");
+        }
+        m.advance(&payload);
         assert!(m.attractor_detected());
         let huge: String = "type".repeat(10_000);
         m.advance(&huge);
@@ -2143,7 +2207,12 @@ mod tests {
         // form a `</tool_call>` prefix.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        m.advance("{\"x\": \"typetypetypetypetypetype");
+        // Structural skeleton loop (`":1,` × 8) trips the guard.
+        let mut payload = String::from("{");
+        for _ in 0..8 {
+            payload.push_str("\"k\":1,");
+        }
+        m.advance(&payload);
         assert!(m.attractor_detected());
 
         let vocab = vec![
@@ -2165,32 +2234,25 @@ mod tests {
     }
 
     #[test]
-    fn ngram_guard_catches_token_attractor_from_real_log() {
-        // Reproduce the exact byte pattern from the Pi log
-        // (transcript shared in conversation, args field of the
-        // failed `write` tool call):
+    fn ngram_guard_does_not_force_close_real_log_content_repetition() {
+        // The exact byte pattern from the Pi log (transcript shared in
+        // conversation, `content` field of the `write` tool call that
+        // produced empty `{}` args) — `pub fn BlinkHash(key_type: type, …`
+        // followed by a `type` run. This lives INSIDE the content string.
         //
-        //   "...pub fn BlinkHash(key_type: type, value_type: type)
-        //    typetypetypetypepub const NodeKind = enum(u2) {
-        //    pub fn BlinkHash(key_tpub const NodeKind = enum(u2) {
-        //        INTERNAL,
-        //    pub fn BlinkHash(key..."
-        //
-        // Two distinct attractors: 4-byte `type` × 4 and the longer
-        // `pub fn BlinkHash(key` phrase × 3+. We feed the chunk in
-        // its natural order; the guard should trip on the first
-        // attractor encountered.
+        // Old contract: the guard tripped here and force-closed `</tool_call>`,
+        // truncating the argument so the client parsed `{}`. New contract: the
+        // n-gram guard never inspects string-value bytes (it can't distinguish
+        // a real loop from legitimate repetitive code), so it does NOT trip —
+        // a genuinely looping write is instead bounded by `max_tokens`. This
+        // is the deliberate trade that fixes the write-tool empty-args bug.
         let mut m = Matcher::new(schemas(&["write"]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
-        // Extended to 6 repeats of `type` (24 bytes) to match the
-        // bumped threshold. The real-log signal had a much longer
-        // attractor run; 6 reps is still well under what production
-        // emits when this loop fires.
         let body = "{\"path\": \"/tmp/x.zig\", \"content\": \"pub fn BlinkHash(key_type: type, value_type: type) typetypetypetypetypetype";
         m.advance(body);
         assert!(
-            m.attractor_detected(),
-            "real-log attractor sequence must trip the guard"
+            !m.attractor_detected(),
+            "in-content repetition must NOT force-close the tool call"
         );
     }
 
