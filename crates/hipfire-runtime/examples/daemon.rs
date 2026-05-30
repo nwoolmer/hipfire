@@ -4681,7 +4681,9 @@ fn generate_dflash(
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
     let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
     let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-    let prefill_tok_s = if prefill_s > 0.0 { prompt_tokens.len() as f64 / prefill_s } else { 0.0 };
+    // New-token count (not full rendered length) so the prefill rate reflects
+    // actual work on a cache HIT/resume — matches every other path's numerator.
+    let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens.len() as f64 / prefill_s } else { 0.0 };
     let tau = if stats.cycles > 0 { stats.accepted_tokens as f64 / stats.cycles as f64 } else { 0.0 };
     // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
     // this branch) the `done` object must surface the bypass reason and
@@ -4706,7 +4708,14 @@ fn generate_dflash(
     let _ = writeln!(
         stdout,
         r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
-        id, generated, tok_s, prompt_tokens.len(),
+        // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
+        // through the model), NOT the full rendered length — the CLI computes
+        // `prompt_tokens = cached + prefill`, so reporting the full length here
+        // double-counted the cached prefix on every HIT/resume. `prefill_tokens`
+        // (= p.new_tokens) is already the suffix; `cached_tokens_dflash` is the
+        // reused prefix, so cached + new == full rendered length. Matches the AR
+        // path (6754) which reports its `prefill_tokens` (new_tokens.len()).
+        id, generated, tok_s, prefill_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
         tau, stats.cycles, cached_tokens_dflash, finish_reason, pflash_done_field,
     );
