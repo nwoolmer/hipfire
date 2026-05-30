@@ -1155,6 +1155,16 @@ struct LoadedModel {
     eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
+    /// Prefill checkpoints for divergent-render resume. Each holds a DeltaNet
+    /// recurrent-state snapshot + the seq_pos/compact_offset at which it was
+    /// captured, taken every `HIPFIRE_CACHE_CKPT_INTERVAL` tokens during
+    /// prefill. On a non-extension client render (history dropped/edited so the
+    /// prior conversation is no longer a prefix) the cache resumes from the
+    /// latest checkpoint ≤ lcp — re-prefilling only the tail — instead of a
+    /// full cold prefill. Bounded to `HIPFIRE_CACHE_CKPT_MAX` entries. Cleared
+    /// on full reset / unload (LoadedModel drop frees the GPU snapshots).
+    prefill_checkpoints: Vec<PrefillCheckpoint>,
+
     /// Per-turn token cache for V4F prefix-cache stability.
     ///
     /// Maps a stable fingerprint of an assistant message — `(role,
@@ -1203,6 +1213,81 @@ struct LoadedModel {
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
     chat_template: Option<String>,
+}
+
+/// One prefill checkpoint: a DeltaNet recurrent-state snapshot plus the physical
+/// `seq_pos` and KV `compact_offset` at which it was captured. Lets the prompt
+/// cache RESUME from this point on a divergent client render (one that dropped /
+/// edited earlier history, so the prior conversation is no longer a prefix of
+/// this prompt) instead of cold-prefilling from zero. The FullAttention KV for
+/// `[0..seq_pos]` stays resident (positional, never overwritten), so only the
+/// recurrent DeltaNet state needs snapshotting. See `checkpoint_dn` (capture)
+/// and the divergence branch in `generate` (restore).
+struct PrefillCheckpoint {
+    seq_pos: usize,
+    compact_offset: usize,
+    dn: DeltaNetSnapshot,
+}
+
+fn ckpt_resume_enabled() -> bool {
+    std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
+}
+fn ckpt_interval() -> usize {
+    std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+        .max(256)
+}
+fn ckpt_max() -> usize {
+    std::env::var("HIPFIRE_CACHE_CKPT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// Capture a DeltaNet checkpoint at the current `seq_pos` if at least
+/// `ckpt_interval()` tokens have elapsed since the last one. Bounded to
+/// `ckpt_max()` retained checkpoints (oldest evicted, its GPU buffers reused so
+/// there's no realloc churn after warmup). Cheap: one device-to-device memcpy
+/// of the recurrent state per checkpoint — no KV copy, since the FullAttention
+/// KV is positional and stays resident. Callers pass already-split field
+/// borrows so this composes inside the prefill loop where `kv`/`dn` hold
+/// disjoint `&mut` borrows of the model. No-op when checkpointing is disabled,
+/// at `seq_pos == 0`, or when the KV head is eviction-remapped
+/// (`compact_offset != 0`) — resume needs an un-remapped resident KV prefix.
+fn checkpoint_dn(
+    checkpoints: &mut Vec<PrefillCheckpoint>,
+    dn: &DeltaNetState,
+    gpu: &mut rdna_compute::Gpu,
+    seq_pos: usize,
+    compact_offset: usize,
+) {
+    if !ckpt_resume_enabled() || compact_offset != 0 || seq_pos == 0 {
+        return;
+    }
+    let interval = ckpt_interval();
+    let cap = ckpt_max();
+    match checkpoints.last().map(|c| c.seq_pos) {
+        Some(p) if seq_pos < p + interval => return,
+        Some(p) if p == seq_pos => return,
+        _ => {}
+    }
+    let mut snap = if checkpoints.len() >= cap {
+        // Reuse the oldest checkpoint's buffers (evict-oldest keeps the most
+        // recent `cap`, which minimizes replay for the common head-divergence).
+        checkpoints.remove(0).dn
+    } else {
+        match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+    if snap.save_from(dn, gpu).is_err() {
+        return;
+    }
+    checkpoints.push(PrefillCheckpoint { seq_pos, compact_offset, dn: snap });
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -2041,6 +2126,7 @@ fn main() {
                     }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
+                    m.prefill_checkpoints.clear();
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -2652,7 +2738,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2698,7 +2784,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2761,7 +2847,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2950,7 +3036,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -2984,7 +3070,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -3083,7 +3169,7 @@ fn load_model_safetensors(
             physical_cap: max_seq,
             eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
@@ -3153,7 +3239,7 @@ fn load_model_safetensors(
         physical_cap: effective_max_seq,
         eviction: None,
         conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(),
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
@@ -3287,7 +3373,7 @@ fn load_model_pp(
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(), decoded_vocab: None,
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -5631,28 +5717,86 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             );
         }
         if lcp < prior_len {
-            // Divergence — full reset and full prefill. DeltaNet
-            // non-reversible; treat as miss.
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
-            if let Some(ref dn) = m.dn_state {
-                for s in &dn.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            // Divergence: the client sent a non-extension render (it dropped or
+            // edited earlier history, so the prior conversation is no longer a
+            // prefix of this prompt). Rather than cold-prefill the whole thing,
+            // try to RESUME from the latest prefill checkpoint at or before
+            // `lcp`: restore the DeltaNet recurrent state captured there, rewind
+            // seq_pos + the KV write head, and re-prefill only
+            // [resume_pos..rendered.len()). KV for [0..resume_pos] is still
+            // resident (positional, never overwritten). Gated to the single-GPU,
+            // no-eviction case — eviction remaps physical KV slots, which would
+            // invalidate the resident prefix. `seq_pos < rendered.len()` on the
+            // chosen checkpoint guarantees ≥1 token is re-prefilled.
+            let evict_safe = m.pp <= 1
+                && m.eviction.is_none()
+                && m.kv_cache.as_ref().map(|k| k.compact_offset == 0).unwrap_or(true)
+                && m.llama_kv.as_ref().map(|k| k.compact_offset == 0).unwrap_or(true);
+            let resume_idx = if ckpt_resume_enabled() && evict_safe && m.dn_state.is_some() {
+                m.prefill_checkpoints
+                    .iter()
+                    .rposition(|c| c.seq_pos <= lcp && c.seq_pos < rendered.len())
+            } else {
+                None
+            };
+            let resumed = if let Some(idx) = resume_idx {
+                let rpos = m.prefill_checkpoints[idx].seq_pos;
+                let roff = m.prefill_checkpoints[idx].compact_offset;
+                let ok = if let (Some(ck), Some(dn)) =
+                    (m.prefill_checkpoints.get(idx), m.dn_state.as_mut())
+                {
+                    ck.dn.restore_to(dn, gpu).is_ok()
+                } else {
+                    false
+                };
+                if ok {
+                    m.seq_pos = rpos;
+                    if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = roff; }
+                    if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = roff; }
+                    m.conversation_tokens.truncate(rpos);
+                    m.prefill_checkpoints.truncate(idx + 1);
+                    cached_tokens_count = rpos;
+                    eprintln!(
+                        "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                        rpos, lcp, prior_len, rendered.len(), rendered.len() - rpos, rendered.len(),
+                    );
+                    Some(rendered[rpos..].to_vec())
+                } else {
+                    None
                 }
-                for s in &dn.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            } else {
+                None
+            };
+            match resumed {
+                Some(tail) => tail,
+                None => {
+                    // No usable checkpoint — full cold reset. DeltaNet recurrent
+                    // state is non-reversible; treat as a miss. Inlined (not
+                    // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
+                    // live here; these are disjoint field accesses.
+                    m.seq_pos = 0;
+                    m.conversation_tokens.clear();
+                    m.prefill_checkpoints.clear();
+                    if let Some(ref dn) = m.dn_state {
+                        for s in &dn.s_matrices {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.s_scales {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.conv_states {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                    }
+                    if let Some(kv) = m.kv_cache.as_mut() {
+                        kv.compact_offset = 0;
+                    }
+                    if let Some(kv) = m.llama_kv.as_mut() {
+                        kv.compact_offset = 0;
+                    }
+                    rendered
                 }
             }
-            if let Some(kv) = m.kv_cache.as_mut() {
-                kv.compact_offset = 0;
-            }
-            if let Some(kv) = m.llama_kv.as_mut() {
-                kv.compact_offset = 0;
-            }
-            rendered
         } else {
             // Pure extension or exact-match edge case. Adjust LCP back
             // by one if the new prompt is byte-identical to the cached
@@ -5803,6 +5947,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     None, None, None, None,
                 ).unwrap();
                 m.seq_pos += chunk.len();
+                // Snapshot the recurrent state every ckpt_interval() tokens so a
+                // later divergent render can resume here instead of cold. `dn`
+                // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
+                // fields, so this composes with the live kv/dn borrows.
+                checkpoint_dn(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, 0);
                 start = end;
             }
         }
@@ -5820,6 +5969,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             kv.compact_offset = 0;
             m.seq_pos = 0;
             m.conversation_tokens.clear();
+            m.prefill_checkpoints.clear();
             let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
             let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
             let _ = stdout.flush();
