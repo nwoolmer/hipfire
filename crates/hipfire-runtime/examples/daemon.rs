@@ -1588,7 +1588,18 @@ fn main() {
                             }
                         }
 
-                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
+                        // `cache_capable`: the daemon implements LCP prompt-cache
+                        // reuse for these arches' AR generate path (qwen3.5/3.6
+                        // = 5/6, deepseek4 = 9). The serve layer keys its
+                        // per-request `reset` decision off THIS flag rather than
+                        // a hardcoded arch-string allowlist, so a new
+                        // cache-capable arch (or an arch-string rename) can't
+                        // silently fall back to stateless reset-every-turn — the
+                        // exact failure that left the prompt cache dead when the
+                        // installed CLI predated the allowlist. Source of truth
+                        // lives here, next to the cache implementation.
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9);
+                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#, arch, dim, layers, vocab, vl, cache_capable);
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //
@@ -1983,6 +1994,9 @@ fn main() {
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
+                    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
+                    }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     // Multi-GPU branch: route per-LA-layer memsets through
@@ -4865,7 +4879,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // thinking requests there until DFlash continuation is implemented.
     let budgeted_thinking_needs_ar = max_think_tokens > 0
         && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
-    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
+    // Prompt-cache routing (2026-05-30). The DFlash decode path
+    // (`generate_dflash`) re-prefills the entire prompt from scratch on every
+    // request — it has no LCP prefix-cache reuse — so multi-turn agentic
+    // workloads pay a full cold prefill of the whole growing conversation each
+    // turn (measured: 197s to re-prefill a 22.5k-token agent context on
+    // gfx1151, `cached_tokens=0` every turn). The AR `generate` path below has
+    // a working LCP prefix cache. For chat-completions requests (which carry a
+    // `messages_history`), prefer the cache-capable AR path so every turn after
+    // the first reuses the prior KV — the dominant cost in agentic loops is
+    // prefill, not decode, so trading DFlash's ~2× decode for a warm prefill is
+    // a large net win. DFlash still serves the raw/no-history path. Force the
+    // DFlash decode path for chat with `HIPFIRE_DFLASH_CHAT=1` (accepts the
+    // no-cache cost; useful for native DFlash+cache-reuse work).
+    let prefer_cache_path = messages_history.is_some()
+        && std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() != Some("1");
+    if prefer_cache_path && m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
+        eprintln!(
+            "[dflash-route] chat request → AR cache path (DFlash has no prefix cache; set HIPFIRE_DFLASH_CHAT=1 to force DFlash decode)"
+        );
+    }
+    if !prefer_cache_path && m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -4905,6 +4939,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
+    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!("[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}", m.conversation_tokens.len(), m.seq_pos);
+    }
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
@@ -5224,6 +5261,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         && !pflash_active
         && !jinja_active
         && !m.conversation_tokens.is_empty();
+    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} !jinja={} conv_tok={}",
+            cache_eligible, cache_kill_switch, messages_history.is_some(),
+            m.eviction.is_none(), !pflash_active, !jinja_active, m.conversation_tokens.len(),
+        );
+    }
     let mut cached_tokens_count: usize = 0;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();

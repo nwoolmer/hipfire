@@ -1446,6 +1446,11 @@ async function serve(port: number, host: string) {
   // so the legacy Hermes `<tools>` block injection and ChatML
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
+  // Daemon-advertised prompt-cache capability (the `cache_capable` field on
+  // the `loaded` response). Source of truth for the per-request reset
+  // decision; null when an older daemon doesn't send it (we then fall back to
+  // the arch-string allowlist below).
+  let currentCacheCapable: boolean | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1513,6 +1518,7 @@ async function serve(port: number, host: string) {
         currentMaxSeq = warmLoadMsg.params.max_seq;
         modelHasVL = loadResult.vl === true;
         currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1613,9 +1619,17 @@ async function serve(port: number, host: string) {
         // `HIPFIRE_QWEN_PROMPT_CACHE=0` (qwen35 daemon also honors it,
         // so reset is harmless when the daemon-side cache is disabled
         // — we omit reset regardless to keep behavior symmetric).
-        const cacheCapable = currentArch === "deepseek4"
-          || currentArch === "qwen3_5"
-          || currentArch === "qwen3_5_moe";
+        // Prefer the daemon's advertised `cache_capable` flag (source of
+        // truth, next to the cache impl). Fall back to the arch-string
+        // allowlist only for older daemons that don't send the flag.
+        const cacheCapable = currentCacheCapable !== null
+          ? currentCacheCapable
+          : (currentArch === "deepseek4"
+            || currentArch === "qwen3_5"
+            || currentArch === "qwen3_5_moe");
+        if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
+          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
+        }
         if (!cacheCapable) {
           await e.send({ type: "reset" }); await e.recv();
         }
@@ -1908,6 +1922,8 @@ async function serve(port: number, host: string) {
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
+        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         }
 
         // Now that currentArch reflects the model we're ACTUALLY sending
