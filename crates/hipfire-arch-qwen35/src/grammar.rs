@@ -97,19 +97,51 @@ pub struct ToolSchema {
 const NGRAM_WINDOW: usize = 256;
 
 /// Minimum consecutive identical n-gram repeats that trigger the
-/// attractor flag. Set conservatively to 4 — legitimate JSON content
-/// (arrays of small ints, indented blocks) can hit 3-repeats; 4 is
-/// safely past the noise floor. The actual incident in production was
-/// `typetypetypetype` (4-byte gram × 4) and
-/// `pub fn BlinkHash(key_pub fn BlinkHash(key_…` (20-byte gram × 3+),
-/// both caught at this threshold.
-const NGRAM_MIN_REPEATS: usize = 4;
+/// attractor flag. **Default 6** — bumped from 4 on 2026-05-28 after a
+/// false-positive incident generating Zig code (legitimate
+/// indentation + repeated section markers tripped the guard mid-args,
+/// stranded the assistant in an empty tool call). Real attractors
+/// (e.g. `typetypetypetype` extended, repeated invocation snippets)
+/// run long and still trip at 6+. Override at startup via
+/// `HIPFIRE_QWEN35_NGRAM_MIN_REPEATS=<n>` if a workload needs tighter
+/// detection.
+const NGRAM_MIN_REPEATS_DEFAULT: usize = 6;
 
-/// Range of n-gram lengths probed each token (inclusive). 2-byte
-/// n-grams catch the tightest character-cycle attractors;
-/// 32-byte n-grams catch multi-token phrase loops.
-const NGRAM_LEN_MIN: usize = 2;
+/// Range of n-gram lengths probed each token (inclusive). **MIN
+/// bumped from 2 → 3** on 2026-05-28: 2-byte n-grams catch `  ` (two
+/// spaces) repeating, `\n\n`, `, ,`, etc. — pervasive in code and
+/// JSON. 3-byte grams still catch tight character cycles without the
+/// false-positive flood. 32-byte grams catch multi-token phrase loops.
+/// Override the lower bound with `HIPFIRE_QWEN35_NGRAM_LEN_MIN=<n>`.
+const NGRAM_LEN_MIN_DEFAULT: usize = 3;
 const NGRAM_LEN_MAX: usize = 32;
+
+/// Resolve `NGRAM_MIN_REPEATS` from env (`HIPFIRE_QWEN35_NGRAM_MIN_REPEATS`)
+/// or fall back to the default. Cached after the first read so the
+/// matcher's hot path doesn't pay an env-var read per token.
+fn ngram_min_repeats() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HIPFIRE_QWEN35_NGRAM_MIN_REPEATS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &usize| n >= 2 && n <= 32)
+            .unwrap_or(NGRAM_MIN_REPEATS_DEFAULT)
+    })
+}
+
+fn ngram_len_min() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HIPFIRE_QWEN35_NGRAM_LEN_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &usize| n >= 1 && n <= NGRAM_LEN_MAX)
+            .unwrap_or(NGRAM_LEN_MIN_DEFAULT)
+    })
+}
 
 /// Grammar matcher: state plus the bytes committed since the last
 /// firm transition. Construct via [`Matcher::new`] with the active
@@ -142,6 +174,24 @@ pub struct Matcher {
     /// know which required-field list to check against the args
     /// body bytes.
     current_tool: Option<usize>,
+    /// JSON brace depth inside the args body while in
+    /// [`State::InArgs`]. Starts at 0 on entry; the first `{` of the
+    /// args body increments to 1; the matching `}` brings it back to
+    /// 0. Used by `is_token_allowed` to block tokens that would
+    /// close the args body before required fields are satisfied —
+    /// the close marker check alone is insufficient because the
+    /// closing `}` of an empty `{}` body already commits before the
+    /// next-token `</tool_call>` is seen, so the empty args stream
+    /// to the client even when the close-marker token is rejected.
+    args_brace_depth: i32,
+    /// True while inside a JSON string in the args body. Toggled on
+    /// unescaped `"`. Used to ignore `{` / `}` inside string values
+    /// when updating `args_brace_depth`.
+    args_in_string: bool,
+    /// True if the previous byte in the args body was a backslash
+    /// inside a string. The next byte is then escaped (skip its
+    /// special meaning, e.g. `\"` does NOT close the string).
+    args_string_escape: bool,
 }
 
 impl Matcher {
@@ -154,6 +204,9 @@ impl Matcher {
             ngram_history: String::new(),
             attractor_detected: false,
             current_tool: None,
+            args_brace_depth: 0,
+            args_in_string: false,
+            args_string_escape: false,
         }
     }
 
@@ -195,6 +248,87 @@ impl Matcher {
         true
     }
 
+    /// Update the args-body brace/string tracking state by consuming
+    /// the bytes in `text`. Caller must guarantee the matcher is in
+    /// [`State::InArgs`]; this is enforced at the only call site
+    /// (`advance`). String-aware: `{` / `}` inside JSON strings do
+    /// NOT change brace depth, and `\"` does NOT close the string.
+    fn update_args_brace_state(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.args_string_escape {
+                self.args_string_escape = false;
+                continue;
+            }
+            if self.args_in_string {
+                match byte {
+                    b'\\' => self.args_string_escape = true,
+                    b'"' => self.args_in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.args_in_string = true,
+                b'{' => self.args_brace_depth += 1,
+                b'}' => self.args_brace_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Simulate the brace-state update for `text` WITHOUT mutating
+    /// `self`, and return whether the token would close the outer
+    /// args body (depth returns to 0 from a depth >= 1 reached at
+    /// or before this token). Used by `is_token_allowed` to reject
+    /// the `}` of an empty `{}` body before it commits.
+    ///
+    /// "Closes the args body" semantics:
+    ///   - If `args_brace_depth` was >= 1 before this token (we're
+    ///     already inside the body), any `}` bringing depth to 0
+    ///     counts as closing.
+    ///   - If `args_brace_depth` was 0 (haven't seen the first `{`
+    ///     yet), the token closes only if it opens then closes the
+    ///     body — i.e. it contains a `{` that raises depth to 1+
+    ///     and a matching `}` that brings depth back to 0. This is
+    ///     the empty-`{}` single-token case.
+    fn would_close_args_body(&self, text: &str) -> bool {
+        let mut depth = self.args_brace_depth;
+        let mut in_string = self.args_in_string;
+        let mut escape = self.args_string_escape;
+        let mut entered_body = self.args_brace_depth >= 1;
+        for byte in text.bytes() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                match byte {
+                    b'\\' => escape = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => {
+                    depth += 1;
+                    if depth >= 1 {
+                        entered_body = true;
+                    }
+                }
+                b'}' => {
+                    depth -= 1;
+                    if entered_body && depth <= 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// True iff the n-gram loop guard has tripped on the current
     /// [`State::InArgs`] body. Exposed for diagnostics; the daemon
     /// uses this to log the trip event.
@@ -204,20 +338,37 @@ impl Matcher {
 
     /// Detect consecutive identical n-gram repetition in the tail of
     /// `buf`. Returns `true` iff there's some `n` in
-    /// `[NGRAM_LEN_MIN, NGRAM_LEN_MAX]` such that the last
-    /// `n * NGRAM_MIN_REPEATS` bytes consist of the same `n`-byte
-    /// block repeated `NGRAM_MIN_REPEATS` times.
+    /// `[ngram_len_min(), NGRAM_LEN_MAX]` such that the last
+    /// `n * ngram_min_repeats()` bytes consist of the same `n`-byte
+    /// block repeated `ngram_min_repeats()` times. The lower bound on
+    /// `n` and the repeat threshold come from env-tunable knobs
+    /// (`HIPFIRE_QWEN35_NGRAM_LEN_MIN`, `HIPFIRE_QWEN35_NGRAM_MIN_REPEATS`)
+    /// with the cached defaults (3 and 6 respectively).
+    ///
+    /// **Uniform-byte filter:** n-grams that consist of a single
+    /// repeated character (e.g. `   ` for whitespace, `===` for
+    /// dividers) are skipped — long runs of the same byte are
+    /// pervasive in code (indentation, section markers) and never
+    /// indicate an attractor. Real attractors (`type`, `pub fn`, etc.)
+    /// have non-uniform grams.
     fn detect_ngram_loop(buf: &str) -> bool {
         let bytes = buf.as_bytes();
-        for ngram_len in NGRAM_LEN_MIN..=NGRAM_LEN_MAX {
-            let needed = ngram_len * NGRAM_MIN_REPEATS;
+        let len_min = ngram_len_min();
+        let min_repeats = ngram_min_repeats();
+        for ngram_len in len_min..=NGRAM_LEN_MAX {
+            let needed = ngram_len * min_repeats;
             if bytes.len() < needed {
                 continue;
             }
             let tail = &bytes[bytes.len() - needed..];
             let first = &tail[..ngram_len];
+            // Skip uniform-byte grams — they fire on legit indentation
+            // and divider runs without signaling a real loop.
+            if Self::is_uniform_byte(first) {
+                continue;
+            }
             let mut all_match = true;
-            for r in 1..NGRAM_MIN_REPEATS {
+            for r in 1..min_repeats {
                 let chunk = &tail[r * ngram_len..(r + 1) * ngram_len];
                 if chunk != first {
                     all_match = false;
@@ -229,6 +380,15 @@ impl Matcher {
             }
         }
         false
+    }
+
+    /// True iff every byte in `chunk` is the same value (e.g. `   `,
+    /// `===`, `\t\t\t`). Empty slice is vacuously uniform.
+    fn is_uniform_byte(chunk: &[u8]) -> bool {
+        match chunk.first() {
+            Some(&first) => chunk.iter().all(|&b| b == first),
+            None => true,
+        }
     }
 
     /// Push bytes into the n-gram history buffer and run detection.
@@ -405,8 +565,17 @@ impl Matcher {
                 if !self.required_fields_satisfied() {
                     // Block close-marker prefix tokens entirely; allow
                     // any other content so the model can keep emitting
-                    // until required fields appear in the body.
+                    // until required fields appear in the body. Also
+                    // block any token that would close the args body
+                    // (`}` bringing brace depth to 0) — without this
+                    // gate the closing `}` of an empty `{}` body
+                    // commits as args content, and even though the
+                    // following `</tool_call>` token is rejected, the
+                    // already-streamed `arguments: {}` lands at the
+                    // OpenAI API as a malformed tool call.
                     if Self::touches_close_marker(&combined) {
+                        false
+                    } else if self.would_close_args_body(text) {
                         false
                     } else {
                         true
@@ -514,6 +683,7 @@ impl Matcher {
         }
         if matches!(self.state, State::InArgs) {
             self.update_ngram_history(text);
+            self.update_args_brace_state(text);
         }
         self.partial_buf.push_str(text);
 
@@ -544,7 +714,10 @@ impl Matcher {
                 // growing without bound during long free-emission runs.
                 let max_keep = "<tool_call>".len() - 1;
                 if self.partial_buf.len() > max_keep {
-                    let drop = self.partial_buf.len() - max_keep;
+                    let drop = Self::drain_boundary(
+                        &self.partial_buf,
+                        self.partial_buf.len() - max_keep,
+                    );
                     self.partial_buf.drain(..drop);
                 }
                 Transition::Stay
@@ -562,6 +735,9 @@ impl Matcher {
                         self.partial_buf = rest_owned;
                         self.state = State::InArgs;
                         self.current_tool = Some(idx);
+                        self.args_brace_depth = 0;
+                        self.args_in_string = false;
+                        self.args_string_escape = false;
                         return Transition::Advanced;
                     }
                 }
@@ -582,11 +758,17 @@ impl Matcher {
                     self.ngram_history.clear();
                     self.attractor_detected = false;
                     self.current_tool = None;
+                    self.args_brace_depth = 0;
+                    self.args_in_string = false;
+                    self.args_string_escape = false;
                     return Transition::Advanced;
                 }
                 let max_keep = "</tool_call>".len() - 1;
                 if self.partial_buf.len() > max_keep {
-                    let drop = self.partial_buf.len() - max_keep;
+                    let drop = Self::drain_boundary(
+                        &self.partial_buf,
+                        self.partial_buf.len() - max_keep,
+                    );
                     self.partial_buf.drain(..drop);
                 }
                 Transition::Stay
@@ -598,6 +780,25 @@ impl Matcher {
 enum Transition {
     Stay,
     Advanced,
+}
+
+impl Matcher {
+    /// Round `desired` UP to the next UTF-8 char boundary in `s`.
+    /// Required because `String::drain(..n)` panics if `n` straddles
+    /// a multi-byte codepoint — and tool_call args can contain
+    /// arbitrary UTF-8 (Pi sessions hit this when the model pulled
+    /// `𝐵link-hash` from a PDF into a write tool body). Returns
+    /// at most `s.len()` so the drain never overshoots.
+    fn drain_boundary(s: &str, desired: usize) -> usize {
+        if desired >= s.len() {
+            return s.len();
+        }
+        let mut idx = desired;
+        while idx < s.len() && !s.is_char_boundary(idx) {
+            idx += 1;
+        }
+        idx
+    }
 }
 
 #[cfg(test)]
@@ -1446,14 +1647,14 @@ mod tests {
 
     #[test]
     fn ngram_guard_catches_short_char_attractor() {
-        // The `typetypetypetype` pattern. 4-byte gram × 4 = 16
-        // bytes — must trip the guard.
+        // The `typetypetypetype...` pattern at the bumped threshold
+        // (6 repeats). 4-byte gram × 6 = 24 bytes.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         assert!(matches!(m.state(), State::InArgs));
         assert!(!m.attractor_detected(), "guard should be clean on entry");
-        m.advance("{\"content\": \"typetypetypetype");
-        assert!(m.attractor_detected(), "should detect 4-byte × 4 repetition");
+        m.advance("{\"content\": \"typetypetypetypetypetype");
+        assert!(m.attractor_detected(), "should detect 4-byte × 6 repetition");
         // Once flagged, the matcher is no longer free — even prose
         // tokens get rejected.
         assert!(!m.is_free());
@@ -1467,7 +1668,7 @@ mod tests {
     #[test]
     fn ngram_guard_catches_long_phrase_attractor() {
         // The `pub fn BlinkHash(key_pub fn BlinkHash(key_...` pattern.
-        // Use a 20-byte gram × 4 repeats; the guard scans up to 32-byte
+        // 20-byte gram × 6 repeats; the guard scans up to 32-byte
         // grams so this must trip.
         let mut m = Matcher::new(schemas(&["write"]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
@@ -1477,24 +1678,73 @@ mod tests {
         // Emit some valid prefix, then the attractor.
         m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"");
         let mut payload = String::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             payload.push_str(phrase);
         }
         m.advance(&payload);
         assert!(
             m.attractor_detected(),
-            "should detect 20-byte phrase × 4 repetition"
+            "should detect 20-byte phrase × 6 repetition"
         );
     }
 
     #[test]
     fn ngram_guard_does_not_trip_on_3_repeats() {
-        // Threshold is 4 repeats. A 3-repeat sequence — legitimate in
-        // arrays like `[1,1,1]` or `{a:0,a:0,a:0}` — must NOT trip.
+        // Threshold is 6 repeats (was 4). A 3-repeat sequence —
+        // legitimate in arrays like `[1,1,1]` — must NOT trip.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         m.advance("{\"arr\": [1,1,1]}");
         assert!(!m.attractor_detected(), "3-repeats must stay below threshold");
+    }
+
+    #[test]
+    fn ngram_guard_does_not_trip_on_5_repeats() {
+        // The threshold bump (4 → 6) means 5 repeats — close to the
+        // boundary — still must NOT trip. Locks in the regression
+        // signal if anyone reverts the bump without thinking.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
+        // 4-byte gram × 5 = 20 bytes; under the new default of 6.
+        m.advance("{\"x\": \"typetypetypetypetype");
+        assert!(!m.attractor_detected(), "5-repeats must stay below the bumped threshold");
+    }
+
+    #[test]
+    fn ngram_guard_does_not_trip_on_double_newline_blocks() {
+        // Code emission with multiple `\n\n` between definitions
+        // (2-byte gram × 4) — was the production false positive that
+        // motivated the LEN_MIN bump from 2 → 3. Must NOT trip.
+        let mut m = Matcher::new(schemas(&["write"]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"fn a(){}\\n\\nfn b(){}\\n\\nfn c(){}\\n\\nfn d(){}\\n\\nfn e(){}");
+        // `\n\n` repeats 4 times — under old defaults this tripped on
+        // legit code emitted between blank-separated declarations.
+        assert!(!m.attractor_detected(), "double-newline blocks between defs must NOT trip");
+    }
+
+    #[test]
+    fn ngram_guard_does_not_trip_on_deep_indentation() {
+        // Long whitespace runs are part of normal indented code. The
+        // detector's uniform-byte filter (`is_uniform_byte`) skips
+        // n-grams consisting of one repeated character — so a 64-space
+        // indent does not trip the guard regardless of length.
+        let mut m = Matcher::new(schemas(&["write"]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        // 64 spaces — deeper than any realistic indent.
+        m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"return                                                                ; ");
+        assert!(!m.attractor_detected(), "uniform whitespace runs must NOT trip the guard");
+    }
+
+    #[test]
+    fn ngram_guard_does_not_trip_on_ascii_divider_runs() {
+        // ASCII dividers (`====`, `----`, `####`) are common in code
+        // comments and section headers. Same uniform-byte filter as
+        // whitespace — must NOT trip.
+        let mut m = Matcher::new(schemas(&["write"]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{\"path\": \"/tmp/x.zig\", \"content\": \"// ============================================================\\n// section\\n");
+        assert!(!m.attractor_detected(), "ASCII divider runs must NOT trip the guard");
     }
 
     #[test]
@@ -1513,7 +1763,7 @@ mod tests {
         // doesn't inherit it.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        m.advance("{\"x\": \"typetypetypetype");
+        m.advance("{\"x\": \"typetypetypetypetypetype");
         assert!(m.attractor_detected());
         // Force-close (the daemon's sample mask would have driven the
         // model here).
@@ -1571,6 +1821,146 @@ mod tests {
         // model can recover by emitting the missing fields.
         assert!(m.is_token_allowed("\"path"));
         assert!(m.is_token_allowed("anything else"));
+    }
+
+    // ─── Args-body close-brace guard ───────────────────────────────
+    //
+    // The close-marker guard alone is insufficient: the `}` that
+    // closes the empty `{}` args body commits BEFORE the next-token
+    // `</tool_call>` is checked, so the truncated args body
+    // (`arguments: {}`) reaches the OpenAI API as a malformed tool
+    // call even after the close marker is correctly rejected. The
+    // brace-depth guard rejects the closing `}` itself when
+    // required fields are not yet satisfied.
+
+    #[test]
+    fn args_body_close_brace_blocked_when_required_missing() {
+        // Model has just emitted `{`. Brace depth = 1, body open.
+        // Next-token `}` would close the body with no required
+        // fields present — must be rejected.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{");
+        // brace depth = 1, no required fields seen
+        assert!(!m.is_token_allowed("}"));
+        assert!(!m.is_token_allowed("}\n"));
+        // Other content is allowed.
+        assert!(m.is_token_allowed("\"path\":\"/tmp/x\""));
+    }
+
+    #[test]
+    fn args_body_close_brace_blocks_empty_args_single_token() {
+        // The exact production failure: the `write` tool emits `{}`
+        // as a single token, then `\n</tool_call>` as a second
+        // token. The close marker is correctly rejected, but the
+        // `{}` already streamed → `arguments: {}` lands at the API.
+        // The brace-depth guard rejects the single-token `{}` itself.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        // The matcher must reject the empty-args token before it
+        // commits — because once it commits, the truncated tool_call
+        // already has the malformed shape on the wire.
+        assert!(!m.is_token_allowed("{}"));
+        assert!(!m.is_token_allowed("{ }"));
+        assert!(!m.is_token_allowed("{}\n"));
+    }
+
+    #[test]
+    fn args_body_close_brace_allowed_when_required_satisfied() {
+        // Once required fields appear in the body, the matcher must
+        // allow the closing `}` and the close marker. The all-in-one
+        // single token also works.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{\"path\":\"/tmp/x\",\"content\":\"hello\"");
+        // Both `"path"` and `"content"` present in ngram_history.
+        assert!(m.is_token_allowed("}"));
+        assert!(m.is_token_allowed("}\n</tool_call>"));
+    }
+
+    #[test]
+    fn args_body_close_brace_allows_nested_object_close() {
+        // Nested objects: a `}` that closes an inner object (depth
+        // 2 → 1) MUST be allowed regardless of required-field state
+        // because it doesn't close the outer args body.
+        let mut m = Matcher::new(schemas_with_required(&[("apply", &["edits"])]));
+        m.advance("<tool_call>\n{\"name\": \"apply\", \"arguments\": ");
+        m.advance("{\"edits\":[{\"line\":1,\"text\":\"foo\"");
+        // Now at depth 3 (outer args, edits array's first object).
+        // Closing the inner object `}` → depth 2. Required `"edits"`
+        // is already in ngram_history (it's the key in args body),
+        // so this would be allowed even without the depth check —
+        // but the test exists to lock the "nested closes don't fire
+        // the guard" behavior.
+        assert!(m.is_token_allowed("}"));
+        // Closing the array `]` → depth 2 (no change to braces).
+        assert!(m.is_token_allowed("]"));
+    }
+
+    #[test]
+    fn args_body_close_brace_ignores_braces_in_strings() {
+        // `{` / `}` inside JSON string literals must not affect
+        // brace depth. The guard's string-aware tracking is what
+        // keeps `{"content":"a}b"}` from being misread as closing
+        // the body at the `}b` byte.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{\"path\":\"/tmp/x\",\"content\":\"a}b{c");
+        // String is unterminated; depth is 1, in_string is true.
+        // Closing the string then the body should be allowed because
+        // required fields are present.
+        assert!(m.is_token_allowed("\"}"));
+    }
+
+    #[test]
+    fn args_body_close_brace_ignores_escaped_quote_in_string() {
+        // `\"` inside a string MUST NOT toggle in_string off.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        // Backslash-escaped quote inside path value — string stays open.
+        m.advance("{\"path\":\"he said \\\"hi\\\"\",\"content\":\"x\"");
+        // Both fields present, brace depth still 1, can close.
+        assert!(m.is_token_allowed("}"));
+    }
+
+    #[test]
+    fn args_body_close_brace_via_token_mask() {
+        // Production-style: the mask must block both `{}` and `}`
+        // (which alone closes the body once depth >= 1) when
+        // required fields aren't yet present.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        let vocab = vec![
+            "{}".to_string(),       // empty body single token — block
+            "{ }".to_string(),      // empty body with space — block
+            "{".to_string(),        // body open — allow
+            "\"path\"".to_string(), // field name — allow
+            "garbage".to_string(),  // arbitrary content — allow
+        ];
+        let mut mask = vec![false; vocab.len()];
+        m.token_mask(&vocab, &mut mask);
+        assert!(!mask[0], "empty `{{}}` body must be blocked");
+        assert!(!mask[1], "empty `{{ }}` body must be blocked");
+        assert!(mask[2], "body-open `{{` must be allowed");
+        assert!(mask[3], "field name `\"path\"` must be allowed");
+        assert!(mask[4], "arbitrary args content must be allowed");
+    }
+
+    #[test]
+    fn args_body_brace_tracking_resets_on_close_marker() {
+        // After a full tool_call cycle, the matcher returns to Out
+        // and the brace tracking state must reset so a SECOND
+        // tool_call's empty `{}` body is still caught.
+        let mut m = Matcher::new(schemas_with_required(&[("write", &["path", "content"])]));
+        // First tool call — completes cleanly.
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        m.advance("{\"path\":\"/a\",\"content\":\"b\"}");
+        m.advance("\n</tool_call>");
+        assert!(matches!(m.state(), State::Out));
+        // Second tool call attempt — empty body must be blocked again.
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        assert!(matches!(m.state(), State::InArgs));
+        assert!(!m.is_token_allowed("{}"));
     }
 
     #[test]
@@ -1677,6 +2067,42 @@ mod tests {
     }
 
     #[test]
+    fn utf8_in_args_body_does_not_panic_on_buffer_trim() {
+        // Regression for production panic at
+        // `crates/hipfire-arch-qwen35/src/grammar.rs:590` —
+        // Pi pulled `𝐵link-hash` from a PDF into a write tool's
+        // content arg. The InArgs partial-buf trim used a byte
+        // offset that straddled the 4-byte `𝐵` codepoint, and
+        // `String::drain(..n)` panicked because `n` wasn't a
+        // char boundary. The fix rounds to the next char
+        // boundary.
+        let mut m = Matcher::new(schemas(&["write"]));
+        m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
+        // Emit a long body with multi-byte UTF-8 (4-byte
+        // codepoint U+1D435 `𝐵`, repeated past max_keep).
+        let mut body = String::from("{\"content\":\"");
+        for _ in 0..50 {
+            body.push('𝐵'); // 4 bytes in UTF-8
+        }
+        body.push_str("\"}");
+        // This advance previously panicked at the buffer trim.
+        m.advance(&body);
+        // No panic = test passes. Verify we're still in a valid state.
+        assert!(matches!(m.state(), State::InArgs));
+    }
+
+    #[test]
+    fn utf8_in_long_prose_does_not_panic_in_out_state() {
+        // Same fix applies to Out-state trim. Long Unicode prose
+        // before any tool_call should be safely trimmed.
+        let mut m = Matcher::new(schemas(&["write"]));
+        let prose: String = "α𝐵γδε".repeat(20);
+        m.advance(&prose);
+        // No panic; we're still in Out.
+        assert!(matches!(m.state(), State::Out));
+    }
+
+    #[test]
     fn current_tool_set_on_in_args_transition() {
         // The matcher must track which tool's schema we're inside.
         let mut m = Matcher::new(schemas_with_required(&[
@@ -1702,7 +2128,7 @@ mod tests {
         // Even after the guard trips, additional advance calls
         // shouldn't keep growing the history (update_ngram_history
         // short-circuits when the flag is set).
-        m.advance("{\"x\": \"typetypetypetype");
+        m.advance("{\"x\": \"typetypetypetypetypetype");
         assert!(m.attractor_detected());
         let huge: String = "type".repeat(10_000);
         m.advance(&huge);
@@ -1717,7 +2143,7 @@ mod tests {
         // form a `</tool_call>` prefix.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
-        m.advance("{\"x\": \"typetypetypetype");
+        m.advance("{\"x\": \"typetypetypetypetypetype");
         assert!(m.attractor_detected());
 
         let vocab = vec![
@@ -1756,7 +2182,11 @@ mod tests {
         // attractor encountered.
         let mut m = Matcher::new(schemas(&["write"]));
         m.advance("<tool_call>\n{\"name\": \"write\", \"arguments\": ");
-        let body = "{\"path\": \"/tmp/x.zig\", \"content\": \"pub fn BlinkHash(key_type: type, value_type: type) typetypetypetype";
+        // Extended to 6 repeats of `type` (24 bytes) to match the
+        // bumped threshold. The real-log signal had a much longer
+        // attractor run; 6 reps is still well under what production
+        // emits when this loop fires.
+        let body = "{\"path\": \"/tmp/x.zig\", \"content\": \"pub fn BlinkHash(key_type: type, value_type: type) typetypetypetypetypetype";
         m.advance(body);
         assert!(
             m.attractor_detected(),

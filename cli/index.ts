@@ -2756,10 +2756,66 @@ async function serve(port: number, host: string) {
                 safeRelease();
               }
             },
-            cancel() { streamCancelled = true; } // lock released in finally after generation drains
+            // Streaming branch cancel. Set the local flag so the for-await
+            // loop drains daemon events without writing more SSE chunks,
+            // AND send `{type:"abort","id":"<reqId>"}` to the daemon so its
+            // prefill chunk loop bails at the next checkpoint. Same protocol
+            // as the non-stream branch — see project_daemon_abort_protocol
+            // memory + cli/index.ts:3034. Without this, Pi/opencode/etc.
+            // dropping a streaming connection mid-prefill leaves the daemon
+            // burning the full 23K-token re-prefill while no client is
+            // listening, locking out the next request for several minutes.
+            async cancel() {
+              console.error(`[hipfire] stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+              streamCancelled = true;
+              try {
+                await e.send({ type: "abort", id: reqId });
+                console.error(`[hipfire] abort sent (reqId=${reqId})`);
+              } catch (err: any) {
+                console.error(`[hipfire] stream abort send failed: ${err?.message || err}`);
+              }
+            }
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
+        // Non-stream chat-completion with heartbeat. The OpenAI-style
+        // non-streaming response is a single JSON body, but Bun's
+        // server-side connection idleTimeout is capped at 255s — and
+        // on 27B with a 30K+-token agent context the daemon's prefill
+        // (one synchronous device call per chunk, zero events until
+        // first sampled token) sits silent for 3–5 minutes. The Bun
+        // socket then idle-closes and the client (Pi, opencode, etc.)
+        // sees "terminated".
+        //
+        // Fix: deliver the response body via a `ReadableStream` and
+        // emit a single space byte every 10s before the JSON is ready.
+        // JSON RFC 8259 §2 allows whitespace anywhere between value
+        // tokens, so a leading-space prefix parses identically on any
+        // lenient JSON client. Each byte enqueued resets Bun's idle
+        // timer. Errors thrown inside the worker land in the catch
+        // and emit a JSON error body (status stays 200 because the
+        // header has already been sent — clients should check for the
+        // `error` field, matching the existing streaming-error
+        // convention).
+        const nsEnc = new TextEncoder();
+        // `nsClientAborted` is set by the ReadableStream's `cancel()`
+        // callback when the client closes the socket (curl `-m` timeout,
+        // Pi / opencode giving up, etc.). The worker checks this flag in
+        // its event loop and stops processing tokens / building the
+        // response — but it MUST keep draining `e.generate` until the
+        // daemon's `done` event lands. Skipping the drain leaves the
+        // EngineConnection with stale events queued for the NEXT
+        // request, which would corrupt that request's response.
+        // Same pattern as the streaming branch (cli/index.ts:2518).
+        let nsClientAborted = false;
+        const nsResponse = new Response(new ReadableStream({
+          async start(ctrl) {
+            let bodyDelivered = false;
+            const heartbeat = setInterval(() => {
+              if (bodyDelivered) return;
+              try { ctrl.enqueue(nsEnc.encode(" ")); } catch {}
+            }, 10_000);
+            try {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
@@ -2781,6 +2837,7 @@ async function serve(port: number, host: string) {
         let reasoningContent = "";
         let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
+          if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
           if (msg.type === "token") { content += msg.text; completionTokens++; }
           else if (msg.type === "reasoning") {
             // V4F's StreamParser splits `<think>…</think>` content out
@@ -2962,7 +3019,48 @@ async function serve(port: number, host: string) {
           delete (choice as any)._truncation;
           responseBody.truncation = nonStreamTrunc;
         }
-        return Response.json(responseBody);
+              bodyDelivered = true;
+              ctrl.enqueue(nsEnc.encode(JSON.stringify(responseBody)));
+              ctrl.close();
+            } catch (err: any) {
+              bodyDelivered = true;
+              safeRelease();
+              try {
+                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: err?.message || "internal error" })));
+              } catch {}
+              try { ctrl.close(); } catch {}
+            } finally {
+              clearInterval(heartbeat);
+            }
+          },
+          // Fires when the HTTP client closes the connection (curl
+          // hit its `-m` cap, Pi / opencode gave up after their own
+          // timeout, etc.).
+          //
+          // Two actions happen here:
+          //   1. Send `{type:"abort","id":"<reqId>"}` to the daemon.
+          //      The daemon's background stdin reader picks this up
+          //      asynchronously and signals the prefill chunk loop
+          //      to bail at the next chunk boundary (~5 s latency
+          //      on gfx1151 at 50 tps). The daemon emits `aborted`
+          //      + `done` events to terminate the generation.
+          //   2. Set `nsClientAborted = true` so the for-await loop
+          //      drains remaining daemon events (the aborted/done)
+          //      WITHOUT accumulating them into the response. This
+          //      keeps the EngineConnection's event queue clean for
+          //      the next request.
+          async cancel() {
+            console.error(`[hipfire] non-stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+            nsClientAborted = true;
+            try {
+              await e.send({ type: "abort", id: reqId });
+              console.error(`[hipfire] abort sent (reqId=${reqId})`);
+            } catch (err: any) {
+              console.error(`[hipfire] abort send failed: ${err?.message || err}`);
+            }
+          }
+        }), { headers: { "Content-Type": "application/json" } });
+        return nsResponse;
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });

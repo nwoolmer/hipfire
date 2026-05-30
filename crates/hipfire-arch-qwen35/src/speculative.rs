@@ -4977,6 +4977,57 @@ pub fn seed_target_hidden_from_prompt(
     Ok(())
 }
 
+/// Abortable variant of `seed_target_hidden_from_prompt`. Manually
+/// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
+/// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
+/// (state has been fully reset — caller should NOT continue with
+/// decode), `Ok(false)` on normal completion. The chunked path matches
+/// the kernel-internal sub-batch size, so per-chunk throughput is the
+/// same as the one-shot variant; the only overhead is one
+/// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
+///
+/// Used by the daemon's `generate_dflash` to honor client-side
+/// cancellation on long-context retries (cache-miss scenarios where
+/// the full conversation must be re-prefilled from scratch).
+pub fn seed_target_hidden_from_prompt_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    prompt_tokens: &[u32],
+    abort_check: &dyn Fn() -> bool,
+) -> HipResult<bool> {
+    target.reset_state(gpu);
+    target_hidden_host.clear();
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut seq_pos: usize = 0;
+    while seq_pos < prompt_tokens.len() {
+        if abort_check() {
+            target.reset_state(gpu);
+            target_hidden_host.clear();
+            return Ok(true);
+        }
+        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
+        let chunk = &prompt_tokens[seq_pos..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            seq_pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None, None, None,
+        )?;
+        let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
+        target_hidden_host.extend_from_slice(&block);
+        seq_pos = end;
+    }
+    Ok(false)
+}
+
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
 /// `target_hidden` and `target_hidden_abs_positions`, so the draft's cross-
 /// attention sees the same subset of context target now has.

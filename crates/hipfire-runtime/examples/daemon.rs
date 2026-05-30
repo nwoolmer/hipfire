@@ -44,7 +44,44 @@ use base64::Engine;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Instant;
+
+/// Abort-target request ID. Set asynchronously by the background
+/// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
+/// consumed and cleared by `check_abort()` from the main thread's
+/// prefill chunk loop. Using an Option<String> rather than a bool
+/// makes the abort targeted — stale aborts from a prior request
+/// can't kill a new request that happens to be running by the time
+/// the message lands.
+fn abort_for_id() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// True if the in-flight request with `req_id` has been aborted.
+/// Clears the flag on match so the next request with the same ID
+/// (unlikely but possible — CLI generates request IDs) starts clean.
+fn check_abort(req_id: &str) -> bool {
+    let mut g = abort_for_id().lock().unwrap();
+    if g.as_deref() == Some(req_id) {
+        *g = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Message types pushed from the stdin-reader thread to the main
+/// processing loop. Abort messages are NOT forwarded — they're
+/// handled inline in the reader thread by setting `abort_for_id()`.
+/// This is what lets the abort signal interrupt a mid-flight prefill;
+/// the main loop is blocked on prefill compute and would only see
+/// new stdin lines after that prefill completed.
+enum DaemonMsg {
+    Regular(serde_json::Value),
+    ParseError(String),
+}
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
@@ -1163,19 +1200,47 @@ fn main() {
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
 
-    let stdin = std::io::stdin();
+    // Background stdin reader. Drains stdin into an mpsc channel so
+    // the main loop can pull non-blockingly between messages. Abort
+    // messages (`{type:"abort","id":"..."}`) are NOT forwarded; the
+    // reader handles them inline by setting `abort_for_id()`. This is
+    // the channel that makes client-side cancellation actually stop
+    // an in-flight prefill — without it, the main loop is blocked on
+    // GPU compute and wouldn't even read the abort line until after
+    // the prefill completed.
+    let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let lock = stdin.lock();
+        for line in lock.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() { continue; }
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(msg) => {
+                    if msg.get("type").and_then(|v| v.as_str()) == Some("abort") {
+                        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            eprintln!("[daemon-abort] received abort for id={}", id);
+                            *abort_for_id().lock().unwrap() = Some(id.to_string());
+                        }
+                        continue;
+                    }
+                    if msg_tx.send(DaemonMsg::Regular(msg)).is_err() { break; }
+                }
+                Err(e) => {
+                    if msg_tx.send(DaemonMsg::ParseError(e.to_string())).is_err() { break; }
+                }
+            }
+        }
+    });
     let mut stdout = std::io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() { continue; }
-
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
+    while let Ok(daemon_msg) = msg_rx.recv() {
+        let msg = match daemon_msg {
+            DaemonMsg::Regular(m) => m,
+            DaemonMsg::ParseError(e) => {
                 let _ = writeln!(stdout, r#"{{"type":"error","message":"invalid JSON: {}"}}"#, e);
                 let _ = stdout.flush();
                 continue;
@@ -3582,19 +3647,43 @@ fn generate_dflash(
         return;
     }
 
-    // Seed target_hidden via the demo's helper — runs a per-token prefill
-    // with hidden extraction into hidden_rb, then downloads prompt-length
-    // worth of rows into target_hidden_host. The draft's first forward
-    // uses these as context.
-    if let Err(e) = speculative::seed_target_hidden_from_prompt(
+    // Seed target_hidden via the demo's helper — runs a chunked prefill
+    // with hidden extraction into hidden_rb, then downloads chunk-by-chunk
+    // into target_hidden_host. The draft's first forward uses these as
+    // context.
+    //
+    // Abortable variant: the prefill chunks at PREFILL_MAX_BATCH (256)
+    // boundaries and checks `abort_for_id()` between chunks. On client
+    // cancellation, state is fully reset (DeltaNet non-reversible) and
+    // we return early — no decode, no tokens emitted to the wire.
+    let id_for_abort = id.to_string();
+    let aborted = match speculative::seed_target_hidden_from_prompt_abortable(
         gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
+        &|| check_abort(&id_for_abort),
     ) {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
-        let _ = stdout.flush();
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            return;
+        }
+    };
+    if aborted {
+        // Full state reset on abort. Return target's reset state to m
+        // and emit aborted+done events for the CLI's drain loop.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+        let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
+        let _ = stdout.flush();
         return;
     }
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
@@ -3789,6 +3878,16 @@ fn generate_dflash(
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
+        // Decode-side abort (dflash path). See the matching block in
+        // `generate()` for rationale. Without this, a Pi cancel
+        // mid-decode leaves the spec-decode loop running for max_tokens
+        // worth of wasted work.
+        if check_abort(id) {
+            let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+            let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0,"dflash":true}}"#, id, generated);
+            let _ = stdout.flush();
+            return;
+        }
         if position + df.block_size >= ctx_capacity { break; }
 
         // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
@@ -5298,10 +5397,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // physical_cap. Chunk size caps out at physical capacity available —
         // when physical is at post-evict `budget`, a full `beta`-sized chunk
         // can run before the next eviction fires.
+        // Prefill loop with abort support. The CLI sends
+        // `{type:"abort","id":"..."}` when the HTTP client closes the
+        // connection (curl `-m` timeout, Pi/opencode response timer
+        // fired, etc.); the stdin reader thread sets the abort flag
+        // and the chunk loop below picks it up. The no-eviction path
+        // is manually chunked at PREFILL_MAX_BATCH so abort latency
+        // is bounded to one chunk (~5 s on gfx1151 at 50 tps).
+        //
+        // On abort, DeltaNet's non-reversible state means we can't
+        // rewind to the pre-prefill position — full reset (seq_pos=0,
+        // conversation_tokens cleared, DN s/conv buffers zeroed,
+        // KV compact_offset=0). Next request hits cache miss and
+        // does a full re-prefill from scratch, which is the same cost
+        // as letting the abandoned prefill drain — but the client
+        // gets control back immediately instead of waiting.
+        let mut prefill_aborted = false;
         if let Some(ref ev) = m.eviction {
             let window = ev.budget() + ev.beta();
             let mut remaining: &[u32] = &new_tokens;
             while !remaining.is_empty() {
+                if check_abort(id) { prefill_aborted = true; break; }
                 let space = window.saturating_sub(m.seq_pos).max(1);
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
@@ -5316,11 +5432,42 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 remaining = rest;
             }
         } else {
-            qwen35::forward_prefill_batch(
-                gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
-                None, None, None, None,
-            ).unwrap();
-            m.seq_pos += new_tokens.len();
+            // Manually chunk the no-eviction prefill so the abort
+            // check fires between batches. PREFILL_MAX_BATCH (256)
+            // is the same boundary the kernel uses internally so
+            // chunking here doesn't change the GPU-side work.
+            let chunk_max = qwen35::PREFILL_MAX_BATCH;
+            let mut start = 0usize;
+            while start < new_tokens.len() {
+                if check_abort(id) { prefill_aborted = true; break; }
+                let end = (start + chunk_max).min(new_tokens.len());
+                let chunk = &new_tokens[start..end];
+                qwen35::forward_prefill_batch(
+                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
+                    None, None, None, None,
+                ).unwrap();
+                m.seq_pos += chunk.len();
+                start = end;
+            }
+        }
+        if prefill_aborted {
+            // Full state reset (see comment above the prefill loop).
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            kv.compact_offset = 0;
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+            let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
+            let _ = stdout.flush();
+            return;
         }
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
@@ -5533,6 +5680,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
+            // Decode-side abort check. Client cancel (Pi 4-min idle
+            // timeout firing while the CLI buffers tokens for tool-call
+            // detection — wire shows zero output until `done`) sends
+            // `{type:"abort","id":"..."}` over stdin; the reader thread
+            // sets `abort_for_id()` and we bail at the next iteration.
+            // Emit aborted+done so the CLI's drain loop terminates
+            // cleanly without an extra max_tokens worth of wasted decode.
+            if check_abort(id) {
+                let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+                let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#, id, generated);
+                let _ = stdout.flush();
+                return;
+            }
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
