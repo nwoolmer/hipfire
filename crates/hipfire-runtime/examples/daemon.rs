@@ -72,6 +72,41 @@ fn check_abort(req_id: &str) -> bool {
     }
 }
 
+/// Force-answer target request ID, set by the stdin-reader thread on
+/// `{type:"force_answer","id":"..."}`. Unlike `abort` (which kills the
+/// turn), force-answer asks the decode loop to STOP THINKING and commit
+/// to the answer — the model's `<think>` span is force-closed (the same
+/// continuation the `max_think_tokens` budget splices) and generation
+/// continues. The CLI sends this when a turn is taking too long so the
+/// stream produces a real answer instead of the client timing out and
+/// terminating mid-think.
+fn force_answer_for_id() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// True if the in-flight request `req_id` was asked to force-answer.
+/// Clears on match (one-shot).
+fn check_force_answer(req_id: &str) -> bool {
+    let mut g = force_answer_for_id().lock().unwrap();
+    if g.as_deref() == Some(req_id) {
+        *g = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// The text spliced into the stream to force-close a `<think>` span (on
+/// either the `max_think_tokens` budget OR a CLI force-answer signal),
+/// making the model commit to its answer. Default closes the think tag
+/// per Qwen's trained post-think format; override with
+/// `HIPFIRE_THINK_CONTINUATION` to inject a richer "now produce the
+/// answer" nudge (keep it short — it's prepended to the visible answer).
+fn think_continuation() -> String {
+    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
+}
+
 /// Message types pushed from the stdin-reader thread to the main
 /// processing loop. Abort messages are NOT forwarded — they're
 /// handled inline in the reader thread by setting `abort_for_id()`.
@@ -1297,6 +1332,13 @@ fn main() {
                         if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
                             eprintln!("[daemon-abort] received abort for id={}", id);
                             *abort_for_id().lock().unwrap() = Some(id.to_string());
+                        }
+                        continue;
+                    }
+                    if msg.get("type").and_then(|v| v.as_str()) == Some("force_answer") {
+                        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            eprintln!("[daemon-force-answer] received force_answer for id={}", id);
+                            *force_answer_for_id().lock().unwrap() = Some(id.to_string());
                         }
                         continue;
                     }
@@ -6052,7 +6094,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // the model commits to an answer with the remaining budget.
             // Same decoded-text scan budget_alert uses; counter is
             // incremented per-iteration only when we're still inside.
-            if max_think_tokens > 0 {
+            // Force-close the <think> span when EITHER the max_think_tokens
+            // budget is hit OR the CLI sent a `force_answer` signal (a turn
+            // running long → make the model commit to its answer instead of
+            // the client timing out mid-think and terminating the stream).
+            let force_answer_now = check_force_answer(id);
+            if max_think_tokens > 0 || force_answer_now {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let open_idx = raw_str.rfind("<think>");
@@ -6062,22 +6109,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     (Some(_), None) => true,
                     _ => false,
                 };
-                if in_think {
-                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
-                } else {
-                    think_count = 0;
+                if max_think_tokens > 0 {
+                    if in_think {
+                        if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                    } else {
+                        think_count = 0;
+                    }
+                    prev_in_think = in_think;
                 }
-                prev_in_think = in_think;
+                let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
 
-                if in_think && think_count >= max_think_tokens {
-                    // Force-close. Encode the close sequence and run each
-                    // token through the KV write + emit path the same way
-                    // a normally-sampled token does. This ensures the
-                    // model's next sample is conditioned on having "said"
-                    // </think>\n itself, instead of seeing a hidden-state
-                    // discontinuity. Respect max_tokens — clip the close
-                    // sequence if not enough room remains and bail.
-                    let close_tokens = tokenizer.encode("</think>\n");
+                if in_think && (budget_hit || force_answer_now) {
+                    if force_answer_now {
+                        eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                    }
+                    // Force-close. Encode the continuation and run each token
+                    // through the KV write + emit path the same way a normally-
+                    // sampled token does, so the model's next sample is
+                    // conditioned on having "said" it (no hidden-state
+                    // discontinuity). Respect max_tokens — clip if not enough
+                    // room remains and bail.
+                    let close_tokens = tokenizer.encode(&think_continuation());
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {

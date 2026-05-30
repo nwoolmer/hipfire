@@ -183,7 +183,12 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_tokens: 4096,
   max_seq: 32768,
   thinking: "on",
-  max_think_tokens: 0,
+  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
+  // <think> span so a long-reasoning turn force-closes and commits to its
+  // answer (daemon splices the continuation) instead of running until the
+  // client times out and terminates the stream mid-think. Override per-model
+  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
+  max_think_tokens: 2048,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
@@ -2554,6 +2559,23 @@ async function serve(port: number, host: string) {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
               }, 10_000);
+              // Force-answer watchdog: if a thinking-heavy turn runs longer
+              // than the budget, ask the daemon to STOP THINKING and commit
+              // to the answer (it splices the think-close continuation) rather
+              // than letting the client give up and terminate the stream
+              // mid-think. One-shot. Disable with HIPFIRE_FORCE_ANSWER_SECS=0.
+              const forceAnswerSecs = parseInt(process.env.HIPFIRE_FORCE_ANSWER_SECS ?? "180", 10);
+              let forceAnswerSent = false;
+              const forceAnswerTimer = forceAnswerSecs > 0
+                ? setTimeout(async () => {
+                    if (forceAnswerSent || streamCancelled) return;
+                    forceAnswerSent = true;
+                    console.error(`[hipfire] force-answer after ${forceAnswerSecs}s (reqId=${reqId}) — asking daemon to close <think> and answer`);
+                    try { await e.send({ type: "force_answer", id: reqId }); } catch (err: any) {
+                      console.error(`[hipfire] force_answer send failed: ${err?.message || err}`);
+                    }
+                  }, forceAnswerSecs * 1000)
+                : null;
               try {
                 let inThink = false;
                 let stripNextLeadingNl = false;
@@ -2817,6 +2839,7 @@ async function serve(port: number, host: string) {
                 try { ctrl.close(); } catch {}
               } finally {
                 clearInterval(heartbeat);
+                if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
                 e.generating = false;
                 safeRelease();
               }
