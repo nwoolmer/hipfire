@@ -1165,6 +1165,13 @@ struct LoadedModel {
     /// on full reset / unload (LoadedModel drop frees the GPU snapshots).
     prefill_checkpoints: Vec<PrefillCheckpoint>,
 
+    /// DeltaNet checkpoint ring for the DFlash path's divergent-render resume
+    /// (the analogue of `prefill_checkpoints` for `generate_dflash`). Pairs of
+    /// (seq_pos, recurrent-state snapshot), captured during the DFlash prompt
+    /// seed. Active by default; disabled by `HIPFIRE_DFLASH_CKPT_RESUME=0` or
+    /// when eviction is configured.
+    dflash_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
+
     /// Per-turn token cache for V4F prefix-cache stability.
     ///
     /// Maps a stable fingerprint of an assistant message — `(role,
@@ -2127,6 +2134,7 @@ fn main() {
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     m.prefill_checkpoints.clear();
+                    m.dflash_checkpoints.clear();
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -2738,7 +2746,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2784,7 +2792,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2847,7 +2855,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -3036,7 +3044,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -3070,7 +3078,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -3169,7 +3177,7 @@ fn load_model_safetensors(
             physical_cap: max_seq,
             eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
@@ -3239,7 +3247,7 @@ fn load_model_safetensors(
         physical_cap: effective_max_seq,
         eviction: None,
         conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
@@ -3373,7 +3381,7 @@ fn load_model_pp(
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
-        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), decoded_vocab: None,
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -3715,6 +3723,12 @@ struct PromptCachePlan {
     /// True ⇒ reuse existing KV/DeltaNet[0..start_pos]; prefill only the suffix.
     /// False ⇒ caller must full-reset and prefill the whole conversation.
     cache_hit: bool,
+    /// `Some(ckpt)` ⇒ this is a divergent-render RESUME (not a pure extension):
+    /// the caller must restore the DeltaNet recurrent state from the checkpoint
+    /// at `ckpt`, rewind seq_pos/conversation_tokens to `ckpt`, then treat the
+    /// turn like a HIT with `start_pos == ckpt` (re-prefill only the tail) and
+    /// drop `draft_ctx_cached_rows` to `ckpt`. `None` on a normal hit/miss.
+    resume_from: Option<usize>,
 }
 
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
@@ -3740,6 +3754,11 @@ fn plan_prompt_cache(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     messages_history: &[hipfire_runtime::prompt_frame::Message],
     cache_disabled: bool,
+    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
+    // whether resume-from-checkpoint is enabled. On a divergence the plan picks
+    // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
+    dflash_ckpt_positions: &[usize],
+    resume_enabled: bool,
 ) -> PromptCachePlan {
     let q_tokens = tokenizer.encode(prompt);
     let rendered = hipfire_runtime::prompt_frame::build_cached_history(
@@ -3779,8 +3798,34 @@ fn plan_prompt_cache(
                 start_pos: lcp,
                 cached_tokens: lcp,
                 cache_hit: true,
+                resume_from: None,
                 rendered,
             };
+        }
+        // Divergent render (lcp < prior_len, or the exact-match edge): not a
+        // pure extension, so the recurrent state at the end is stale. If resume
+        // is enabled, rewind to the latest checkpoint at-or-before lcp that
+        // still leaves ≥1 token to re-prefill, and resume from there instead of
+        // cold-prefilling the whole conversation.
+        if resume_enabled {
+            if let Some(&ckpt) = dflash_ckpt_positions
+                .iter()
+                .filter(|&&p| p <= lcp && p < rendered.len())
+                .max()
+            {
+                eprintln!(
+                    "[qwen-cache resume dflash] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
+                );
+                return PromptCachePlan {
+                    new_tokens: rendered[ckpt..].to_vec(),
+                    start_pos: ckpt,
+                    cached_tokens: ckpt,
+                    cache_hit: true,
+                    resume_from: Some(ckpt),
+                    rendered,
+                };
+            }
         }
     }
     PromptCachePlan {
@@ -3788,6 +3833,7 @@ fn plan_prompt_cache(
         start_pos: 0,
         cached_tokens: 0,
         cache_hit: false,
+        resume_from: None,
         rendered,
     }
 }
@@ -3914,6 +3960,16 @@ fn generate_dflash(
     // full-reset and prefill the whole conversation (legacy behaviour).
     let cache_disabled = try_jinja
         || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    // DFlash divergent-render resume (default ON; opt out with
+    // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
+    // resident KV prefix). When on, the recurrent state is checkpointed during
+    // the prompt seed and a divergent render resumes from the latest checkpoint
+    // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
+    // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
+    // (zero overhead) + legacy cold-reset-on-divergence.
+    let dflash_resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
+        && m.eviction.is_none();
+    let dflash_ckpt_positions: Vec<usize> = m.dflash_checkpoints.iter().map(|(p, _)| *p).collect();
     let cache_plan: Option<PromptCachePlan> = if !try_jinja {
         messages_history.map(|hist| {
             let tok = m.tokenizer.as_ref().unwrap();
@@ -3927,11 +3983,14 @@ fn generate_dflash(
                 assistant_prefix,
                 hist,
                 cache_disabled,
+                &dflash_ckpt_positions,
+                dflash_resume_enabled,
             )
         })
     } else {
         None
     };
+    let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
     // `prompt_tokens` becomes the full canonical conversation when the cache
     // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
     // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
@@ -3944,6 +4003,25 @@ fn generate_dflash(
             Some(p) => (p.new_tokens.clone(), p.start_pos, p.cache_hit, p.cached_tokens),
             None => (prompt_tokens.clone(), 0, false, 0),
         };
+
+    // Divergent-render RESUME: restore the DeltaNet recurrent state to the
+    // checkpoint and rewind seq_pos/conversation_tokens/checkpoints to it. The
+    // turn then proceeds exactly like a HIT with start_pos == ckpt (the cache
+    // plan already set cache_hit=true + start_pos=ckpt), re-prefilling only the
+    // tail. The FullAttention KV[0..ckpt] is still resident (positional), and
+    // the draft's target_hidden[0..ckpt] is preserved from the prior turn.
+    if let Some(ckpt) = resume_from {
+        if let Some(idx) = m.dflash_checkpoints.iter().rposition(|(p, _)| *p == ckpt) {
+            if let (Some(dn), Some((_, snap))) =
+                (m.dn_state.as_mut(), m.dflash_checkpoints.get(idx))
+            {
+                let _ = snap.restore_to(dn, gpu);
+            }
+            m.seq_pos = ckpt;
+            m.conversation_tokens.truncate(ckpt);
+            m.dflash_checkpoints.truncate(idx + 1);
+        }
+    }
 
     if !cache_hit {
         // Fresh target state — full prefill from position 0.
@@ -4052,17 +4130,24 @@ fn generate_dflash(
     // cancellation, state is fully reset (DeltaNet non-reversible) and
     // we return early — no decode, no tokens emitted to the wire.
     let id_for_abort = id.to_string();
+    // DeltaNet checkpoint ring (divergent-render resume). `Some` only when
+    // HIPFIRE_DFLASH_CKPT_RESUME=1 + no eviction; the seed snapshots the
+    // recurrent state every ck_int tokens so a future divergent render resumes
+    // from a checkpoint instead of cold-prefilling.
+    let (ck_int, ck_cap) = (ckpt_interval(), ckpt_max());
+    let ckpt_sink: Option<&mut Vec<(usize, speculative::DeltaNetSnapshot)>> =
+        if dflash_resume_enabled { Some(&mut m.dflash_checkpoints) } else { None };
     let seed_result = if cache_hit {
         // Incremental: prefill only the suffix, continuing from start_pos with
         // the reused target KV + DeltaNet state (no reset).
         speculative::seed_target_hidden_suffix_abortable(
             gpu, &mut target, &mut df.hidden_rb, &prefill_tokens, prefill_start,
-            &|| check_abort(&id_for_abort),
+            &|| check_abort(&id_for_abort), ckpt_sink, ck_int, ck_cap,
         )
     } else {
         speculative::seed_target_hidden_from_prompt_abortable(
             gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
-            &|| check_abort(&id_for_abort),
+            &|| check_abort(&id_for_abort), ckpt_sink, ck_int, ck_cap,
         )
     };
     let aborted = match seed_result {
@@ -4082,6 +4167,7 @@ fn generate_dflash(
         // and emit aborted+done events for the CLI's drain loop.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        m.dflash_checkpoints.clear();
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
@@ -4117,6 +4203,14 @@ fn generate_dflash(
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     df.draft_scratch.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
+    if let Some(ckpt) = resume_from {
+        // Rows [ckpt..len) of target_hidden were just overwritten with the new
+        // (divergent) content, so the draft's projection cache for them is
+        // stale. Drop the cursor to ckpt; the first spec step re-projects
+        // [ckpt..position) from the fresh rows (the same delta path a HIT uses,
+        // just from ckpt instead of the prior length).
+        df.draft_scratch.draft_ctx_cached_rows = ckpt;
+    }
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -4502,6 +4596,7 @@ fn generate_dflash(
     if grammar_violated {
         eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
         m.conversation_tokens.clear();
+        m.dflash_checkpoints.clear();
         m.seq_pos = 0;
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices {

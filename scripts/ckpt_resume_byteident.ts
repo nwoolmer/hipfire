@@ -22,10 +22,12 @@ const MODEL = process.argv[3] || "qwen3.6-27b.mq4";
 const SYSTEM = "You are a precise assistant. Answer in one short sentence.";
 // LONG = many distinct words so it tokenizes to several thousand tokens and
 // crosses multiple checkpoint intervals; SHORT is a strict textual prefix.
+const NWORDS = parseInt(process.argv[4] || "3000", 10);
+const NSLICE = parseInt(process.argv[5] || "1800", 10);
 const words: string[] = [];
-for (let i = 0; i < 3000; i++) words.push(`item${i}`);
+for (let i = 0; i < NWORDS; i++) words.push(`item${i}`);
 const LONG = "Here is a numbered inventory, then a question. " + words.join(" ") + ". Now: how many distinct items did I list, approximately?";
-const SHORT = "Here is a numbered inventory, then a question. " + words.slice(0, 1800).join(" ") + ". Now: name the very first item.";
+const SHORT = "Here is a numbered inventory, then a question. " + words.slice(0, NSLICE).join(" ") + ". Now: name the very first item.";
 
 function sig(msg: any): string {
   const h = createHash("sha1");

@@ -4941,6 +4941,44 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
+/// Snapshot the target's DeltaNet recurrent state into a bounded ring `cks`
+/// when `interval` tokens have elapsed since the last snapshot — the DFlash
+/// analogue of the AR path's `checkpoint_dn`. Enables resume-from-checkpoint on
+/// a divergent client render (see the daemon's `plan_prompt_cache` /
+/// `generate_dflash`). Oldest evicted at `cap` (buffers reused — no realloc
+/// churn after warmup). Cheap: one device-to-device memcpy of the recurrent
+/// S/scale/conv buffers; no KV copy (FullAttention KV is positional and stays
+/// resident, so resume only needs to restore the recurrent state).
+pub fn take_dflash_dn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+) {
+    if pos == 0 || cap == 0 {
+        return;
+    }
+    match cks.last().map(|(p, _)| *p) {
+        Some(p) if pos < p + interval => return,
+        Some(p) if p == pos => return,
+        _ => {}
+    }
+    let mut snap = if cks.len() >= cap {
+        cks.remove(0).1
+    } else {
+        match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+    if snap.save_from(dn, gpu).is_err() {
+        return;
+    }
+    cks.push((pos, snap));
+}
+
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -4989,6 +5027,7 @@ pub fn seed_target_hidden_from_prompt(
 /// Used by the daemon's `generate_dflash` to honor client-side
 /// cancellation on long-context retries (cache-miss scenarios where
 /// the full conversation must be re-prefilled from scratch).
+#[allow(clippy::too_many_arguments)]
 pub fn seed_target_hidden_from_prompt_abortable(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -4996,15 +5035,27 @@ pub fn seed_target_hidden_from_prompt_abortable(
     target_hidden_host: &mut Vec<f32>,
     prompt_tokens: &[u32],
     abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring for divergent-render resume. When
+    // `Some`, the recurrent state is snapshotted every `ckpt_interval` tokens
+    // (bounded at `ckpt_cap`). `None` ⇒ no checkpointing (zero overhead).
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
 ) -> HipResult<bool> {
     target.reset_state(gpu);
     target_hidden_host.clear();
+    if let Some(cks) = checkpoints.as_deref_mut() {
+        cks.clear(); // fresh cold prefill ⇒ stale checkpoints no longer valid
+    }
     let chunk_max = qwen35::PREFILL_MAX_BATCH;
     let mut seq_pos: usize = 0;
     while seq_pos < prompt_tokens.len() {
         if abort_check() {
             target.reset_state(gpu);
             target_hidden_host.clear();
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                cks.clear();
+            }
             return Ok(true);
         }
         let end = (seq_pos + chunk_max).min(prompt_tokens.len());
@@ -5024,6 +5075,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
         let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
         target_hidden_host.extend_from_slice(&block);
         seq_pos = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dflash_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+        }
     }
     Ok(false)
 }
@@ -5046,6 +5100,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
 /// the prior conversation (pure extension — no rewind). Returns `Ok(true)` if
 /// aborted mid-prefill (state left as-is; caller must full-reset & retry),
 /// `Ok(false)` on completion.
+#[allow(clippy::too_many_arguments)]
 pub fn seed_target_hidden_suffix_abortable(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -5053,6 +5108,12 @@ pub fn seed_target_hidden_suffix_abortable(
     suffix: &[u32],
     start_pos: usize,
     abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
+    // or a resume keep adding checkpoints as the conversation grows, so a later
+    // divergence resumes from a recent point rather than the initial prefill.
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
 ) -> HipResult<bool> {
     let chunk_max = qwen35::PREFILL_MAX_BATCH;
     let mut off: usize = 0;
@@ -5077,6 +5138,9 @@ pub fn seed_target_hidden_suffix_abortable(
         )?;
         pos += chunk.len();
         off = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dflash_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+        }
     }
     Ok(false)
 }
