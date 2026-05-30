@@ -57,8 +57,11 @@ function execTool(name: string, a: any): string {
   return `unknown tool ${name}`;
 }
 
+const THINK = args.includes("--think");
 async function callModel(messages: any[]) {
-  const body = { model: MODEL, messages, tools: TOOLS, tool_choice: "auto", max_tokens: GEN, temperature: 0, stream: false, chat_template_kwargs: { enable_thinking: false } };
+  const body: any = { model: MODEL, messages, tools: TOOLS, tool_choice: "auto", max_tokens: GEN, temperature: 0, stream: false };
+  if (!THINK) body.chat_template_kwargs = { enable_thinking: false };
+  else body.reasoning = { effort: "medium" };
   const t0 = performance.now();
   const res = await fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const wall = (performance.now() - t0) / 1000;
