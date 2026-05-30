@@ -30,8 +30,8 @@ for (const c of cells) {
 }
 
 md += `\n## divergent (dropped-history render — checkpoint RESUME)\n\n`;
-md += `| cell | resume reuse | resume wall s | cold wall s | speedup | uniq |\n|---|--:|--:|--:|--:|--:|\n`;
-for (const c of cells) { const d = get(c, "divergent"); md += `| ${c} | ${pct(d.resume_reuse)} | ${n(d.resume_wall_s, 2)} | ${n(d.cold_wall_s, 2)} | ${d.speedup_wall ? d.speedup_wall + "x" : "-"} | ${n(d.resume_uniq_ratio, 3)} |\n`; }
+md += `| cell | resume reuse | replay / prompt tok | resume prefill s | cold-est s | prefill speedup | uniq |\n|---|--:|--:|--:|--:|--:|--:|\n`;
+for (const c of cells) { const d = get(c, "divergent"); md += `| ${c} | ${pct(d.resume_reuse)} | ${d.replay_tokens ?? "-"} / ${d.resume_prompt ?? "-"} | ${n(d.resume_prefill_s, 2)} | ${n(d.cold_est_s, 2)} | ${d.prefill_speedup ? d.prefill_speedup + "×" : "-"} | ${n(d.resume_uniq_ratio, 3)} |\n`; }
 
 md += `\n## toolcalls (bash/read/write/grep correctness)\n\n`;
 md += `| cell | correct | decode t/s | τ |\n|---|--:|--:|--:|\n`;

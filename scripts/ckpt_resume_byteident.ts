@@ -34,8 +34,10 @@ function sig(msg: any): string {
   h.update(JSON.stringify({ c: msg.content ?? "", t: (msg.tool_calls ?? []).map((x: any) => ({ n: x.function?.name, a: x.function?.arguments })) }));
   return h.digest("hex").slice(0, 12);
 }
+const THINK = process.argv.includes("--think");
 async function post(user: string, maxTok: number) {
-  const body = { model: MODEL, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }], max_tokens: maxTok, temperature: 0, stream: false, chat_template_kwargs: { enable_thinking: false } };
+  const body: any = { model: MODEL, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }], max_tokens: maxTok, temperature: 0, stream: false };
+  if (THINK) body.reasoning = { effort: "medium" }; else body.chat_template_kwargs = { enable_thinking: false };
   const r = await fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const j: any = await r.json();
   return { msg: j.choices?.[0]?.message ?? {}, cached: j.usage?.prompt_tokens_details?.cached_tokens ?? 0, prompt: j.usage?.prompt_tokens ?? 0 };

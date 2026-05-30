@@ -35,9 +35,12 @@ const OUT = opt("--out", "");
 // Size knobs (27B prefill is ~90 t/s, so keep contexts moderate). --fast shrinks
 // everything for harness validation.
 const FAST = A.includes("--fast");
-const DOC_FNS = parseInt(opt("--doc-fns", FAST ? "20" : "80"), 10);
-const MT_TURNS = parseInt(opt("--mt-turns", FAST ? "3" : "5"), 10);
-const DIV_CHUNKS = parseInt(opt("--div-chunks", FAST ? "3" : "8"), 10);
+// Sizes tuned so each cell is ~3-4 min on 27B while still demonstrating the
+// effects: a ~9K-tok divergent prime crosses the 2048 checkpoint interval (so
+// resume engages) and fits any per-request timeout; multiturn grows to ~7K.
+const DOC_FNS = parseInt(opt("--doc-fns", FAST ? "20" : "48"), 10);
+const MT_TURNS = parseInt(opt("--mt-turns", FAST ? "3" : "4"), 10);
+const DIV_CHUNKS = parseInt(opt("--div-chunks", FAST ? "3" : "5"), 10);
 const URL = `http://127.0.0.1:${PORT}/v1/chat/completions`;
 
 type Stream = {
@@ -48,7 +51,7 @@ type Stream = {
   wall_s: number; ok: boolean;
 };
 
-async function streamChat(messages: any[], tools: any[] | null, maxTok: number): Promise<Stream> {
+async function streamChat(messages: any[], tools: any[] | null, maxTok: number, timeoutMs = 240_000): Promise<Stream> {
   const body: any = {
     model: MODEL, messages, max_tokens: maxTok, temperature: 0, stream: true,
     stream_options: { include_usage: true },
@@ -65,7 +68,7 @@ async function streamChat(messages: any[], tools: any[] | null, maxTok: number):
   };
   const t0 = performance.now();
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 240_000); // per-request ceiling
+  const timer = setTimeout(() => ctl.abort(), timeoutMs); // per-request ceiling
   let res: Response;
   try { res = await fetch(URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctl.signal }); }
   catch (e: any) { clearTimeout(timer); out.wall_s = (performance.now() - t0) / 1000; return out; }
@@ -202,20 +205,27 @@ async function scDivergent() {
   const longUser = long + "\nQuestion: how many modules are described above?";
   const shortUser = long.slice(0, Math.floor(long.length * 0.6)) + "\nQuestion: explain what op_0_0 returns, in one sentence.";
   const sys = sysFor("divergent");
-  // prime
-  await streamChat([{ role: "system", content: sys }, { role: "user", content: longUser }], null, 8);
-  // divergent prefix → resume
-  const r = await streamChat([{ role: "system", content: sys }, { role: "user", content: shortUser }], null, 80);
-  // cold baseline: unique system nonce so it can't reuse → true cold prefill of the same SHORT
-  await streamChat([{ role: "system", content: sysFor("divergent_cold_prime") }, { role: "user", content: "unrelated short preamble" }], null, 8);
-  const cold = await streamChat([{ role: "system", content: sysFor("divergent_cold") }, { role: "user", content: shortUser }], null, 80);
+  // Prime (cold) — also captures the cold prefill RATE so we can DERIVE the cold
+  // cost of the divergent render instead of running a second full cold prefill
+  // (saves the biggest request in the scenario). Generous timeout: a one-time
+  // cold prime must not be aborted (that would leave the resume nothing to reuse
+  // and mis-measure as 0%).
+  const p = await streamChat([{ role: "system", content: sys }, { role: "user", content: longUser }], null, 8, 900_000);
+  // Divergent prefix render (dropped tail, lcp < prior_len) → checkpoint RESUME.
+  const r = await streamChat([{ role: "system", content: sys }, { role: "user", content: shortUser }], null, 80, 900_000);
+  const replay = Math.max(0, r.usage.prompt - r.usage.cached);
+  const coldRate = p.timings.prefill_tok_s > 0 ? p.timings.prefill_tok_s : r.timings.prefill_tok_s; // tok/s, cold
+  const coldEstS = coldRate > 0 ? r.usage.prompt / coldRate : 0;           // cost to cold-prefill all of SHORT
+  const resumePrefillS = (r.timings.ttft_ms || 0) / 1000;                  // ≈ resume prefill (replay + first tok)
   return record("divergent", {
-    ok: r.ok && cold.ok,
-    resume_prompt: r.usage.prompt, resume_cached: r.usage.cached, resume_reuse: +(r.usage.cached / Math.max(1, r.usage.prompt)).toFixed(3),
-    resume_prefill_tok_s: +r.timings.prefill_tok_s.toFixed(1), resume_wall_s: +r.wall_s.toFixed(2),
-    cold_prompt: cold.usage.prompt, cold_wall_s: +cold.wall_s.toFixed(2),
+    ok: r.ok && r.usage.cached > 0,
+    resume_prompt: r.usage.prompt, resume_cached: r.usage.cached,
+    resume_reuse: +(r.usage.cached / Math.max(1, r.usage.prompt)).toFixed(3),
+    replay_tokens: replay,
+    resume_prefill_s: +resumePrefillS.toFixed(2),
+    cold_est_s: +coldEstS.toFixed(2),
+    prefill_speedup: resumePrefillS > 0 ? +(coldEstS / resumePrefillS).toFixed(1) : null,
     resume_uniq_ratio: +uniqRatio(r.text).toFixed(3),
-    speedup_wall: cold.wall_s > 0 ? +(cold.wall_s / Math.max(0.01, r.wall_s)).toFixed(2) : null,
   });
 }
 
@@ -263,7 +273,7 @@ async function scToolcalls() {
     for (const t of mt.turns ?? []) console.log(`   turn ${t.turn}: prompt=${t.prompt} cached=${t.cached} reuse=${pct(t.reuse)} prefill=${t.prefill_tok_s}t/s decode=${t.decode_tok_s}t/s tau=${t.tau ?? "-"} wall=${t.wall_s}s`);
   }
   if (dv.error) console.log(`divergent: ERROR ${dv.error}`);
-  else console.log(`divergent: resume cached=${dv.resume_cached}/${dv.resume_prompt} (${pct(dv.resume_reuse)}) wall=${dv.resume_wall_s}s vs cold wall=${dv.cold_wall_s}s (speedup ${dv.speedup_wall}x) uniq=${dv.resume_uniq_ratio}`);
+  else console.log(`divergent: resume reuse ${pct(dv.resume_reuse)} (replay ${dv.replay_tokens}/${dv.resume_prompt}) prefill ${dv.resume_prefill_s}s vs cold-est ${dv.cold_est_s}s = ${dv.prefill_speedup ?? "-"}x uniq=${dv.resume_uniq_ratio}`);
   if (tools.error) console.log(`toolcalls: ERROR ${tools.error}`);
   else console.log(`toolcalls: ${tools.correct}/${tools.total} correct  ttft=${tools.ttft_ms}ms decode=${tools.decode_tok_s}t/s tau=${tools.tau ?? "-"}`);
 })();
