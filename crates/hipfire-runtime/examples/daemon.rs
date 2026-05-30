@@ -4397,6 +4397,19 @@ fn generate_dflash(
         // mid-decode leaves the spec-decode loop running for max_tokens
         // worth of wasted work.
         if check_abort(id) {
+            // Restore the borrowed slot before returning, then full-reset the
+            // conversation. The mid-decode KV/DeltaNet are advanced past the
+            // (un-baked) conversation_tokens, so the next turn must cold-start
+            // (which re-seeds + resets the recurrent state). CRITICAL: without
+            // putting the slot fields back, m.dn_state/kv_cache stay None and the
+            // NEXT request panics at the cold-reset unwrap (daemon.rs ~4031).
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.dflash_checkpoints.clear();
             let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
             let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0,"dflash":true}}"#, id, generated);
             let _ = stdout.flush();
