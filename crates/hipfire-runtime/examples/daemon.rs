@@ -1155,21 +1155,21 @@ struct LoadedModel {
     eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
-    /// Prefill checkpoints for divergent-render resume. Each holds a DeltaNet
-    /// recurrent-state snapshot + the seq_pos/compact_offset at which it was
-    /// captured, taken every `HIPFIRE_CACHE_CKPT_INTERVAL` tokens during
-    /// prefill. On a non-extension client render (history dropped/edited so the
-    /// prior conversation is no longer a prefix) the cache resumes from the
-    /// latest checkpoint ≤ lcp — re-prefilling only the tail — instead of a
-    /// full cold prefill. Bounded to `HIPFIRE_CACHE_CKPT_MAX` entries. Cleared
-    /// on full reset / unload (LoadedModel drop frees the GPU snapshots).
-    prefill_checkpoints: Vec<PrefillCheckpoint>,
+    /// DeltaNet checkpoint ring for the AR `generate` path's divergent-render
+    /// resume. Pairs of `(seq_pos, recurrent-state snapshot)`, captured every
+    /// `HIPFIRE_CACHE_CKPT_INTERVAL` tokens during prefill/decode via the shared
+    /// `speculative::take_dn_checkpoint`. On a non-extension client render
+    /// (history dropped/edited so the prior conversation is no longer a prefix)
+    /// the cache resumes from the latest checkpoint ≤ lcp — re-prefilling only
+    /// the tail — instead of a full cold prefill. Bounded to
+    /// `HIPFIRE_CACHE_CKPT_MAX`. Only the recurrent state is snapshotted; the
+    /// FullAttention KV[0..seq_pos] stays resident (positional). Cleared on full
+    /// reset / unload (LoadedModel drop frees the GPU snapshots).
+    prefill_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
 
-    /// DeltaNet checkpoint ring for the DFlash path's divergent-render resume
-    /// (the analogue of `prefill_checkpoints` for `generate_dflash`). Pairs of
-    /// (seq_pos, recurrent-state snapshot), captured during the DFlash prompt
-    /// seed. Active by default; disabled by `HIPFIRE_DFLASH_CKPT_RESUME=0` or
-    /// when eviction is configured.
+    /// Same ring for the DFlash path (`generate_dflash`), captured during the
+    /// DFlash prompt seed. Active by default; disabled by
+    /// `HIPFIRE_DFLASH_CKPT_RESUME=0` or when eviction is configured.
     dflash_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
 
     /// Per-turn token cache for V4F prefix-cache stability.
@@ -1222,20 +1222,6 @@ struct LoadedModel {
     chat_template: Option<String>,
 }
 
-/// One prefill checkpoint: a DeltaNet recurrent-state snapshot plus the physical
-/// `seq_pos` and KV `compact_offset` at which it was captured. Lets the prompt
-/// cache RESUME from this point on a divergent client render (one that dropped /
-/// edited earlier history, so the prior conversation is no longer a prefix of
-/// this prompt) instead of cold-prefilling from zero. The FullAttention KV for
-/// `[0..seq_pos]` stays resident (positional, never overwritten), so only the
-/// recurrent DeltaNet state needs snapshotting. See `checkpoint_dn` (capture)
-/// and the divergence branch in `generate` (restore).
-struct PrefillCheckpoint {
-    seq_pos: usize,
-    compact_offset: usize,
-    dn: DeltaNetSnapshot,
-}
-
 fn ckpt_resume_enabled() -> bool {
     std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
 }
@@ -1252,49 +1238,6 @@ fn ckpt_max() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
         .max(1)
-}
-
-/// Capture a DeltaNet checkpoint at the current `seq_pos` if at least
-/// `ckpt_interval()` tokens have elapsed since the last one. Bounded to
-/// `ckpt_max()` retained checkpoints (oldest evicted, its GPU buffers reused so
-/// there's no realloc churn after warmup). Cheap: one device-to-device memcpy
-/// of the recurrent state per checkpoint — no KV copy, since the FullAttention
-/// KV is positional and stays resident. Callers pass already-split field
-/// borrows so this composes inside the prefill loop where `kv`/`dn` hold
-/// disjoint `&mut` borrows of the model. No-op when checkpointing is disabled,
-/// at `seq_pos == 0`, or when the KV head is eviction-remapped
-/// (`compact_offset != 0`) — resume needs an un-remapped resident KV prefix.
-fn checkpoint_dn(
-    checkpoints: &mut Vec<PrefillCheckpoint>,
-    dn: &DeltaNetState,
-    gpu: &mut rdna_compute::Gpu,
-    seq_pos: usize,
-    compact_offset: usize,
-) {
-    if !ckpt_resume_enabled() || compact_offset != 0 || seq_pos == 0 {
-        return;
-    }
-    let interval = ckpt_interval();
-    let cap = ckpt_max();
-    match checkpoints.last().map(|c| c.seq_pos) {
-        Some(p) if seq_pos < p + interval => return,
-        Some(p) if p == seq_pos => return,
-        _ => {}
-    }
-    let mut snap = if checkpoints.len() >= cap {
-        // Reuse the oldest checkpoint's buffers (evict-oldest keeps the most
-        // recent `cap`, which minimizes replay for the common head-divergence).
-        checkpoints.remove(0).dn
-    } else {
-        match DeltaNetSnapshot::new_for(gpu, dn) {
-            Ok(s) => s,
-            Err(_) => return,
-        }
-    };
-    if snap.save_from(dn, gpu).is_err() {
-        return;
-    }
-    checkpoints.push(PrefillCheckpoint { seq_pos, compact_offset, dn: snap });
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -5852,24 +5795,24 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             let resume_idx = if ckpt_resume_enabled() && evict_safe && m.dn_state.is_some() {
                 m.prefill_checkpoints
                     .iter()
-                    .rposition(|c| c.seq_pos <= lcp && c.seq_pos < rendered.len())
+                    .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
             } else {
                 None
             };
             let resumed = if let Some(idx) = resume_idx {
-                let rpos = m.prefill_checkpoints[idx].seq_pos;
-                let roff = m.prefill_checkpoints[idx].compact_offset;
+                let rpos = m.prefill_checkpoints[idx].0;
                 let ok = if let (Some(ck), Some(dn)) =
                     (m.prefill_checkpoints.get(idx), m.dn_state.as_mut())
                 {
-                    ck.dn.restore_to(dn, gpu).is_ok()
+                    ck.1.restore_to(dn, gpu).is_ok()
                 } else {
                     false
                 };
                 if ok {
                     m.seq_pos = rpos;
-                    if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = roff; }
-                    if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = roff; }
+                    // `evict_safe` guarantees compact_offset == 0, so setting
+                    // seq_pos already points the KV write head at rpos — nothing
+                    // to restore (checkpoints are only captured with offset 0).
                     m.conversation_tokens.truncate(rpos);
                     m.prefill_checkpoints.truncate(idx + 1);
                     cached_tokens_count = rpos;
@@ -6068,7 +6011,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 // later divergent render can resume here instead of cold. `dn`
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
                 // fields, so this composes with the live kv/dn borrows.
-                checkpoint_dn(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, 0);
+                if ckpt_resume_enabled() { speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, ckpt_interval(), ckpt_max()); }
                 start = end;
             }
         }
@@ -6348,7 +6291,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // big code emission) can be resumed mid-region if the NEXT turn's
             // render diverges within it — without replaying the whole
             // generation. No-op under eviction (compact_offset != 0).
-            checkpoint_dn(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, 0);
+            if ckpt_resume_enabled() { speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, ckpt_interval(), ckpt_max()); }
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;

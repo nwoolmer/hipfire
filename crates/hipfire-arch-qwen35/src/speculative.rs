@@ -4941,15 +4941,16 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
-/// Snapshot the target's DeltaNet recurrent state into a bounded ring `cks`
-/// when `interval` tokens have elapsed since the last snapshot — the DFlash
-/// analogue of the AR path's `checkpoint_dn`. Enables resume-from-checkpoint on
-/// a divergent client render (see the daemon's `plan_prompt_cache` /
-/// `generate_dflash`). Oldest evicted at `cap` (buffers reused — no realloc
-/// churn after warmup). Cheap: one device-to-device memcpy of the recurrent
-/// S/scale/conv buffers; no KV copy (FullAttention KV is positional and stays
-/// resident, so resume only needs to restore the recurrent state).
-pub fn take_dflash_dn_checkpoint(
+/// Snapshot the DeltaNet recurrent state into a bounded ring `cks` (pairs of
+/// `(seq_pos, snapshot)`) when `interval` tokens have elapsed since the last
+/// one. Shared by BOTH the AR `generate` and the DFlash prompt-cache paths to
+/// enable resume-from-checkpoint on a divergent client render (see the daemon's
+/// `generate` divergence branch + `generate_dflash`). Oldest evicted at `cap`
+/// (buffers reused — no realloc churn after warmup). Cheap: one device-to-device
+/// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
+/// positional and stays resident, so resume only restores the recurrent state).
+/// Gating (resume enabled / no eviction) is the caller's responsibility.
+pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
     gpu: &mut Gpu,
@@ -5076,7 +5077,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
         target_hidden_host.extend_from_slice(&block);
         seq_pos = end;
         if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dflash_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
         }
     }
     Ok(false)
@@ -5139,7 +5140,7 @@ pub fn seed_target_hidden_suffix_abortable(
         pos += chunk.len();
         off = end;
         if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dflash_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
         }
     }
     Ok(false)

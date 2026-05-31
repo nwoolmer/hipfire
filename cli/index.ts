@@ -2078,6 +2078,16 @@ async function serve(port: number, host: string) {
           usage.cache_creation_input_tokens = prefillTokens;
           return usage;
         };
+        // Per-request perf/spec-decode metrics for the streaming final chunk.
+        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness (mean
+        // accepted tokens per verify cycle) for benchmarking/observability;
+        // they're absent on the AR path.
+        const buildTimings = (m: any) => ({
+          tokens: m.tokens, tok_s: m.tok_s, prefill_tokens: m.prefill_tokens,
+          prefill_ms: m.prefill_ms, prefill_tok_s: m.prefill_tok_s,
+          decode_tok_s: m.decode_tok_s, ttft_ms: m.ttft_ms,
+          tau: m.tau, cycles: m.cycles, dflash: m.dflash,
+        });
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -2756,7 +2766,7 @@ async function serve(port: number, host: string) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        timings: { tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens, prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s, decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms, tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash },
+                        timings: buildTimings(msg),
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
@@ -2790,7 +2800,7 @@ async function serve(port: number, host: string) {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                          timings: { tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens, prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s, decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms, tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash },
+                          timings: buildTimings(msg),
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2811,24 +2821,15 @@ async function serve(port: number, host: string) {
                         // Surface perf/spec-decode metrics on the tool-call final chunk too
                         // (matches the plain-text branch) so benchmarks see timings on
                         // tool-calling turns.
-                        finalChunk.timings = {
-                          tokens: msg.tokens, tok_s: msg.tok_s, prefill_tokens: msg.prefill_tokens,
-                          prefill_ms: msg.prefill_ms, prefill_tok_s: msg.prefill_tok_s,
-                          decode_tok_s: msg.decode_tok_s, ttft_ms: msg.ttft_ms,
-                          tau: msg.tau, cycles: msg.cycles, dflash: msg.dflash,
-                        };
+                        finalChunk.timings = buildTimings(msg);
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                       }
                     } else {
-                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms, tau, cycles, dflash } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness
-                        // (mean accepted tokens per verify cycle) for benchmarking/observability;
-                        // absent on the AR path.
-                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms, tau, cycles, dflash }
+                        timings: buildTimings(msg)
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
